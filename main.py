@@ -21,15 +21,17 @@ def setup_logging(debug: bool = None):
     
     level = logging.DEBUG if debug else getattr(logging, config.log_level, logging.INFO)
     
-    # Ensure temp directory exists
-    os.makedirs(os.path.dirname(config.log_file), exist_ok=True)
+    # Ensure log file directory exists
+    log_file = config.log_file
+    if os.path.dirname(log_file):
+        os.makedirs(os.path.dirname(log_file), exist_ok=True)
     
     logging.basicConfig(
         level=level,
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
         handlers=[
             logging.StreamHandler(),
-            logging.FileHandler(config.log_file)
+            logging.FileHandler(log_file)
         ]
     )
 

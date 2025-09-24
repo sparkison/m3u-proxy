@@ -39,11 +39,36 @@ class StreamConfig(BaseModel):
     failover_urls: List[HttpUrl] = Field(default_factory=list)
     format: Optional[StreamFormat] = None
     auto_detect_format: bool = True
-    enable_hardware_acceleration: bool = Field(default_factory=lambda: config.enable_hardware_acceleration)
-    buffer_size: int = Field(default_factory=lambda: config.default_buffer_size, ge=64 * 1024)
-    timeout: int = Field(default_factory=lambda: config.default_timeout, ge=5)
-    retry_attempts: int = Field(default_factory=lambda: config.default_retry_attempts, ge=1)
-    retry_delay: int = Field(default_factory=lambda: config.default_retry_delay, ge=1)
+    enable_hardware_acceleration: Optional[bool] = None
+    buffer_size: Optional[int] = None
+    timeout: Optional[int] = None
+    retry_attempts: Optional[int] = None
+    retry_delay: Optional[int] = None
+
+    def model_post_init(self, __context) -> None:
+        """Set defaults from config after validation."""
+        if self.enable_hardware_acceleration is None:
+            self.enable_hardware_acceleration = config.enable_hardware_acceleration
+        # Treat 0 or None as "use default"
+        if self.buffer_size is None or self.buffer_size == 0:
+            self.buffer_size = config.default_buffer_size
+        elif self.buffer_size < 64 * 1024:
+            raise ValueError(f"buffer_size must be at least {64 * 1024} bytes")
+            
+        if self.timeout is None or self.timeout == 0:
+            self.timeout = config.default_timeout
+        elif self.timeout < 5:
+            raise ValueError("timeout must be at least 5 seconds")
+            
+        if self.retry_attempts is None or self.retry_attempts == 0:
+            self.retry_attempts = config.default_retry_attempts
+        elif self.retry_attempts < 1:
+            raise ValueError("retry_attempts must be at least 1")
+            
+        if self.retry_delay is None or self.retry_delay == 0:
+            self.retry_delay = config.default_retry_delay
+        elif self.retry_delay < 1:
+            raise ValueError("retry_delay must be at least 1 second")
 
 
 class StreamInfo(BaseModel):

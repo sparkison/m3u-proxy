@@ -70,6 +70,10 @@ start_dev() {
     fi
     
     echo -e "${BLUE}Server will start on port ${PORT}${NC}"
+    
+    # Make sure we're in the project directory and activate venv
+    cd "$PROJECT_DIR"
+    source "$PROJECT_DIR/venv/bin/activate"
     python "$PROJECT_DIR/main.py" --debug --reload
 }
 
@@ -85,6 +89,9 @@ run_tests() {
         PORT=8080
     fi
     
+    # Make sure we're in the project directory and activate venv
+    cd "$PROJECT_DIR"
+    source "$PROJECT_DIR/venv/bin/activate"
     python "$PROJECT_DIR/test_setup.py" "http://localhost:${PORT}"
 }
 

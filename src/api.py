@@ -111,6 +111,27 @@ async def get_stats():
     )
 
 
+@app.get("/hardware")
+async def get_hardware_info():
+    """Get hardware acceleration information."""
+    hw_support = stream_manager._detect_hardware_acceleration()
+    best_method = stream_manager._get_best_hw_acceleration()
+    
+    return {
+        "hardware_acceleration_available": stream_manager._has_hardware_acceleration(),
+        "best_method": best_method,
+        "supported_methods": hw_support,
+        "details": {
+            "vaapi": "Intel/AMD hardware acceleration on Linux via VAAPI",
+            "qsv": "Intel Quick Sync Video hardware acceleration", 
+            "nvenc": "NVIDIA NVENC hardware acceleration",
+            "cuda": "NVIDIA CUDA acceleration for filtering/scaling",
+            "videotoolbox": "Apple VideoToolbox hardware acceleration (macOS)",
+            "opencl": "OpenCL acceleration for filtering"
+        }
+    }
+
+
 @app.post("/streams", response_model=StreamInfo)
 async def create_stream(config: StreamConfig):
     """Create a new stream."""

@@ -398,10 +398,16 @@ class StreamManager:
         # Build FFmpeg command
         cmd = ['ffmpeg', '-y']
         
-        # Hardware acceleration
-        if config.enable_hardware_acceleration and self._has_hardware_acceleration():
-            cmd.extend(['-hwaccel', 'auto'])
-            
+        # Hardware acceleration setup
+        hw_method = None
+        if config.enable_hardware_acceleration:
+            hw_method = self._get_best_hw_acceleration()
+            if hw_method:
+                logger.info(f"Using hardware acceleration: {hw_method}")
+                cmd.extend(self._get_hw_acceleration_args(hw_method))
+            else:
+                logger.info("No hardware acceleration available, using software encoding")
+        
         # Input options
         cmd.extend(['-i', input_url])
         
@@ -411,8 +417,15 @@ class StreamManager:
             
         # Output options
         if config.format == StreamFormat.HLS:
+            # For HLS, we might need transcoding
+            if hw_method and not self._can_copy_codec(input_url):
+                # Use hardware encoding for transcoding
+                codec_args = self._get_hw_encoding_args(hw_method)
+                cmd.extend(codec_args)
+            else:
+                cmd.extend(['-c', 'copy'])
+                
             cmd.extend([
-                '-c', 'copy',
                 '-f', 'hls',
                 '-hls_time', '6',
                 '-hls_list_size', '10',
@@ -420,8 +433,16 @@ class StreamManager:
                 f'{config.temp_dir}/stream_{config.stream_id}/playlist.m3u8'
             ])
         else:
+            # For direct streaming, prefer copy when possible
+            if self._can_copy_codec(input_url):
+                cmd.extend(['-c', 'copy'])
+            elif hw_method:
+                codec_args = self._get_hw_encoding_args(hw_method)
+                cmd.extend(codec_args)
+            else:
+                cmd.extend(['-c:v', 'libx264', '-preset', 'fast', '-crf', '23'])
+                
             cmd.extend([
-                '-c', 'copy',
                 '-f', 'mpegts',
                 f'http://localhost:{output_port}/stream'
             ])
@@ -441,27 +462,152 @@ class StreamManager:
         )
         
         return process
+    
+    def _get_hw_acceleration_args(self, hw_method: str) -> List[str]:
+        """Get hardware acceleration arguments for FFmpeg."""
+        if hw_method == 'vaapi':
+            return ['-hwaccel', 'vaapi', '-hwaccel_device', '/dev/dri/renderD128']
+        elif hw_method == 'qsv':
+            return ['-hwaccel', 'qsv']
+        elif hw_method == 'nvenc':
+            return ['-hwaccel', 'cuda']
+        elif hw_method == 'cuda':
+            return ['-hwaccel', 'cuda']
+        elif hw_method == 'videotoolbox':
+            return ['-hwaccel', 'videotoolbox']
+        else:
+            return ['-hwaccel', 'auto']
+    
+    def _get_hw_encoding_args(self, hw_method: str) -> List[str]:
+        """Get hardware encoding arguments for FFmpeg."""
+        if hw_method == 'vaapi':
+            return ['-c:v', 'h264_vaapi', '-vf', 'format=nv12,hwupload']
+        elif hw_method == 'qsv':
+            return ['-c:v', 'h264_qsv', '-preset', 'medium']
+        elif hw_method == 'nvenc':
+            return ['-c:v', 'h264_nvenc', '-preset', 'medium']
+        elif hw_method == 'cuda':
+            return ['-c:v', 'h264_nvenc', '-preset', 'medium']
+        elif hw_method == 'videotoolbox':
+            return ['-c:v', 'h264_videotoolbox']
+        else:
+            return ['-c:v', 'libx264', '-preset', 'fast', '-crf', '23']
+    
+    def _can_copy_codec(self, input_url: str) -> bool:
+        """Check if we can copy codecs without transcoding."""
+        try:
+            probe = ffmpeg.probe(str(input_url), timeout=5)
+            if 'streams' in probe:
+                for stream in probe['streams']:
+                    if stream.get('codec_type') == 'video':
+                        codec_name = stream.get('codec_name', '').lower()
+                        # Can copy common streaming codecs
+                        if codec_name in ['h264', 'h265', 'hevc']:
+                            return True
+            return False
+        except Exception:
+            return False
 
     def _has_hardware_acceleration(self) -> bool:
         """Check if hardware acceleration is available."""
-        # Check for NVIDIA GPU
-        try:
-            result = subprocess.run(['nvidia-smi'], capture_output=True, timeout=5)
-            if result.returncode == 0:
-                return True
-        except (subprocess.TimeoutExpired, FileNotFoundError):
-            pass
-            
-        # Check for Intel Quick Sync (Linux)
+        hw_methods = self._detect_hardware_acceleration()
+        return len(hw_methods) > 0
+    
+    def _detect_hardware_acceleration(self) -> Dict[str, bool]:
+        """Detect available hardware acceleration methods."""
+        hw_support = {
+            'vaapi': False,
+            'qsv': False,
+            'nvenc': False,
+            'videotoolbox': False,
+            'cuda': False,
+            'opencl': False
+        }
+        
+        # Check VAAPI (Intel/AMD on Linux)
         if os.path.exists('/dev/dri'):
-            return True
-            
-        # Check for macOS VideoToolbox
+            try:
+                # Check if VAAPI devices are accessible
+                dri_devices = [f for f in os.listdir('/dev/dri') if f.startswith('render')]
+                if dri_devices:
+                    # Test VAAPI with FFmpeg
+                    result = subprocess.run([
+                        'ffmpeg', '-hide_banner', '-f', 'lavfi', '-i', 'testsrc2=duration=1:size=320x240:rate=1',
+                        '-t', '1', '-vaapi_device', '/dev/dri/renderD128', '-vf', 'format=nv12,hwupload', 
+                        '-c:v', 'h264_vaapi', '-f', 'null', '-'
+                    ], capture_output=True, timeout=5)
+                    hw_support['vaapi'] = result.returncode == 0
+            except (subprocess.TimeoutExpired, FileNotFoundError, PermissionError):
+                pass
+        
+        # Check Intel QSV
         try:
             result = subprocess.run(['ffmpeg', '-hwaccels'], capture_output=True, timeout=5)
-            if b'videotoolbox' in result.stdout:
-                return True
+            if b'qsv' in result.stdout:
+                # Test QSV encoding
+                test_result = subprocess.run([
+                    'ffmpeg', '-hide_banner', '-f', 'lavfi', '-i', 'testsrc2=duration=1:size=320x240:rate=1',
+                    '-t', '1', '-c:v', 'h264_qsv', '-preset', 'fast', '-f', 'null', '-'
+                ], capture_output=True, timeout=10)
+                hw_support['qsv'] = test_result.returncode == 0
         except (subprocess.TimeoutExpired, FileNotFoundError):
             pass
             
-        return False
+        # Check NVIDIA NVENC
+        try:
+            # Check if nvidia-smi exists and GPU is available
+            result = subprocess.run(['nvidia-smi', '--query-gpu=name', '--format=csv,noheader'], 
+                                   capture_output=True, timeout=5)
+            if result.returncode == 0:
+                # Test NVENC encoding
+                test_result = subprocess.run([
+                    'ffmpeg', '-hide_banner', '-f', 'lavfi', '-i', 'testsrc2=duration=1:size=320x240:rate=1',
+                    '-t', '1', '-c:v', 'h264_nvenc', '-preset', 'fast', '-f', 'null', '-'
+                ], capture_output=True, timeout=10)
+                hw_support['nvenc'] = test_result.returncode == 0
+                
+                # Check CUDA support
+                cuda_result = subprocess.run([
+                    'ffmpeg', '-hide_banner', '-f', 'lavfi', '-i', 'testsrc2=duration=1:size=320x240:rate=1',
+                    '-t', '1', '-filter:v', 'scale_cuda=320:240', '-c:v', 'h264_nvenc', '-f', 'null', '-'
+                ], capture_output=True, timeout=10)
+                hw_support['cuda'] = cuda_result.returncode == 0
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            pass
+            
+        # Check macOS VideoToolbox
+        if os.uname().sysname == 'Darwin':
+            try:
+                result = subprocess.run(['ffmpeg', '-hwaccels'], capture_output=True, timeout=5)
+                if b'videotoolbox' in result.stdout:
+                    # Test VideoToolbox encoding
+                    test_result = subprocess.run([
+                        'ffmpeg', '-hide_banner', '-f', 'lavfi', '-i', 'testsrc2=duration=1:size=320x240:rate=1',
+                        '-t', '1', '-c:v', 'h264_videotoolbox', '-f', 'null', '-'
+                    ], capture_output=True, timeout=10)
+                    hw_support['videotoolbox'] = test_result.returncode == 0
+            except (subprocess.TimeoutExpired, FileNotFoundError):
+                pass
+        
+        # Check OpenCL support
+        try:
+            result = subprocess.run(['ffmpeg', '-hwaccels'], capture_output=True, timeout=5)
+            if b'opencl' in result.stdout:
+                hw_support['opencl'] = True
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            pass
+            
+        return hw_support
+    
+    def _get_best_hw_acceleration(self) -> Optional[str]:
+        """Get the best available hardware acceleration method."""
+        hw_support = self._detect_hardware_acceleration()
+        
+        # Priority order: NVENC > QSV > VAAPI > VideoToolbox > CUDA > OpenCL
+        priority_order = ['nvenc', 'qsv', 'vaapi', 'videotoolbox', 'cuda', 'opencl']
+        
+        for method in priority_order:
+            if hw_support.get(method, False):
+                return method
+        
+        return None

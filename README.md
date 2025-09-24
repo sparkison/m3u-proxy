@@ -42,7 +42,7 @@ A high-performance streaming proxy service built with Python that supports multi
    ```
 
 4. **Access the API**:
-   - API docs: http://localhost:PORT/docs (where PORT is from .env, default 8080)
+   - API docs: http://localhost:PORT/docs (where PORT is from .env, default 8085)
    - Health check: http://localhost:PORT/health
 
 ### Docker Deployment
@@ -73,10 +73,26 @@ A high-performance streaming proxy service built with Python that supports multi
 
 ## API Usage
 
+### Monitor Streams
+
+```bash
+# Get all streams
+curl "http://localhost:8085/streams"
+
+# Get specific stream
+curl "http://localhost:8085/streams/{stream_id}"
+
+# Get system stats
+curl "http://localhost:8085/stats"
+
+# Get hardware acceleration info
+curl "http://localhost:8085/hardware"
+```
+
 ### Create a Stream
 
 ```bash
-curl -X POST "http://localhost:8080/streams" \
+curl -X POST "http://localhost:8085/streams" \
      -H "Content-Type: application/json" \
      -d '{
        "primary_url": "https://example.com/stream.m3u8",
@@ -91,31 +107,31 @@ curl -X POST "http://localhost:8080/streams" \
 ### Start a Stream
 
 ```bash
-curl -X POST "http://localhost:8080/streams/{stream_id}/start"
+curl -X POST "http://localhost:8085/streams/{stream_id}/start"
 ```
 
 ### Connect to Stream
 
-- **HLS**: `http://localhost:8080/streams/{stream_id}/playlist.m3u8`
-- **Direct**: `http://localhost:8080/streams/{stream_id}/stream`
+- **HLS**: `http://localhost:8085/streams/{stream_id}/playlist.m3u8`
+- **Direct**: `http://localhost:8085/streams/{stream_id}/stream`
 
 ### Monitor Streams
 
 ```bash
 # Get all streams
-curl "http://localhost:8080/streams"
+curl "http://localhost:8085/streams"
 
 # Get specific stream
-curl "http://localhost:8080/streams/{stream_id}"
+curl "http://localhost:8085/streams/{stream_id}"
 
 # Get system stats
-curl "http://localhost:8080/stats"
+curl "http://localhost:8085/stats"
 ```
 
 ### Seek in VOD Content
 
 ```bash
-curl -X POST "http://localhost:8080/streams/{stream_id}/seek" \
+curl -X POST "http://localhost:8085/streams/{stream_id}/seek" \
      -H "Content-Type: application/json" \
      -d '{"position": 120.5}'
 ```
@@ -123,7 +139,7 @@ curl -X POST "http://localhost:8080/streams/{stream_id}/seek" \
 ### Configure Webhooks
 
 ```bash
-curl -X POST "http://localhost:8080/webhooks" \
+curl -X POST "http://localhost:8085/webhooks" \
      -H "Content-Type: application/json" \
      -d '{
        "url": "https://your-webhook-url.com/events",
@@ -183,10 +199,28 @@ To avoid port conflicts with other applications:
 
 The service automatically detects and uses available hardware acceleration:
 
-- **NVIDIA GPUs**: Uses NVENC/NVDEC when available
-- **Intel Quick Sync**: Uses when `/dev/dri` is available
-- **macOS VideoToolbox**: Uses on macOS systems
-- **Auto-detection**: Automatically falls back to software encoding
+- **VAAPI**: Intel/AMD hardware acceleration on Linux (requires `/dev/dri` access)
+- **Intel Quick Sync (QSV)**: Intel CPU hardware acceleration
+- **NVIDIA NVENC**: NVIDIA GPU hardware acceleration
+- **NVIDIA CUDA**: GPU acceleration for filtering and scaling
+- **Apple VideoToolbox**: Hardware acceleration on macOS
+- **OpenCL**: Cross-platform acceleration for filtering
+
+**Priority Order**: NVENC > QSV > VAAPI > VideoToolbox > CUDA > OpenCL
+
+**Check Available Methods**:
+```bash
+curl http://localhost:8085/hardware
+```
+
+**Docker with Hardware Acceleration**:
+```bash
+# For Intel/AMD (VAAPI)
+docker run --device /dev/dri:/dev/dri m3u-proxy
+
+# For NVIDIA (add nvidia runtime)
+docker run --gpus all --device /dev/dri:/dev/dri m3u-proxy
+```
 
 ## Event System
 
@@ -235,7 +269,7 @@ server {
     server_name your-domain.com;
     
     location / {
-        proxy_pass http://127.0.0.1:8080;
+        proxy_pass http://127.0.0.1:8085;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;

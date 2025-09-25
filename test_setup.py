@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Test script to verify M3U Proxy setup and basic functionality
+Test script to verify m3u-proxy setup and basic functionality
 """
 
 import asyncio
@@ -123,7 +123,7 @@ class M3UProxyTest:
     
     async def run_all_tests(self) -> bool:
         """Run all tests"""
-        print("🚀 Starting M3U Proxy tests...")
+        print("🚀 Starting m3u-proxy tests...")
         print("=" * 50)
         
         tests = [
@@ -170,7 +170,7 @@ async def main():
     success = await tester.run_all_tests()
     
     if success:
-        print("\n🎉 All tests passed! M3U Proxy is working correctly.")
+        print("\n🎉 All tests passed! m3u-proxy is working correctly.")
         sys.exit(0)
     else:
         print("\n💥 Some tests failed. Check the server setup.")

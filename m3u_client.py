@@ -10,13 +10,15 @@ class M3UProxyClient:
     def __init__(self, base_url="http://localhost:8001"):
         self.base_url = base_url
     
-    def create_stream(self, url, failover_urls=None):
+    def create_stream(self, url, failover_urls=None, user_agent=None):
         """Create a new stream"""
-        params = {"url": url}
+        data = {"url": url}
         if failover_urls:
-            params["failover_urls"] = ",".join(failover_urls)
+            data["failover_urls"] = failover_urls
+        if user_agent:
+            data["user_agent"] = user_agent
         
-        response = requests.post(f"{self.base_url}/streams", params=params)
+        response = requests.post(f"{self.base_url}/streams", json=data)
         return response.json()
     
     def list_streams(self):
@@ -101,7 +103,7 @@ class M3UProxyClient:
                 print()
 
 def main():
-    parser = argparse.ArgumentParser(description="M3U Proxy Client")
+    parser = argparse.ArgumentParser(description="m3u-proxy Client")
     parser.add_argument("--base-url", default="http://localhost:8001", 
                        help="Base URL of the proxy server")
     
@@ -111,6 +113,7 @@ def main():
     create_parser = subparsers.add_parser("create", help="Create a new stream")
     create_parser.add_argument("url", help="Primary stream URL")
     create_parser.add_argument("--failover", nargs="*", help="Failover URLs")
+    create_parser.add_argument("--user-agent", help="Custom user agent string")
     
     # List streams
     subparsers.add_parser("list", help="List all streams")
@@ -142,7 +145,7 @@ def main():
     
     try:
         if args.command == "create":
-            result = client.create_stream(args.url, args.failover)
+            result = client.create_stream(args.url, args.failover, args.user_agent)
             print(json.dumps(result, indent=2))
             
         elif args.command == "list":
@@ -174,7 +177,7 @@ def main():
             print(json.dumps(result, indent=2))
             
         elif args.command == "monitor":
-            print("Monitoring M3U Proxy (Press Ctrl+C to stop)...")
+            print("Monitoring m3u-proxy (Press Ctrl+C to stop)...")
             try:
                 while True:
                     client.print_stats()

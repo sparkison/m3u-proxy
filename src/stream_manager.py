@@ -35,6 +35,7 @@ class StreamInfo:
     failover_urls: List[str] = field(default_factory=list)
     current_failover_index: int = 0
     current_url: Optional[str] = None
+    user_agent: str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"
 
 @dataclass
 class ProxyStats:
@@ -105,7 +106,7 @@ class M3U8Processor:
         
         return '\n'.join(processed_lines)
 
-class EnhancedStreamManager:
+class StreamManager:
     def __init__(self):
         self.streams: Dict[str, StreamInfo] = {}
         self.clients: Dict[str, ClientInfo] = {}
@@ -124,7 +125,7 @@ class EnhancedStreamManager:
         """Start the stream manager"""
         self._running = True
         self._cleanup_task = asyncio.create_task(self._periodic_cleanup())
-        logger.info("Enhanced stream manager started")
+        logger.info("Stream manager started")
     
     async def stop(self):
         """Stop the stream manager"""
@@ -132,12 +133,13 @@ class EnhancedStreamManager:
         if self._cleanup_task:
             self._cleanup_task.cancel()
         await self.http_client.aclose()
-        logger.info("Enhanced stream manager stopped")
+        logger.info("Stream manager stopped")
     
     async def get_or_create_stream(
         self, 
         stream_url: str, 
-        failover_urls: Optional[List[str]] = None
+        failover_urls: Optional[List[str]] = None,
+        user_agent: Optional[str] = None
     ) -> str:
         """Get or create a stream and return its ID"""
         # Create a stream ID based on the URL
@@ -146,18 +148,23 @@ class EnhancedStreamManager:
         
         if stream_id not in self.streams:
             now = datetime.now()
+            # Use provided user agent or default
+            if user_agent is None:
+                user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"
+            
             self.streams[stream_id] = StreamInfo(
                 stream_id=stream_id,
                 original_url=stream_url,
                 current_url=stream_url,
                 created_at=now,
                 last_access=now,
-                failover_urls=failover_urls or []
+                failover_urls=failover_urls or [],
+                user_agent=user_agent
             )
             self.stream_clients[stream_id] = set()
             self._stats.total_streams += 1
             self._stats.active_streams += 1
-            logger.info(f"Created new stream: {stream_id}")
+            logger.info(f"Created new stream: {stream_id} with user agent: {user_agent}")
         
         # Update last access
         self.streams[stream_id].last_access = datetime.now()
@@ -213,7 +220,9 @@ class EnhancedStreamManager:
         
         try:
             logger.info(f"Fetching playlist from: {current_url}")
-            response = await self.http_client.get(current_url)
+            # Use stream-specific user agent
+            headers = {'User-Agent': stream_info.user_agent}
+            response = await self.http_client.get(current_url, headers=headers)
             response.raise_for_status()
             
             content = response.text
@@ -262,8 +271,16 @@ class EnhancedStreamManager:
         try:
             logger.info(f"Client {client_id} requesting segment: {segment_url}")
             
-            # Prepare headers
-            headers = {}
+            # Prepare headers with user agent from stream
+            headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36'}  # default
+            
+            # Get user agent from client's stream if available
+            if client_id in self.clients:
+                client_info = self.clients[client_id]
+                if client_info.stream_id and client_info.stream_id in self.streams:
+                    stream_info = self.streams[client_info.stream_id]
+                    headers['User-Agent'] = stream_info.user_agent
+            
             if range_header:
                 headers['Range'] = range_header
                 logger.info(f"Range request: {range_header}")
@@ -315,8 +332,9 @@ class EnhancedStreamManager:
         logger.info(f"Attempting failover for stream {stream_id} to: {next_url}")
         
         try:
-            # Test the failover URL
-            response = await self.http_client.head(next_url, timeout=10.0)
+            # Test the failover URL with stream's user agent
+            headers = {'User-Agent': stream_info.user_agent}
+            response = await self.http_client.head(next_url, headers=headers, timeout=10.0)
             response.raise_for_status()
             
             # Failover successful
@@ -411,6 +429,7 @@ class EnhancedStreamManager:
                     "stream_id": stream.stream_id,
                     "original_url": stream.original_url,
                     "current_url": stream.current_url,
+                    "user_agent": stream.user_agent,
                     "client_count": stream.client_count,
                     "total_bytes_served": stream.total_bytes_served,
                     "total_segments_served": stream.total_segments_served,

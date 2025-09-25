@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-M3U Proxy Enhanced - Main Entry Point
-A high-performance HLS streaming proxy with client management and failover support.
+m3u-proxy - Main Entry Point
+A high-performance IPTV streaming proxy with client management and failover support.
 """
 
 import uvicorn
@@ -14,7 +14,7 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
 
 def main():
-    parser = argparse.ArgumentParser(description="M3U Proxy Enhanced Server")
+    parser = argparse.ArgumentParser(description="m3u-proxy Enhanced Server")
     parser.add_argument("--host", default="0.0.0.0", help="Host to bind to")
     parser.add_argument("--port", type=int, default=8001, help="Port to bind to")
     parser.add_argument("--debug", action="store_true", help="Enable debug mode")
@@ -31,7 +31,7 @@ def main():
     )
     
     logger = logging.getLogger(__name__)
-    logger.info(f"Starting M3U Proxy Enhanced on {args.host}:{args.port}")
+    logger.info(f"Starting m3u-proxy on {args.host}:{args.port}")
     
     # Start the server
     uvicorn.run(

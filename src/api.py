@@ -6,8 +6,9 @@ import uuid
 from urllib.parse import unquote
 from typing import Optional, List
 import json
+from pydantic import BaseModel
 
-from stream_manager import EnhancedStreamManager
+from stream_manager import StreamManager
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -35,23 +36,29 @@ def is_direct_stream(url: str) -> bool:
     """Check if URL is a direct stream (not HLS playlist)"""
     return url.lower().endswith(('.ts', '.mp4', '.mkv', '.webm', '.avi'))
 
+# Request models
+class StreamCreateRequest(BaseModel):
+    url: str
+    failover_urls: Optional[List[str]] = None
+    user_agent: Optional[str] = None
+
 app = FastAPI(
-    title="M3U Proxy", 
+    title="m3u-proxy", 
     version="2.0.0",
-    description="Advanced HLS streaming proxy with client management, stats, and failover support"
+    description="Advanced IPTV streaming proxy with client management, stats, and failover support"
 )
 
 # Global stream manager
-stream_manager = EnhancedStreamManager()
+stream_manager = StreamManager()
 
 @app.on_event("startup")
 async def startup_event():
-    logger.info("M3U Proxy Enhanced starting up...")
+    logger.info("m3u-proxy Enhanced starting up...")
     await stream_manager.start()
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    logger.info("M3U Proxy Enhanced shutting down...")
+    logger.info("m3u-proxy Enhanced shutting down...")
     await stream_manager.stop()
 
 def get_client_info(request: Request):
@@ -65,26 +72,23 @@ def get_client_info(request: Request):
 async def root():
     stats = stream_manager.get_stats()
     return {
-        "message": "M3U Proxy Enhanced is running", 
+        "message": "m3u-proxy Enhanced is running", 
         "version": "2.0.0",
         "stats": stats["proxy_stats"]
     }
 
 @app.post("/streams")
-async def create_stream(
-    url: str = Query(..., description="Stream URL (HLS .m3u8 or direct .ts/.mp4/.mkv)"),
-    failover_urls: Optional[str] = Query(None, description="Comma-separated failover URLs"),
-):
-    """Create a new stream with optional failover URLs"""
+async def create_stream(request: StreamCreateRequest):
+    """Create a new stream with optional failover URLs and custom user agent"""
     try:
-        failover_list = []
-        if failover_urls:
-            failover_list = [u.strip() for u in failover_urls.split(',') if u.strip()]
-        
-        stream_id = await stream_manager.get_or_create_stream(url, failover_list)
+        stream_id = await stream_manager.get_or_create_stream(
+            request.url, 
+            request.failover_urls,
+            request.user_agent
+        )
         
         # Determine the appropriate endpoint based on stream type
-        if is_direct_stream(url):
+        if is_direct_stream(request.url):
             stream_endpoint = f"/stream/{stream_id}"
             stream_type = "direct"
         else:
@@ -93,8 +97,9 @@ async def create_stream(
         
         return {
             "stream_id": stream_id,
-            "primary_url": url,
-            "failover_urls": failover_list,
+            "primary_url": request.url,
+            "failover_urls": request.failover_urls or [],
+            "user_agent": request.user_agent or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36",
             "stream_type": stream_type,
             "stream_endpoint": stream_endpoint,
             "message": f"Stream created successfully ({stream_type})"

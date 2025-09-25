@@ -220,6 +220,11 @@ class StreamManager:
             data={"client_id": client_id}
         ))
 
+        # Stop stream if no clients remain
+        if stream_id in self.streams and len(self.clients[stream_id]) == 0:
+            logger.info(f"No clients remaining for stream {stream_id}, stopping stream")
+            await self.stop_stream(stream_id)
+
         logger.info(f"Disconnected client {client_id} from stream {stream_id}")
         return True
 
@@ -281,6 +286,29 @@ class StreamManager:
 
         config = self.stream_configs[stream_id]
         stream_info = self.streams[stream_id]
+
+        # Check if there are any connected clients
+        if len(self.clients.get(stream_id, set())) == 0:
+            logger.info(f"Stream {stream_id} ended and no clients connected, stopping")
+            stream_info.status = StreamStatus.STOPPED
+            # Clean up the process reference
+            if stream_id in self.stream_processes:
+                del self.stream_processes[stream_id]
+            return
+
+        # For VOD streams that naturally end, don't restart unless there are failover URLs
+        if not stream_info.is_live and not config.failover_urls:
+            logger.info(f"VOD stream {stream_id} ended naturally, stopping")
+            stream_info.status = StreamStatus.STOPPED
+            # Clean up the process reference
+            if stream_id in self.stream_processes:
+                del self.stream_processes[stream_id]
+            await self.event_manager.emit_event(StreamEvent(
+                event_type=EventType.STREAM_STOPPED,
+                stream_id=stream_id,
+                data={"reason": "VOD stream ended naturally"}
+            ))
+            return
 
         # Try failover URLs
         if config.failover_urls and stream_info.current_url_index < len(config.failover_urls):

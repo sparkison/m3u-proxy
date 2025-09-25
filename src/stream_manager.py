@@ -121,7 +121,9 @@ class StreamManager:
         self.stream_timeout = 300  # 5 minutes
         self.http_client = httpx.AsyncClient(
             timeout=30.0,
-            headers={'User-Agent': 'M3U-Proxy/2.0'}
+            headers={'User-Agent': 'M3U-Proxy/2.0'},
+            follow_redirects=True,  # Enable redirect following
+            max_redirects=10        # Limit redirects to prevent loops
         )
         self._stats = ProxyStats()
         self._cleanup_task: Optional[asyncio.Task] = None
@@ -316,12 +318,59 @@ class StreamManager:
                 headers['Range'] = range_header
                 logger.info(f"Range request: {range_header}")
 
+            # Handle redirects manually for streaming
+            current_url = segment_url
+            max_redirects = 10
+            redirect_count = 0
             bytes_served = 0
-            async with self.http_client.stream('GET', segment_url, headers=headers) as response:
-                response.raise_for_status()
-                async for chunk in response.aiter_bytes(chunk_size=8192):
-                    bytes_served += len(chunk)
-                    yield chunk
+            
+            while redirect_count < max_redirects:
+                try:
+                    async with self.http_client.stream('GET', current_url, headers=headers, follow_redirects=False) as response:
+                        # Handle redirects manually
+                        if response.status_code in (301, 302, 303, 307, 308):
+                            location = response.headers.get('location')
+                            if not location:
+                                logger.error(f"Redirect response without location header for {current_url}")
+                                response.raise_for_status()
+                                return
+                                
+                            # Handle relative redirects
+                            if location.startswith('/'):
+                                from urllib.parse import urlparse, urljoin
+                                parsed_url = urlparse(current_url)
+                                base_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
+                                current_url = urljoin(base_url, location)
+                            elif not location.startswith('http'):
+                                from urllib.parse import urljoin
+                                current_url = urljoin(current_url, location)
+                            else:
+                                current_url = location
+                                
+                            redirect_count += 1
+                            logger.info(f"Following redirect {redirect_count}/{max_redirects}: {segment_url} -> {current_url}")
+                            continue
+                        
+                        # Not a redirect, process the response
+                        logger.debug(f"Streaming segment from final URL: {current_url} (after {redirect_count} redirects)")
+                        response.raise_for_status()
+                        async for chunk in response.aiter_bytes(chunk_size=8192):
+                            bytes_served += len(chunk)
+                            yield chunk
+                        break  # Successfully streamed, exit the redirect loop
+                        
+                except Exception as e:
+                    logger.error(f"Error during redirect {redirect_count} for {current_url}: {e}")
+                    if redirect_count == 0:
+                        # If first request fails, re-raise the error
+                        raise
+                    else:
+                        # If a redirect fails, try to continue with what we have
+                        break
+            
+            if redirect_count >= max_redirects:
+                logger.error(f"Too many redirects ({max_redirects}) for segment: {segment_url}")
+                raise Exception(f"Too many redirects for segment: {segment_url}")
 
             # Update client stats
             if client_id in self.clients:

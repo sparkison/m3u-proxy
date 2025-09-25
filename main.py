@@ -1,75 +1,46 @@
 #!/usr/bin/env python3
 """
-M3U Streaming Proxy Server
-Main entry point for the application
+M3U Proxy Enhanced - Main Entry Point
+A high-performance HLS streaming proxy with client management and failover support.
 """
 
-import asyncio
 import uvicorn
 import argparse
-import os
 import logging
-from pathlib import Path
+import sys
+import os
 
-from src.config import config
-
-
-def setup_logging(debug: bool = None):
-    """Setup logging configuration."""
-    if debug is None:
-        debug = config.debug
-    
-    level = logging.DEBUG if debug else getattr(logging, config.log_level, logging.INFO)
-    
-    # Ensure log file directory exists
-    log_file = config.log_file
-    if os.path.dirname(log_file):
-        os.makedirs(os.path.dirname(log_file), exist_ok=True)
-    
-    logging.basicConfig(
-        level=level,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.StreamHandler(),
-            logging.FileHandler(log_file)
-        ]
-    )
-
+# Add the src directory to Python path
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
 
 def main():
-    parser = argparse.ArgumentParser(description='M3U Streaming Proxy Server')
-    parser.add_argument('--host', default=config.host, help='Host to bind to')
-    parser.add_argument('--port', type=int, default=config.port, help='Port to bind to')
-    parser.add_argument('--reload', action='store_true', help='Enable auto-reload')
-    parser.add_argument('--debug', action='store_true', help='Enable debug logging')
-    parser.add_argument('--workers', type=int, default=1, help='Number of workers')
+    parser = argparse.ArgumentParser(description="M3U Proxy Enhanced Server")
+    parser.add_argument("--host", default="0.0.0.0", help="Host to bind to")
+    parser.add_argument("--port", type=int, default=8001, help="Port to bind to")
+    parser.add_argument("--debug", action="store_true", help="Enable debug mode")
+    parser.add_argument("--reload", action="store_true", help="Enable auto-reload")
+    parser.add_argument("--log-level", choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'], 
+                       default='INFO', help="Logging level")
     
     args = parser.parse_args()
     
-    setup_logging(args.debug)
-    
-    # Create temp directory for streams
-    os.makedirs(config.temp_dir, exist_ok=True)
+    # Configure logging
+    logging.basicConfig(
+        level=getattr(logging, args.log_level),
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
     
     logger = logging.getLogger(__name__)
-    logger.info(f"Starting M3U Proxy Server on {args.host}:{args.port}")
-    logger.info(f"Configuration: {config.to_dict()}")
+    logger.info(f"Starting M3U Proxy Enhanced on {args.host}:{args.port}")
     
-    try:
-        uvicorn.run(
-            "src.api:app",
-            host=args.host,
-            port=args.port,
-            reload=args.reload,
-            workers=args.workers,
-            log_level="debug" if args.debug else config.log_level.lower(),
-            access_log=True
-        )
-    except KeyboardInterrupt:
-        logger.info("Server stopped by user")
-    except Exception as e:
-        logger.error(f"Server error: {e}")
-        raise
+    # Start the server
+    uvicorn.run(
+        "api:app",
+        host=args.host,
+        port=args.port,
+        reload=args.reload,
+        log_level=args.log_level.lower()
+    )
 
 if __name__ == "__main__":
     main()

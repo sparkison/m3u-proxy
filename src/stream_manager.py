@@ -1,694 +1,438 @@
 import asyncio
-import aiohttp
-import logging
+import httpx
+import re
 import time
-import psutil
-from typing import Dict, List, Optional, Set
+import logging
+from typing import Dict, Optional, AsyncIterator, List, Set
+from urllib.parse import urljoin, urlparse, quote, unquote
 from datetime import datetime
-import uuid
-import json
-import ffmpeg
-import m3u8
-import os
-import signal
-import subprocess
-from pathlib import Path
-
-from .models import (
-    StreamConfig, StreamInfo, StreamStatus, StreamFormat, 
-    ClientInfo, StreamEvent, EventType, StreamSeekRequest
-)
-from .events import EventManager
-from .config import config
-
+from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
 
+@dataclass
+class ClientInfo:
+    client_id: str
+    created_at: datetime
+    last_access: datetime
+    user_agent: Optional[str] = None
+    ip_address: Optional[str] = None
+    stream_id: Optional[str] = None
+    bytes_served: int = 0
+    segments_served: int = 0
 
-class StreamManager:
-    def __init__(self, event_manager: EventManager):
-        self.event_manager = event_manager
+@dataclass
+class StreamInfo:
+    stream_id: str
+    original_url: str
+    created_at: datetime
+    last_access: datetime
+    client_count: int = 0
+    total_bytes_served: int = 0
+    total_segments_served: int = 0
+    error_count: int = 0
+    is_active: bool = True
+    failover_urls: List[str] = field(default_factory=list)
+    current_failover_index: int = 0
+    current_url: Optional[str] = None
+
+@dataclass
+class ProxyStats:
+    total_streams: int = 0
+    active_streams: int = 0
+    total_clients: int = 0
+    active_clients: int = 0
+    total_bytes_served: int = 0
+    total_segments_served: int = 0
+    uptime_start: datetime = field(default_factory=datetime.now)
+
+class M3U8Processor:
+    def __init__(self, base_url: str):
+        self.base_url = base_url
+    
+    async def process_playlist(self, content: str, original_base_url: str) -> str:
+        """Process M3U8 playlist content, rewriting URLs appropriately"""
+        lines = content.split('\n')
+        processed_lines = []
+        
+        # Check if this is a master playlist (contains #EXT-X-STREAM-INF)
+        is_master_playlist = any('#EXT-X-STREAM-INF' in line for line in lines)
+        
+        for line in lines:
+            original_line = line
+            line = line.strip()
+            
+            if line and not line.startswith('#'):
+                # This is a direct URL line
+                if line.startswith('http'):
+                    full_url = line
+                else:
+                    # Relative URL - resolve it
+                    full_url = urljoin(original_base_url, line)
+                
+                if is_master_playlist:
+                    # This is a variant playlist URL - proxy it as another playlist
+                    encoded_url = quote(full_url, safe='')
+                    proxy_url = f"{self.base_url}/playlist.m3u8?url={encoded_url}"
+                else:
+                    # This is a media segment URL - proxy it as a segment
+                    encoded_url = quote(full_url, safe='')
+                    proxy_url = f"{self.base_url}/segment?url={encoded_url}"
+                
+                processed_lines.append(proxy_url)
+                
+            elif line.startswith('#EXT-X-MAP:'):
+                # Process EXT-X-MAP URI
+                uri_match = re.search(r'URI="([^"]+)"', line)
+                if uri_match:
+                    uri = uri_match.group(1)
+                    if uri.startswith('http'):
+                        full_url = uri
+                    else:
+                        full_url = urljoin(original_base_url, uri)
+                    
+                    encoded_url = quote(full_url, safe='')
+                    proxy_url = f"{self.base_url}/segment?url={encoded_url}"
+                    
+                    # Replace the URI in the line
+                    new_line = line.replace(f'URI="{uri}"', f'URI="{proxy_url}"')
+                    processed_lines.append(new_line)
+                else:
+                    processed_lines.append(original_line)
+                    
+            else:
+                processed_lines.append(original_line)
+        
+        return '\n'.join(processed_lines)
+
+class EnhancedStreamManager:
+    def __init__(self):
         self.streams: Dict[str, StreamInfo] = {}
-        self.stream_processes: Dict[str, subprocess.Popen] = {}
-        self.stream_configs: Dict[str, StreamConfig] = {}
-        self.clients: Dict[str, Set[str]] = {}  # stream_id -> set of client_ids
-        self.client_info: Dict[str, ClientInfo] = {}
+        self.clients: Dict[str, ClientInfo] = {}
+        self.stream_clients: Dict[str, Set[str]] = {}  # stream_id -> client_ids
+        self.client_timeout = 30  # seconds
+        self.stream_timeout = 300  # 5 minutes
+        self.http_client = httpx.AsyncClient(
+            timeout=30.0,
+            headers={'User-Agent': 'M3U-Proxy/2.0'}
+        )
+        self._stats = ProxyStats()
+        self._cleanup_task: Optional[asyncio.Task] = None
         self._running = False
-        self._monitor_task: Optional[asyncio.Task] = None
-
+    
     async def start(self):
-        """Start the stream manager and monitoring task."""
+        """Start the stream manager"""
         self._running = True
-        self._monitor_task = asyncio.create_task(self._monitor_streams())
-        logger.info("Stream manager started")
-
+        self._cleanup_task = asyncio.create_task(self._periodic_cleanup())
+        logger.info("Enhanced stream manager started")
+    
     async def stop(self):
-        """Stop the stream manager and all active streams."""
+        """Stop the stream manager"""
         self._running = False
-        if self._monitor_task:
-            self._monitor_task.cancel()
-            try:
-                await self._monitor_task
-            except asyncio.CancelledError:
-                pass
-
-        # Stop all active streams
-        for stream_id in list(self.streams.keys()):
-            await self.stop_stream(stream_id)
-
-        logger.info("Stream manager stopped")
-
-    async def create_stream(self, config: StreamConfig) -> StreamInfo:
-        """Create a new stream with the given configuration."""
-        stream_info = StreamInfo(
-            stream_id=config.stream_id,
-            status=StreamStatus.IDLE,
-            current_url=config.primary_url,
-            current_url_index=0,
-            is_live=True
-        )
-
-        self.streams[config.stream_id] = stream_info
-        self.stream_configs[config.stream_id] = config
-        self.clients[config.stream_id] = set()
-
-        logger.info(f"Created stream {config.stream_id}")
-        return stream_info
-
-    async def start_stream(self, stream_id: str) -> StreamInfo:
-        """Start a stream if it's not already running."""
+        if self._cleanup_task:
+            self._cleanup_task.cancel()
+        await self.http_client.aclose()
+        logger.info("Enhanced stream manager stopped")
+    
+    async def get_or_create_stream(
+        self, 
+        stream_url: str, 
+        failover_urls: Optional[List[str]] = None
+    ) -> str:
+        """Get or create a stream and return its ID"""
+        # Create a stream ID based on the URL
+        import hashlib
+        stream_id = hashlib.md5(stream_url.encode()).hexdigest()
+        
         if stream_id not in self.streams:
-            raise ValueError(f"Stream {stream_id} not found")
-
+            now = datetime.now()
+            self.streams[stream_id] = StreamInfo(
+                stream_id=stream_id,
+                original_url=stream_url,
+                current_url=stream_url,
+                created_at=now,
+                last_access=now,
+                failover_urls=failover_urls or []
+            )
+            self.stream_clients[stream_id] = set()
+            self._stats.total_streams += 1
+            self._stats.active_streams += 1
+            logger.info(f"Created new stream: {stream_id}")
+        
+        # Update last access
+        self.streams[stream_id].last_access = datetime.now()
+        return stream_id
+    
+    async def register_client(
+        self, 
+        client_id: str, 
+        stream_id: str,
+        user_agent: Optional[str] = None,
+        ip_address: Optional[str] = None
+    ) -> ClientInfo:
+        """Register a client for a stream"""
+        now = datetime.now()
+        
+        if client_id not in self.clients:
+            self.clients[client_id] = ClientInfo(
+                client_id=client_id,
+                created_at=now,
+                last_access=now,
+                user_agent=user_agent,
+                ip_address=ip_address,
+                stream_id=stream_id
+            )
+            self._stats.total_clients += 1
+            self._stats.active_clients += 1
+            logger.info(f"Registered new client: {client_id}")
+        
+        # Add client to stream
+        if stream_id in self.stream_clients:
+            self.stream_clients[stream_id].add(client_id)
+            self.streams[stream_id].client_count = len(self.stream_clients[stream_id])
+        
+        # Update client info
+        client_info = self.clients[client_id]
+        client_info.last_access = now
+        client_info.stream_id = stream_id
+        
+        return client_info
+    
+    async def get_playlist_content(
+        self, 
+        stream_id: str, 
+        client_id: str,
+        base_proxy_url: str
+    ) -> Optional[str]:
+        """Get and process playlist content for a stream"""
+        if stream_id not in self.streams:
+            return None
+        
         stream_info = self.streams[stream_id]
-        config = self.stream_configs[stream_id]
-
-        # If already running, return current info
-        if stream_info.status == StreamStatus.RUNNING:
-            logger.info(f"Stream {stream_id} already running")
-            return stream_info
-
-        stream_info.status = StreamStatus.STARTING
-        stream_info.started_at = datetime.utcnow()
-
+        current_url = stream_info.current_url or stream_info.original_url
+        
         try:
-            # Detect format if not specified
-            if config.auto_detect_format and not config.format:
-                detected_format = await self._detect_format(config.primary_url)
-                config.format = detected_format
-                stream_info.format = detected_format
-
-            # Get stream metadata
-            metadata = await self._get_stream_metadata(config.primary_url)
-            if metadata:
-                stream_info.duration = metadata.get('duration')
-                stream_info.bitrate = metadata.get('bit_rate')
-                stream_info.resolution = metadata.get('resolution')
-                stream_info.fps = metadata.get('fps')
-                stream_info.is_live = metadata.get('duration') is None
-
-            # Start FFmpeg process
-            process = await self._start_ffmpeg_process(config, stream_info)
-            self.stream_processes[stream_id] = process
-
-            stream_info.status = StreamStatus.RUNNING
-            stream_info.last_error = None
-
-            # Emit event
-            await self.event_manager.emit_event(StreamEvent(
-                event_type=EventType.STREAM_STARTED,
-                stream_id=stream_id,
-                data={"url": str(config.primary_url), "format": config.format}
-            ))
-
-            logger.info(f"Started stream {stream_id}")
-            return stream_info
-
+            logger.info(f"Fetching playlist from: {current_url}")
+            response = await self.http_client.get(current_url)
+            response.raise_for_status()
+            
+            content = response.text
+            logger.info(f"Received playlist content ({len(content)} chars)")
+            
+            # Determine base URL for resolving relative URLs
+            parsed_url = urlparse(current_url)
+            base_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
+            if parsed_url.path:
+                path_parts = parsed_url.path.rsplit('/', 1)
+                if len(path_parts) > 1:
+                    base_url += path_parts[0] + '/'
+                else:
+                    base_url += '/'
+            else:
+                base_url += '/'
+            
+            # Process the playlist
+            processor = M3U8Processor(base_proxy_url)
+            processed_content = await processor.process_playlist(content, base_url)
+            
+            # Update stats
+            stream_info.last_access = datetime.now()
+            if client_id in self.clients:
+                self.clients[client_id].last_access = datetime.now()
+            
+            return processed_content
+            
         except Exception as e:
-            stream_info.status = StreamStatus.FAILED
-            stream_info.last_error = str(e)
+            logger.error(f"Error fetching playlist for stream {stream_id}: {e}")
             
-            await self.event_manager.emit_event(StreamEvent(
-                event_type=EventType.STREAM_FAILED,
-                stream_id=stream_id,
-                data={"error": str(e), "url": str(config.primary_url)}
-            ))
+            # Try failover if available
+            if await self._try_failover(stream_id):
+                return await self.get_playlist_content(stream_id, client_id, base_proxy_url)
             
-            logger.error(f"Failed to start stream {stream_id}: {e}")
+            stream_info.error_count += 1
+            return None
+    
+    async def proxy_segment(
+        self, 
+        segment_url: str, 
+        client_id: str,
+        range_header: Optional[str] = None
+    ) -> AsyncIterator[bytes]:
+        """Proxy a segment request directly"""
+        try:
+            logger.info(f"Client {client_id} requesting segment: {segment_url}")
+            
+            # Prepare headers
+            headers = {}
+            if range_header:
+                headers['Range'] = range_header
+                logger.info(f"Range request: {range_header}")
+            
+            bytes_served = 0
+            async with self.http_client.stream('GET', segment_url, headers=headers) as response:
+                response.raise_for_status()
+                async for chunk in response.aiter_bytes(chunk_size=8192):
+                    bytes_served += len(chunk)
+                    yield chunk
+            
+            # Update client stats
+            if client_id in self.clients:
+                client_info = self.clients[client_id]
+                client_info.bytes_served += bytes_served
+                client_info.segments_served += 1
+                client_info.last_access = datetime.now()
+                
+                # Update stream stats
+                if client_info.stream_id and client_info.stream_id in self.streams:
+                    stream_info = self.streams[client_info.stream_id]
+                    stream_info.total_bytes_served += bytes_served
+                    stream_info.total_segments_served += 1
+                    stream_info.last_access = datetime.now()
+            
+            # Update global stats
+            self._stats.total_bytes_served += bytes_served
+            self._stats.total_segments_served += 1
+            
+        except Exception as e:
+            logger.error(f"Error proxying segment for client {client_id}: {e}")
             raise
-
-    async def stop_stream(self, stream_id: str) -> bool:
-        """Stop a running stream."""
+    
+    async def _try_failover(self, stream_id: str) -> bool:
+        """Try to failover to next available URL"""
         if stream_id not in self.streams:
             return False
-
+        
         stream_info = self.streams[stream_id]
         
-        # Stop FFmpeg process
-        if stream_id in self.stream_processes:
-            process = self.stream_processes[stream_id]
-            try:
-                process.terminate()
-                await asyncio.sleep(1)
-                if process.poll() is None:
-                    process.kill()
-            except Exception as e:
-                logger.error(f"Error stopping FFmpeg process for stream {stream_id}: {e}")
-            finally:
-                del self.stream_processes[stream_id]
-
-        # Disconnect all clients
-        for client_id in list(self.clients[stream_id]):
-            await self.disconnect_client(stream_id, client_id)
-
-        stream_info.status = StreamStatus.STOPPED
+        if not stream_info.failover_urls:
+            logger.warning(f"No failover URLs available for stream {stream_id}")
+            return False
         
-        await self.event_manager.emit_event(StreamEvent(
-            event_type=EventType.STREAM_STOPPED,
-            stream_id=stream_id
-        ))
-
-        logger.info(f"Stopped stream {stream_id}")
-        return True
-
-    async def connect_client(self, stream_id: str, client_id: str, ip_address: str, user_agent: str = None) -> bool:
-        """Connect a client to a stream."""
-        if stream_id not in self.streams:
-            return False
-
-        # Start stream if not running
-        stream_info = self.streams[stream_id]
-        if stream_info.status != StreamStatus.RUNNING:
-            await self.start_stream(stream_id)
-
-        # Add client
-        self.clients[stream_id].add(client_id)
-        self.client_info[client_id] = ClientInfo(
-            client_id=client_id,
-            stream_id=stream_id,
-            connected_at=datetime.utcnow(),
-            ip_address=ip_address,
-            user_agent=user_agent
-        )
-
-        stream_info.client_count = len(self.clients[stream_id])
-
-        await self.event_manager.emit_event(StreamEvent(
-            event_type=EventType.CLIENT_CONNECTED,
-            stream_id=stream_id,
-            data={"client_id": client_id, "ip_address": ip_address}
-        ))
-
-        logger.info(f"Connected client {client_id} to stream {stream_id}")
-        return True
-
-    async def ensure_client_connected(self, stream_id: str, client_id: str, ip_address: str, user_agent: str = None) -> bool:
-        """Ensure a client is connected to a stream, connecting if necessary."""
-        if stream_id not in self.streams:
-            return False
-
-        # Check if client is already connected
-        if client_id in self.client_info:
-            # Update last activity time
-            self.client_info[client_id].connected_at = datetime.utcnow()
+        # Try next failover URL
+        next_index = (stream_info.current_failover_index + 1) % len(stream_info.failover_urls)
+        next_url = stream_info.failover_urls[next_index]
+        
+        logger.info(f"Attempting failover for stream {stream_id} to: {next_url}")
+        
+        try:
+            # Test the failover URL
+            response = await self.http_client.head(next_url, timeout=10.0)
+            response.raise_for_status()
+            
+            # Failover successful
+            stream_info.current_url = next_url
+            stream_info.current_failover_index = next_index
+            logger.info(f"Failover successful for stream {stream_id}")
             return True
-
-        # Connect new client
-        return await self.connect_client(stream_id, client_id, ip_address, user_agent)
-
-    async def disconnect_client(self, stream_id: str, client_id: str) -> bool:
-        """Disconnect a client from a stream."""
-        if stream_id not in self.clients or client_id not in self.clients[stream_id]:
+            
+        except Exception as e:
+            logger.error(f"Failover failed for stream {stream_id}: {e}")
             return False
-
-        self.clients[stream_id].remove(client_id)
-        if client_id in self.client_info:
-            del self.client_info[client_id]
-
-        if stream_id in self.streams:
-            self.streams[stream_id].client_count = len(self.clients[stream_id])
-
-        await self.event_manager.emit_event(StreamEvent(
-            event_type=EventType.CLIENT_DISCONNECTED,
-            stream_id=stream_id,
-            data={"client_id": client_id}
-        ))
-
-        # Stop stream if no clients remain
-        if stream_id in self.streams and len(self.clients[stream_id]) == 0:
-            logger.info(f"No clients remaining for stream {stream_id}, stopping stream")
-            await self.stop_stream(stream_id)
-
-        logger.info(f"Disconnected client {client_id} from stream {stream_id}")
-        return True
-
-    async def seek_stream(self, stream_id: str, position: float) -> bool:
-        """Seek to a specific position in a VOD stream."""
-        if stream_id not in self.streams:
-            return False
-
-        stream_info = self.streams[stream_id]
-        if stream_info.is_live:
-            return False  # Cannot seek in live streams
-
-        # Update position
-        stream_info.position = position
-        
-        # TODO: Implement actual seeking in FFmpeg process
-        # This would require restarting the FFmpeg process with -ss parameter
-        
-        logger.info(f"Seeking stream {stream_id} to position {position}s")
-        return True
-
-    async def get_stream_info(self, stream_id: str) -> Optional[StreamInfo]:
-        """Get information about a stream."""
-        return self.streams.get(stream_id)
-
-    async def list_streams(self) -> List[StreamInfo]:
-        """List all streams."""
-        return list(self.streams.values())
-
-    async def get_client_info(self, client_id: str) -> Optional[ClientInfo]:
-        """Get information about a client."""
-        return self.client_info.get(client_id)
-
-    async def list_clients(self, stream_id: str = None) -> List[ClientInfo]:
-        """List clients, optionally filtered by stream."""
-        if stream_id:
-            client_ids = self.clients.get(stream_id, set())
-            return [self.client_info[cid] for cid in client_ids if cid in self.client_info]
-        return list(self.client_info.values())
-
-    async def _monitor_streams(self):
-        """Monitor stream processes and handle failover."""
+    
+    async def cleanup_client(self, client_id: str):
+        """Clean up a client"""
+        if client_id in self.clients:
+            client_info = self.clients[client_id]
+            
+            # Remove from stream
+            if client_info.stream_id and client_info.stream_id in self.stream_clients:
+                self.stream_clients[client_info.stream_id].discard(client_id)
+                if client_info.stream_id in self.streams:
+                    self.streams[client_info.stream_id].client_count = len(
+                        self.stream_clients[client_info.stream_id]
+                    )
+            
+            del self.clients[client_id]
+            self._stats.active_clients -= 1
+            logger.info(f"Cleaned up client: {client_id}")
+    
+    async def _periodic_cleanup(self):
+        """Periodic cleanup of inactive clients and streams"""
         while self._running:
             try:
-                # Monitor stream processes
-                for stream_id, process in list(self.stream_processes.items()):
-                    if process.poll() is not None:  # Process has terminated
-                        logger.warning(f"Stream {stream_id} process terminated")
-                        await self._handle_stream_failure(stream_id)
-                
-                # Clean up inactive clients (timeout after 30 seconds of inactivity)
                 await self._cleanup_inactive_clients()
-                
-                await asyncio.sleep(5)  # Check every 5 seconds
+                await self._cleanup_inactive_streams()
+                await asyncio.sleep(30)  # Run every 30 seconds
+            except asyncio.CancelledError:
+                break
             except Exception as e:
-                logger.error(f"Error in stream monitor: {e}")
-                await asyncio.sleep(5)
-
-    async def _handle_stream_failure(self, stream_id: str):
-        """Handle stream failure and attempt failover."""
-        if stream_id not in self.stream_configs:
-            return
-
-        config = self.stream_configs[stream_id]
-        stream_info = self.streams[stream_id]
-
-        # Check if there are any connected clients
-        if len(self.clients.get(stream_id, set())) == 0:
-            logger.info(f"Stream {stream_id} ended and no clients connected, stopping")
-            stream_info.status = StreamStatus.STOPPED
-            # Clean up the process reference
-            if stream_id in self.stream_processes:
-                del self.stream_processes[stream_id]
-            return
-
-        # For VOD streams that naturally end, don't restart unless there are failover URLs
-        if not stream_info.is_live and not config.failover_urls:
-            logger.info(f"VOD stream {stream_id} ended naturally, stopping")
-            stream_info.status = StreamStatus.STOPPED
-            # Clean up the process reference
-            if stream_id in self.stream_processes:
-                del self.stream_processes[stream_id]
-            await self.event_manager.emit_event(StreamEvent(
-                event_type=EventType.STREAM_STOPPED,
-                stream_id=stream_id,
-                data={"reason": "VOD stream ended naturally"}
-            ))
-            return
-
-        # Try failover URLs
-        if config.failover_urls and stream_info.current_url_index < len(config.failover_urls):
-            next_index = stream_info.current_url_index + 1
-            if next_index == 1:  # First failover (from primary)
-                next_url = config.failover_urls[0]
-            else:
-                next_url = config.failover_urls[next_index - 1]
-
-            logger.info(f"Attempting failover for stream {stream_id} to URL {next_index}")
-            
-            stream_info.current_url = next_url
-            stream_info.current_url_index = next_index
-
-            try:
-                # Restart with new URL
-                process = await self._start_ffmpeg_process(config, stream_info)
-                self.stream_processes[stream_id] = process
-                stream_info.status = StreamStatus.RUNNING
-                
-                await self.event_manager.emit_event(StreamEvent(
-                    event_type=EventType.FAILOVER_TRIGGERED,
-                    stream_id=stream_id,
-                    data={"url": str(next_url), "url_index": next_index}
-                ))
-                
-                logger.info(f"Failover successful for stream {stream_id}")
-                return
-            except Exception as e:
-                logger.error(f"Failover failed for stream {stream_id}: {e}")
-
-        # No more failover URLs or all failed
-        stream_info.status = StreamStatus.FAILED
-        stream_info.last_error = "All URLs failed"
-        
-        await self.event_manager.emit_event(StreamEvent(
-            event_type=EventType.STREAM_FAILED,
-            stream_id=stream_id,
-            data={"error": "All URLs failed"}
-        ))
-
+                logger.error(f"Error in periodic cleanup: {e}")
+                await asyncio.sleep(30)
+    
     async def _cleanup_inactive_clients(self):
-        """Clean up clients that haven't been active for 15 seconds."""
-        current_time = datetime.utcnow()
+        """Clean up clients that haven't been accessed recently"""
+        current_time = datetime.now()
         inactive_clients = []
         
-        for client_id, client_info in self.client_info.items():
-            # Check if client has been inactive for more than 15 seconds
-            time_since_activity = (current_time - client_info.connected_at).total_seconds()
-            if time_since_activity > 15:  # Reduced from 30 to 15 seconds
-                inactive_clients.append((client_id, time_since_activity))
+        for client_id, client_info in self.clients.items():
+            if (current_time - client_info.last_access).seconds > self.client_timeout:
+                inactive_clients.append(client_id)
         
-        # Disconnect inactive clients
-        for client_id, inactive_time in inactive_clients:
-            client_info = self.client_info[client_id]
-            stream_id = client_info.stream_id
-            logger.info(f"Cleaning up inactive client {client_id} from stream {stream_id} (inactive for {inactive_time:.1f}s)")
-            await self.disconnect_client(stream_id, client_id)
-
-    async def _detect_format(self, url: str) -> Optional[StreamFormat]:
-        """Auto-detect stream format from URL or content."""
-        url_str = str(url).lower()
-        
-        # Check URL extension
-        if url_str.endswith('.m3u8'):
-            return StreamFormat.HLS
-        elif url_str.endswith('.ts'):
-            return StreamFormat.MPEG_TS
-        elif url_str.endswith('.mkv'):
-            return StreamFormat.MKV
-        elif url_str.endswith('.mp4'):
-            return StreamFormat.MP4
-        elif url_str.endswith('.webm'):
-            return StreamFormat.WEBM
-        elif url_str.endswith('.avi'):
-            return StreamFormat.AVI
-
-        # Try to probe with FFmpeg
-        try:
-            probe = ffmpeg.probe(str(url), timeout=10)
-            if probe and 'streams' in probe:
-                # Analyze first video stream
-                for stream in probe['streams']:
-                    if stream.get('codec_type') == 'video':
-                        codec_name = stream.get('codec_name', '').lower()
-                        if 'h264' in codec_name or 'h265' in codec_name:
-                            return StreamFormat.MPEG_TS  # Default for H.264/H.265
-                        break
-        except Exception as e:
-            logger.warning(f"Could not probe URL {url}: {e}")
-
-        return StreamFormat.MPEG_TS  # Default fallback
-
-    async def _get_stream_metadata(self, url: str) -> Optional[Dict]:
-        """Get stream metadata using FFprobe."""
-        try:
-            probe = ffmpeg.probe(str(url), timeout=10)
-            metadata = {}
-            
-            if 'format' in probe:
-                metadata['duration'] = probe['format'].get('duration')
-                if metadata['duration']:
-                    metadata['duration'] = float(metadata['duration'])
-                metadata['bit_rate'] = probe['format'].get('bit_rate')
-                if metadata['bit_rate']:
-                    metadata['bit_rate'] = int(metadata['bit_rate'])
-
-            if 'streams' in probe:
-                for stream in probe['streams']:
-                    if stream.get('codec_type') == 'video':
-                        width = stream.get('width')
-                        height = stream.get('height')
-                        if width and height:
-                            metadata['resolution'] = f"{width}x{height}"
-                        
-                        fps = stream.get('r_frame_rate', '0/1')
-                        if '/' in fps:
-                            num, den = fps.split('/')
-                            if den != '0':
-                                metadata['fps'] = float(num) / float(den)
-                        break
-
-            return metadata
-        except Exception as e:
-            logger.warning(f"Could not get metadata for URL {url}: {e}")
-            return None
-
-    async def _start_ffmpeg_process(self, stream_config: StreamConfig, stream_info: StreamInfo) -> subprocess.Popen:
-        """Start FFmpeg process for streaming."""
-        input_url = str(stream_info.current_url)
-        output_port = 8000 + hash(stream_config.stream_id) % 10000  # Simple port assignment
-        
-        # Build FFmpeg command
-        cmd = ['ffmpeg', '-y']
-        
-        # Hardware acceleration setup
-        hw_method = None
-        if stream_config.enable_hardware_acceleration:
-            hw_method = self._get_best_hw_acceleration()
-            if hw_method:
-                logger.info(f"Using hardware acceleration: {hw_method}")
-                cmd.extend(self._get_hw_acceleration_args(hw_method))
-            else:
-                logger.info("No hardware acceleration available, using software encoding")
-        
-        # Input options
-        cmd.extend(['-i', input_url])
-        
-        # Seeking support for VOD
-        if stream_info.position and not stream_info.is_live:
-            cmd.extend(['-ss', str(stream_info.position)])
-            
-        # Output options
-        if stream_config.format == StreamFormat.HLS:
-            # For HLS, we might need transcoding
-            if hw_method and not self._can_copy_codec(input_url):
-                # Use hardware encoding for transcoding
-                codec_args = self._get_hw_encoding_args(hw_method)
-                cmd.extend(codec_args)
-            else:
-                cmd.extend(['-c', 'copy'])
-                
-            # HLS-specific options based on stream type
-            hls_flags = []
-            hls_list_size = '10'
-            
-            if stream_info.is_live:
-                # For live streams, delete old segments to save space
-                hls_flags.append('delete_segments')
-                hls_list_size = '10'
-            else:
-                # For VOD, don't delete segments - just don't add the delete flag
-                hls_list_size = '0'  # 0 means unlimited for VOD
-            
-            hls_flags_str = '+'.join(hls_flags) if hls_flags else ''
-            
-            cmd.extend([
-                '-f', 'hls',
-                '-hls_time', '6',
-                '-hls_list_size', hls_list_size,
-            ])
-            
-            if hls_flags_str:
-                cmd.extend(['-hls_flags', hls_flags_str])
-                
-            cmd.append(f'{config.temp_dir}/stream_{stream_config.stream_id}/playlist.m3u8')
-        else:
-            # For direct streaming, prefer copy when possible
-            if self._can_copy_codec(input_url):
-                cmd.extend(['-c', 'copy'])
-            elif hw_method:
-                codec_args = self._get_hw_encoding_args(hw_method)
-                cmd.extend(codec_args)
-            else:
-                cmd.extend(['-c:v', 'libx264', '-preset', 'fast', '-crf', '23'])
-                
-            cmd.extend([
-                '-f', 'mpegts',
-                f'http://localhost:{output_port}/stream'
-            ])
-        
-        # Create output directory if needed
-        if stream_config.format == StreamFormat.HLS:
-            os.makedirs(f'{config.temp_dir}/stream_{stream_config.stream_id}', exist_ok=True)
-        
-        logger.info(f"Starting FFmpeg with command: {' '.join(cmd)}")
-        
-        # Start process
-        process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            preexec_fn=os.setsid
-        )
-        
-        return process
+        for client_id in inactive_clients:
+            await self.cleanup_client(client_id)
     
-    def _get_hw_acceleration_args(self, hw_method: str) -> List[str]:
-        """Get hardware acceleration arguments for FFmpeg."""
-        if hw_method == 'vaapi':
-            return ['-hwaccel', 'vaapi', '-hwaccel_device', '/dev/dri/renderD128']
-        elif hw_method == 'qsv':
-            return ['-hwaccel', 'qsv']
-        elif hw_method == 'nvenc':
-            return ['-hwaccel', 'cuda']
-        elif hw_method == 'cuda':
-            return ['-hwaccel', 'cuda']
-        elif hw_method == 'videotoolbox':
-            return ['-hwaccel', 'videotoolbox']
-        else:
-            return ['-hwaccel', 'auto']
+    async def _cleanup_inactive_streams(self):
+        """Clean up streams with no active clients"""
+        current_time = datetime.now()
+        inactive_streams = []
+        
+        for stream_id, stream_info in self.streams.items():
+            # Check if stream has any active clients
+            has_active_clients = stream_id in self.stream_clients and len(self.stream_clients[stream_id]) > 0
+            
+            # Check if stream is old and unused
+            is_old = (current_time - stream_info.last_access).seconds > self.stream_timeout
+            
+            if not has_active_clients and is_old:
+                inactive_streams.append(stream_id)
+        
+        for stream_id in inactive_streams:
+            if stream_id in self.streams:
+                del self.streams[stream_id]
+                if stream_id in self.stream_clients:
+                    del self.stream_clients[stream_id]
+                self._stats.active_streams -= 1
+                logger.info(f"Cleaned up inactive stream: {stream_id}")
     
-    def _get_hw_encoding_args(self, hw_method: str) -> List[str]:
-        """Get hardware encoding arguments for FFmpeg."""
-        if hw_method == 'vaapi':
-            return ['-c:v', 'h264_vaapi', '-vf', 'format=nv12,hwupload']
-        elif hw_method == 'qsv':
-            return ['-c:v', 'h264_qsv', '-preset', 'medium']
-        elif hw_method == 'nvenc':
-            return ['-c:v', 'h264_nvenc', '-preset', 'medium']
-        elif hw_method == 'cuda':
-            return ['-c:v', 'h264_nvenc', '-preset', 'medium']
-        elif hw_method == 'videotoolbox':
-            return ['-c:v', 'h264_videotoolbox']
-        else:
-            return ['-c:v', 'libx264', '-preset', 'fast', '-crf', '23']
-    
-    def _can_copy_codec(self, input_url: str) -> bool:
-        """Check if we can copy codecs without transcoding."""
-        try:
-            probe = ffmpeg.probe(str(input_url), timeout=5)
-            if 'streams' in probe:
-                for stream in probe['streams']:
-                    if stream.get('codec_type') == 'video':
-                        codec_name = stream.get('codec_name', '').lower()
-                        # Can copy common streaming codecs
-                        if codec_name in ['h264', 'h265', 'hevc']:
-                            return True
-            return False
-        except Exception:
-            return False
-
-    def _has_hardware_acceleration(self) -> bool:
-        """Check if hardware acceleration is available."""
-        hw_methods = self._detect_hardware_acceleration()
-        return len(hw_methods) > 0
-    
-    def _detect_hardware_acceleration(self) -> Dict[str, bool]:
-        """Detect available hardware acceleration methods."""
-        hw_support = {
-            'vaapi': False,
-            'qsv': False,
-            'nvenc': False,
-            'videotoolbox': False,
-            'cuda': False,
-            'opencl': False
+    def get_stats(self) -> Dict:
+        """Get comprehensive stats"""
+        return {
+            "proxy_stats": {
+                "total_streams": self._stats.total_streams,
+                "active_streams": self._stats.active_streams,
+                "total_clients": self._stats.total_clients,
+                "active_clients": self._stats.active_clients,
+                "total_bytes_served": self._stats.total_bytes_served,
+                "total_segments_served": self._stats.total_segments_served,
+                "uptime_seconds": (datetime.now() - self._stats.uptime_start).seconds
+            },
+            "streams": [
+                {
+                    "stream_id": stream.stream_id,
+                    "original_url": stream.original_url,
+                    "current_url": stream.current_url,
+                    "client_count": stream.client_count,
+                    "total_bytes_served": stream.total_bytes_served,
+                    "total_segments_served": stream.total_segments_served,
+                    "error_count": stream.error_count,
+                    "is_active": stream.is_active,
+                    "has_failover": len(stream.failover_urls) > 0,
+                    "created_at": stream.created_at.isoformat(),
+                    "last_access": stream.last_access.isoformat()
+                }
+                for stream in self.streams.values()
+            ],
+            "clients": [
+                {
+                    "client_id": client.client_id,
+                    "stream_id": client.stream_id,
+                    "user_agent": client.user_agent,
+                    "ip_address": client.ip_address,
+                    "bytes_served": client.bytes_served,
+                    "segments_served": client.segments_served,
+                    "created_at": client.created_at.isoformat(),
+                    "last_access": client.last_access.isoformat()
+                }
+                for client in self.clients.values()
+            ]
         }
-        
-        # Check VAAPI (Intel/AMD on Linux)
-        if os.path.exists('/dev/dri'):
-            try:
-                # Check if VAAPI devices are accessible
-                dri_devices = [f for f in os.listdir('/dev/dri') if f.startswith('render')]
-                if dri_devices:
-                    # Test VAAPI with FFmpeg
-                    result = subprocess.run([
-                        'ffmpeg', '-hide_banner', '-f', 'lavfi', '-i', 'testsrc2=duration=1:size=320x240:rate=1',
-                        '-t', '1', '-vaapi_device', '/dev/dri/renderD128', '-vf', 'format=nv12,hwupload', 
-                        '-c:v', 'h264_vaapi', '-f', 'null', '-'
-                    ], capture_output=True, timeout=5)
-                    hw_support['vaapi'] = result.returncode == 0
-            except (subprocess.TimeoutExpired, FileNotFoundError, PermissionError):
-                pass
-        
-        # Check Intel QSV
-        try:
-            result = subprocess.run(['ffmpeg', '-hwaccels'], capture_output=True, timeout=5)
-            if b'qsv' in result.stdout:
-                # Test QSV encoding
-                test_result = subprocess.run([
-                    'ffmpeg', '-hide_banner', '-f', 'lavfi', '-i', 'testsrc2=duration=1:size=320x240:rate=1',
-                    '-t', '1', '-c:v', 'h264_qsv', '-preset', 'fast', '-f', 'null', '-'
-                ], capture_output=True, timeout=10)
-                hw_support['qsv'] = test_result.returncode == 0
-        except (subprocess.TimeoutExpired, FileNotFoundError):
-            pass
-            
-        # Check NVIDIA NVENC
-        try:
-            # Check if nvidia-smi exists and GPU is available
-            result = subprocess.run(['nvidia-smi', '--query-gpu=name', '--format=csv,noheader'], 
-                                   capture_output=True, timeout=5)
-            if result.returncode == 0:
-                # Test NVENC encoding
-                test_result = subprocess.run([
-                    'ffmpeg', '-hide_banner', '-f', 'lavfi', '-i', 'testsrc2=duration=1:size=320x240:rate=1',
-                    '-t', '1', '-c:v', 'h264_nvenc', '-preset', 'fast', '-f', 'null', '-'
-                ], capture_output=True, timeout=10)
-                hw_support['nvenc'] = test_result.returncode == 0
-                
-                # Check CUDA support
-                cuda_result = subprocess.run([
-                    'ffmpeg', '-hide_banner', '-f', 'lavfi', '-i', 'testsrc2=duration=1:size=320x240:rate=1',
-                    '-t', '1', '-filter:v', 'scale_cuda=320:240', '-c:v', 'h264_nvenc', '-f', 'null', '-'
-                ], capture_output=True, timeout=10)
-                hw_support['cuda'] = cuda_result.returncode == 0
-        except (subprocess.TimeoutExpired, FileNotFoundError):
-            pass
-            
-        # Check macOS VideoToolbox
-        if os.uname().sysname == 'Darwin':
-            try:
-                result = subprocess.run(['ffmpeg', '-hwaccels'], capture_output=True, timeout=5)
-                if b'videotoolbox' in result.stdout:
-                    # Test VideoToolbox encoding
-                    test_result = subprocess.run([
-                        'ffmpeg', '-hide_banner', '-f', 'lavfi', '-i', 'testsrc2=duration=1:size=320x240:rate=1',
-                        '-t', '1', '-c:v', 'h264_videotoolbox', '-f', 'null', '-'
-                    ], capture_output=True, timeout=10)
-                    hw_support['videotoolbox'] = test_result.returncode == 0
-            except (subprocess.TimeoutExpired, FileNotFoundError):
-                pass
-        
-        # Check OpenCL support
-        try:
-            result = subprocess.run(['ffmpeg', '-hwaccels'], capture_output=True, timeout=5)
-            if b'opencl' in result.stdout:
-                hw_support['opencl'] = True
-        except (subprocess.TimeoutExpired, FileNotFoundError):
-            pass
-            
-        return hw_support
-    
-    def _get_best_hw_acceleration(self) -> Optional[str]:
-        """Get the best available hardware acceleration method."""
-        hw_support = self._detect_hardware_acceleration()
-        
-        # Priority order: NVENC > QSV > VAAPI > VideoToolbox > CUDA > OpenCL
-        priority_order = ['nvenc', 'qsv', 'vaapi', 'videotoolbox', 'cuda', 'opencl']
-        
-        for method in priority_order:
-            if hw_support.get(method, False):
-                return method
-        
-        return None

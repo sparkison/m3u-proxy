@@ -14,7 +14,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(
-    title="M3U Proxy Enhanced", 
+    title="M3U Proxy", 
     version="2.0.0",
     description="Advanced HLS streaming proxy with client management, stats, and failover support"
 )

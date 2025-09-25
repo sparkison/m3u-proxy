@@ -43,15 +43,23 @@ Server will start on `http://localhost:8001`
 ### 3. Create a Stream
 
 ```bash
-# HLS stream
-curl -X POST "http://localhost:8001/streams?url=https://your-stream.m3u8"
+# HLS stream with custom user agent
+curl -X POST "http://localhost:8001/streams" \
+  -H "Content-Type: application/json" \
+  -d '{"url": "https://your-stream.m3u8", "user_agent": "MyApp/1.0"}'
 
-# Direct IPTV stream (TS, MP4, MKV, etc.)
-curl -X POST "http://localhost:8001/streams?url=http://server.com/stream.ts"
+# Direct IPTV stream with failover
+curl -X POST "http://localhost:8001/streams" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "url": "http://server.com/stream.ts",
+    "failover_urls": ["http://backup.com/stream.ts"],
+    "user_agent": "VLC/3.0.18"
+  }'
 
 # Using the CLI client
-python m3u_client.py create "https://your-stream.m3u8"
-python m3u_client.py create "http://server.com/movie.mkv"
+python m3u_client.py create "https://your-stream.m3u8" --user-agent "MyApp/1.0"
+python m3u_client.py create "http://server.com/movie.mkv" --failover "http://backup.com/movie.mkv"
 ```
 
 ### 4. Access Your Stream
@@ -72,7 +80,14 @@ http://localhost:8001/stream/{stream_id}
 
 #### Create Stream
 ```bash
-POST /streams?url=<stream_url>&failover_urls=<url1,url2>
+POST /streams
+Content-Type: application/json
+
+{
+  "url": "stream_url",
+  "failover_urls": ["backup_url1", "backup_url2"],
+  "user_agent": "Custom User Agent String"  
+}
 ```
 
 #### List Streams

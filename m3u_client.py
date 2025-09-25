@@ -82,6 +82,7 @@ class M3UProxyClient:
             for stream in stats["streams"]:
                 print(f"Stream ID: {stream['stream_id'][:16]}...")
                 print(f"  URL: {stream['original_url'][:50]}...")
+                print(f"  User Agent: {stream['user_agent'][:50]}...")
                 print(f"  Clients: {stream['client_count']}")
                 print(f"  Data Served: {self.format_bytes(stream['total_bytes_served'])}")
                 print(f"  Segments: {stream['total_segments_served']}")

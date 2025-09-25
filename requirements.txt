@@ -1,3 +1,6 @@
 fastapi>=0.104.0
 uvicorn[standard]>=0.24.0
 httpx>=0.25.0
+pytest>=7.4.0
+pytest-asyncio>=0.21.0
+pytest-httpx>=0.22.0

@@ -202,12 +202,13 @@ async def get_hls_playlist(stream_id: str, request: Request):
     if not stream_info:
         raise HTTPException(status_code=404, detail="Stream not found")
     
-    # Connect client
-    client_id = str(uuid.uuid4())
+    # Use IP + User-Agent as client identifier for HLS sessions
     client_ip = await get_client_ip(request)
-    user_agent = request.headers.get("User-Agent")
+    user_agent = request.headers.get("User-Agent", "")
+    client_id = f"{client_ip}_{hash(user_agent)}"
     
-    await stream_manager.connect_client(stream_id, client_id, client_ip, user_agent)
+    # Connect client only if not already connected
+    await stream_manager.ensure_client_connected(stream_id, client_id, client_ip, user_agent)
     
     # Serve HLS playlist
     playlist_path = f"{config.temp_dir}/stream_{stream_id}/playlist.m3u8"
@@ -219,8 +220,23 @@ async def get_hls_playlist(stream_id: str, request: Request):
         with open(playlist_path, 'r') as f:
             content = f.read()
         
+        # Rewrite segment URLs to point to our API endpoints
+        lines = content.split('\n')
+        rewritten_lines = []
+        
+        for line in lines:
+            # If it's a segment file (ends with .ts), rewrite the URL
+            if line.strip().endswith('.ts'):
+                segment_name = line.strip()
+                # Rewrite to use our segments endpoint
+                rewritten_lines.append(f"segments/{segment_name}")
+            else:
+                rewritten_lines.append(line)
+        
+        rewritten_content = '\n'.join(rewritten_lines)
+        
         return StreamingResponse(
-            iter([content]),
+            iter([rewritten_content]),
             media_type="application/vnd.apple.mpegurl",
             headers={
                 "Cache-Control": "no-cache, no-store, must-revalidate",
@@ -234,11 +250,19 @@ async def get_hls_playlist(stream_id: str, request: Request):
 
 
 @app.get("/streams/{stream_id}/segments/{segment_name}")
-async def get_hls_segment(stream_id: str, segment_name: str):
+async def get_hls_segment(stream_id: str, segment_name: str, request: Request):
     """Get HLS segment for a stream."""
     stream_info = await stream_manager.get_stream_info(stream_id)
     if not stream_info:
         raise HTTPException(status_code=404, detail="Stream not found")
+    
+    # Update client activity (same logic as playlist endpoint)
+    client_ip = await get_client_ip(request)
+    user_agent = request.headers.get("User-Agent", "")
+    client_id = f"{client_ip}_{hash(user_agent)}"
+    
+    # Ensure client is still connected and update activity
+    await stream_manager.ensure_client_connected(stream_id, client_id, client_ip, user_agent)
     
     segment_path = f"{config.temp_dir}/stream_{stream_id}/{segment_name}"
     

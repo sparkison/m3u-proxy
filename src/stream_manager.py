@@ -202,6 +202,20 @@ class StreamManager:
         logger.info(f"Connected client {client_id} to stream {stream_id}")
         return True
 
+    async def ensure_client_connected(self, stream_id: str, client_id: str, ip_address: str, user_agent: str = None) -> bool:
+        """Ensure a client is connected to a stream, connecting if necessary."""
+        if stream_id not in self.streams:
+            return False
+
+        # Check if client is already connected
+        if client_id in self.client_info:
+            # Update last activity time
+            self.client_info[client_id].connected_at = datetime.utcnow()
+            return True
+
+        # Connect new client
+        return await self.connect_client(stream_id, client_id, ip_address, user_agent)
+
     async def disconnect_client(self, stream_id: str, client_id: str) -> bool:
         """Disconnect a client from a stream."""
         if stream_id not in self.clients or client_id not in self.clients[stream_id]:
@@ -269,10 +283,14 @@ class StreamManager:
         """Monitor stream processes and handle failover."""
         while self._running:
             try:
+                # Monitor stream processes
                 for stream_id, process in list(self.stream_processes.items()):
                     if process.poll() is not None:  # Process has terminated
                         logger.warning(f"Stream {stream_id} process terminated")
                         await self._handle_stream_failure(stream_id)
+                
+                # Clean up inactive clients (timeout after 30 seconds of inactivity)
+                await self._cleanup_inactive_clients()
                 
                 await asyncio.sleep(5)  # Check every 5 seconds
             except Exception as e:
@@ -349,6 +367,24 @@ class StreamManager:
             stream_id=stream_id,
             data={"error": "All URLs failed"}
         ))
+
+    async def _cleanup_inactive_clients(self):
+        """Clean up clients that haven't been active for 15 seconds."""
+        current_time = datetime.utcnow()
+        inactive_clients = []
+        
+        for client_id, client_info in self.client_info.items():
+            # Check if client has been inactive for more than 15 seconds
+            time_since_activity = (current_time - client_info.connected_at).total_seconds()
+            if time_since_activity > 15:  # Reduced from 30 to 15 seconds
+                inactive_clients.append((client_id, time_since_activity))
+        
+        # Disconnect inactive clients
+        for client_id, inactive_time in inactive_clients:
+            client_info = self.client_info[client_id]
+            stream_id = client_info.stream_id
+            logger.info(f"Cleaning up inactive client {client_id} from stream {stream_id} (inactive for {inactive_time:.1f}s)")
+            await self.disconnect_client(stream_id, client_id)
 
     async def _detect_format(self, url: str) -> Optional[StreamFormat]:
         """Auto-detect stream format from URL or content."""
@@ -453,13 +489,30 @@ class StreamManager:
             else:
                 cmd.extend(['-c', 'copy'])
                 
+            # HLS-specific options based on stream type
+            hls_flags = []
+            hls_list_size = '10'
+            
+            if stream_info.is_live:
+                # For live streams, delete old segments to save space
+                hls_flags.append('delete_segments')
+                hls_list_size = '10'
+            else:
+                # For VOD, don't delete segments - just don't add the delete flag
+                hls_list_size = '0'  # 0 means unlimited for VOD
+            
+            hls_flags_str = '+'.join(hls_flags) if hls_flags else ''
+            
             cmd.extend([
                 '-f', 'hls',
                 '-hls_time', '6',
-                '-hls_list_size', '10',
-                '-hls_flags', 'delete_segments',
-                f'{config.temp_dir}/stream_{stream_config.stream_id}/playlist.m3u8'
+                '-hls_list_size', hls_list_size,
             ])
+            
+            if hls_flags_str:
+                cmd.extend(['-hls_flags', hls_flags_str])
+                
+            cmd.append(f'{config.temp_dir}/stream_{stream_config.stream_id}/playlist.m3u8')
         else:
             # For direct streaming, prefer copy when possible
             if self._can_copy_codec(input_url):

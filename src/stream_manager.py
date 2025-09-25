@@ -390,17 +390,17 @@ class StreamManager:
             logger.warning(f"Could not get metadata for URL {url}: {e}")
             return None
 
-    async def _start_ffmpeg_process(self, config: StreamConfig, stream_info: StreamInfo) -> subprocess.Popen:
+    async def _start_ffmpeg_process(self, stream_config: StreamConfig, stream_info: StreamInfo) -> subprocess.Popen:
         """Start FFmpeg process for streaming."""
         input_url = str(stream_info.current_url)
-        output_port = 8000 + hash(config.stream_id) % 10000  # Simple port assignment
+        output_port = 8000 + hash(stream_config.stream_id) % 10000  # Simple port assignment
         
         # Build FFmpeg command
         cmd = ['ffmpeg', '-y']
         
         # Hardware acceleration setup
         hw_method = None
-        if config.enable_hardware_acceleration:
+        if stream_config.enable_hardware_acceleration:
             hw_method = self._get_best_hw_acceleration()
             if hw_method:
                 logger.info(f"Using hardware acceleration: {hw_method}")
@@ -416,7 +416,7 @@ class StreamManager:
             cmd.extend(['-ss', str(stream_info.position)])
             
         # Output options
-        if config.format == StreamFormat.HLS:
+        if stream_config.format == StreamFormat.HLS:
             # For HLS, we might need transcoding
             if hw_method and not self._can_copy_codec(input_url):
                 # Use hardware encoding for transcoding
@@ -430,7 +430,7 @@ class StreamManager:
                 '-hls_time', '6',
                 '-hls_list_size', '10',
                 '-hls_flags', 'delete_segments',
-                f'{config.temp_dir}/stream_{config.stream_id}/playlist.m3u8'
+                f'{config.temp_dir}/stream_{stream_config.stream_id}/playlist.m3u8'
             ])
         else:
             # For direct streaming, prefer copy when possible
@@ -448,8 +448,8 @@ class StreamManager:
             ])
         
         # Create output directory if needed
-        if config.format == StreamFormat.HLS:
-            os.makedirs(f'{config.temp_dir}/stream_{config.stream_id}', exist_ok=True)
+        if stream_config.format == StreamFormat.HLS:
+            os.makedirs(f'{config.temp_dir}/stream_{stream_config.stream_id}', exist_ok=True)
         
         logger.info(f"Starting FFmpeg with command: {' '.join(cmd)}")
         

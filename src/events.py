@@ -1,12 +1,8 @@
 import asyncio
-import aiohttp
+import httpx
 import logging
-from typing import List, Dict, Any, Optional
-from datetime import datetime
-import json
-
-from .models import StreamEvent, WebhookConfig
-
+from typing import List, Optional
+from models import StreamEvent, WebhookConfig
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +40,8 @@ class EventManager:
     def remove_webhook(self, webhook_url: str) -> bool:
         """Remove a webhook by URL."""
         initial_count = len(self.webhooks)
-        self.webhooks = [wh for wh in self.webhooks if str(wh.url) != webhook_url]
+        self.webhooks = [
+            wh for wh in self.webhooks if str(wh.url) != webhook_url]
         removed = len(self.webhooks) != initial_count
         if removed:
             logger.info(f"Removed webhook {webhook_url}")
@@ -58,7 +55,8 @@ class EventManager:
     async def emit_event(self, event: StreamEvent):
         """Emit an event to be processed."""
         await self.event_queue.put(event)
-        logger.debug(f"Emitted event: {event.event_type} for stream {event.stream_id}")
+        logger.debug(
+            f"Emitted event: {event.event_type} for stream {event.stream_id}")
 
     async def _process_events(self):
         """Process events from the queue."""
@@ -72,7 +70,7 @@ class EventManager:
 
                 # Process event
                 await self._handle_event(event)
-                
+
             except Exception as e:
                 logger.error(f"Error processing event: {e}")
 
@@ -94,12 +92,12 @@ class EventManager:
     async def _send_webhooks(self, event: StreamEvent):
         """Send event to configured webhooks."""
         tasks = []
-        
+
         for webhook in self.webhooks:
             if event.event_type in webhook.events:
                 task = asyncio.create_task(self._send_webhook(webhook, event))
                 tasks.append(task)
-        
+
         if tasks:
             # Wait for all webhooks to complete
             await asyncio.gather(*tasks, return_exceptions=True)
@@ -122,21 +120,24 @@ class EventManager:
 
         for attempt in range(webhook.retry_attempts + 1):
             try:
-                async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=webhook.timeout)) as session:
-                    async with session.post(
+                async with httpx.AsyncClient(timeout=webhook.timeout) as client:
+                    response = await client.post(
                         str(webhook.url),
                         json=payload,
                         headers=headers
-                    ) as response:
-                        if response.status < 400:
-                            logger.debug(f"Webhook sent successfully to {webhook.url}")
-                            return
-                        else:
-                            logger.warning(f"Webhook failed with status {response.status}: {webhook.url}")
-                            
+                    )
+                    if response.status_code < 400:
+                        logger.debug(
+                            f"Webhook sent successfully to {webhook.url}")
+                        return
+                    else:
+                        logger.warning(
+                            f"Webhook failed with status {response.status_code}: {webhook.url}")
+
             except Exception as e:
-                logger.warning(f"Webhook attempt {attempt + 1} failed for {webhook.url}: {e}")
-                
+                logger.warning(
+                    f"Webhook attempt {attempt + 1} failed for {webhook.url}: {e}")
+
             # Wait before retry (except on last attempt)
             if attempt < webhook.retry_attempts:
                 await asyncio.sleep(2 ** attempt)  # Exponential backoff

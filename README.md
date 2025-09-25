@@ -17,12 +17,14 @@ A high-performance HTTP proxy server for HLS (HTTP Live Streaming) content with 
 - 🔄 **Failover Support**: Automatic and manual failover between multiple stream URLs
 - 🎯 **Stream Isolation**: Each stream gets a unique ID and isolated statistics
 - 🧹 **Automatic Cleanup**: Inactive streams and clients are automatically cleaned up
+- 🎯 **Event System**: Real-time events and webhook notifications for stream lifecycle
 
 ### API Features
 - 🌐 **RESTful API**: Complete REST API for stream and client management
 - 📈 **Real-time Stats**: Live statistics endpoints for monitoring
 - 🎛️ **Manual Controls**: Trigger failover, manage streams, and view detailed info
 - 💚 **Health Checks**: Built-in health endpoints for monitoring
+- 📡 **Webhook Integration**: Send events to external systems via webhooks
 
 ## Quick Start
 
@@ -308,6 +310,52 @@ ffplay "http://localhost:8001/hls/{stream_id}/playlist.m3u8"
 ```bash
 vlc "http://localhost:8001/hls/{stream_id}/playlist.m3u8"
 ```
+
+## 📡 Event System & Webhooks
+
+The proxy includes a comprehensive event system for monitoring and integration:
+
+### Webhook Configuration
+```bash
+# Add webhook to receive events
+curl -X POST "http://localhost:8001/webhooks" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "url": "https://your-server.com/webhook",
+    "events": ["stream_started", "client_connected", "failover_triggered"],
+    "timeout": 10,
+    "retry_attempts": 3
+  }'
+```
+
+### Available Events
+- `stream_started` - New stream created
+- `stream_stopped` - Stream ended
+- `client_connected` - Client joined stream  
+- `client_disconnected` - Client left stream
+- `failover_triggered` - Switched to backup URL
+
+### Webhook Payload Example
+```json
+{
+  "event_id": "uuid",
+  "event_type": "stream_started", 
+  "stream_id": "abc123",
+  "timestamp": "2025-09-25T22:38:34.392830",
+  "data": {
+    "primary_url": "http://example.com/stream.m3u8",
+    "user_agent": "MyApp/1.0"
+  }
+}
+```
+
+### Demo Events
+```bash
+# Try the event system demo
+python demo_events.py
+```
+
+📖 **Full Documentation**: See [EVENT_SYSTEM.md](EVENT_SYSTEM.md) for complete webhook integration guide.
 
 ## Development
 

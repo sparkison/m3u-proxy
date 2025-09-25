@@ -4,7 +4,17 @@ from enum import Enum
 from datetime import datetime
 import uuid
 
-from .config import config
+try:
+    from config import config
+except ImportError:
+    # Fallback for when config is not available
+    class MockConfig:
+        enable_hardware_acceleration = False
+        default_buffer_size = 1024 * 1024
+        default_timeout = 30
+        default_retry_attempts = 3
+        default_retry_delay = 5
+    config = MockConfig()
 
 
 class StreamFormat(str, Enum):

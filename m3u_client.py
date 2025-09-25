@@ -149,7 +149,8 @@ def main():
             result = client.list_streams()
             if result["streams"]:
                 for stream in result["streams"]:
-                    print(f"{stream['stream_id']}: {stream['original_url']}")
+                    stream_type = "HLS" if stream['original_url'].lower().endswith('.m3u8') else "Direct"
+                    print(f"{stream['stream_id']}: {stream['original_url']} ({stream_type})")
             else:
                 print("No active streams")
                 

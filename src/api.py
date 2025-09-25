@@ -13,6 +13,28 @@ from stream_manager import EnhancedStreamManager
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+def get_content_type(url: str) -> str:
+    """Determine content type based on URL extension"""
+    url_lower = url.lower()
+    if url_lower.endswith('.ts'):
+        return 'video/mp2t'
+    elif url_lower.endswith('.m3u8'):
+        return 'application/vnd.apple.mpegurl'
+    elif url_lower.endswith('.mp4'):
+        return 'video/mp4'
+    elif url_lower.endswith('.mkv'):
+        return 'video/x-matroska'
+    elif url_lower.endswith('.webm'):
+        return 'video/webm'
+    elif url_lower.endswith('.avi'):
+        return 'video/x-msvideo'
+    else:
+        return 'application/octet-stream'
+
+def is_direct_stream(url: str) -> bool:
+    """Check if URL is a direct stream (not HLS playlist)"""
+    return url.lower().endswith(('.ts', '.mp4', '.mkv', '.webm', '.avi'))
+
 app = FastAPI(
     title="M3U Proxy", 
     version="2.0.0",
@@ -50,7 +72,7 @@ async def root():
 
 @app.post("/streams")
 async def create_stream(
-    url: str = Query(..., description="Primary HLS stream URL"),
+    url: str = Query(..., description="Stream URL (HLS .m3u8 or direct .ts/.mp4/.mkv)"),
     failover_urls: Optional[str] = Query(None, description="Comma-separated failover URLs"),
 ):
     """Create a new stream with optional failover URLs"""
@@ -61,12 +83,21 @@ async def create_stream(
         
         stream_id = await stream_manager.get_or_create_stream(url, failover_list)
         
+        # Determine the appropriate endpoint based on stream type
+        if is_direct_stream(url):
+            stream_endpoint = f"/stream/{stream_id}"
+            stream_type = "direct"
+        else:
+            stream_endpoint = f"/hls/{stream_id}/playlist.m3u8"
+            stream_type = "hls"
+        
         return {
             "stream_id": stream_id,
             "primary_url": url,
             "failover_urls": failover_list,
-            "playlist_url": f"/hls/{stream_id}/playlist.m3u8",
-            "message": "Stream created successfully"
+            "stream_type": stream_type,
+            "stream_endpoint": stream_endpoint,
+            "message": f"Stream created successfully ({stream_type})"
         }
     except Exception as e:
         logger.error(f"Error creating stream: {e}")
@@ -137,8 +168,11 @@ async def get_hls_segment(
         # Get range header if present
         range_header = request.headers.get('range')
         
+        # Determine content type from the segment URL
+        content_type = get_content_type(segment_url)
+        
         # Prepare response headers
-        response_headers = {"content-type": "video/mp4"}
+        response_headers = {"content-type": content_type}
         if range_header:
             response_headers["accept-ranges"] = "bytes"
         
@@ -151,6 +185,72 @@ async def get_hls_segment(
         
     except Exception as e:
         logger.error(f"Error serving segment: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/stream/{stream_id}")
+async def get_direct_stream(
+    stream_id: str,
+    request: Request,
+    client_id: Optional[str] = Query(None, description="Client ID (auto-generated if not provided)"),
+    url: Optional[str] = Query(None, description="Stream URL (for direct access)")
+):
+    """Serve direct streams (.ts, .mp4, .mkv, etc.) for IPTV"""
+    try:
+        # Generate client ID if not provided
+        if not client_id:
+            client_id = str(uuid.uuid4())
+        
+        # If URL is provided, create/get stream first
+        if url:
+            decoded_url = unquote(url)
+            stream_id = await stream_manager.get_or_create_stream(decoded_url)
+        
+        # Register client
+        client_info_data = get_client_info(request)
+        await stream_manager.register_client(
+            client_id, 
+            stream_id,
+            user_agent=client_info_data["user_agent"],
+            ip_address=client_info_data["ip_address"]
+        )
+        
+        # Get stream info
+        if stream_id not in stream_manager.streams:
+            raise HTTPException(status_code=404, detail="Stream not found")
+        
+        stream_info = stream_manager.streams[stream_id]
+        stream_url = stream_info.current_url or stream_info.original_url
+        
+        # Determine content type
+        content_type = get_content_type(stream_url)
+        
+        # Get range header if present
+        range_header = request.headers.get('range')
+        
+        # Prepare response headers
+        response_headers = {
+            "content-type": content_type,
+            "X-Client-ID": client_id,
+            "X-Stream-ID": stream_id
+        }
+        if range_header:
+            response_headers["accept-ranges"] = "bytes"
+        
+        logger.info(f"Serving direct stream to client {client_id} for stream {stream_id}")
+        logger.info(f"Stream URL: {stream_url}")
+        logger.info(f"Content-Type: {content_type}")
+        
+        # Stream the content
+        return StreamingResponse(
+            stream_manager.proxy_segment(stream_url, client_id, range_header),
+            headers=response_headers,
+            status_code=206 if range_header else 200
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error serving direct stream: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.delete("/hls/{stream_id}/clients/{client_id}")

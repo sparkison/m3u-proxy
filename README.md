@@ -6,7 +6,8 @@ A high-performance HTTP proxy server for HLS (HTTP Live Streaming) content with 
 
 ### Core Streaming
 - 🚀 **Pure HTTP Proxy**: No transcoding, direct byte-range streaming
-- 📺 **HLS Support**: Handles master playlists, media playlists, and segments
+- 📺 **HLS Support**: Handles master playlists, media playlists, and segments (.m3u8)
+- 📡 **IPTV Support**: Direct streaming of .ts, .mp4, .mkv, .webm, .avi files
 - 🔄 **Real-time URL Rewriting**: Automatic playlist modification for proxied content
 - 📱 **Byte-range Support**: Full support for VOD streams with byte-range requests
 
@@ -42,19 +43,27 @@ Server will start on `http://localhost:8001`
 ### 3. Create a Stream
 
 ```bash
-# Using curl
+# HLS stream
 curl -X POST "http://localhost:8001/streams?url=https://your-stream.m3u8"
+
+# Direct IPTV stream (TS, MP4, MKV, etc.)
+curl -X POST "http://localhost:8001/streams?url=http://server.com/stream.ts"
 
 # Using the CLI client
 python m3u_client.py create "https://your-stream.m3u8"
+python m3u_client.py create "http://server.com/movie.mkv"
 ```
 
 ### 4. Access Your Stream
 
-The response will include a `playlist_url` that you can use in any HLS player:
-
+For **HLS streams** (.m3u8):
 ```
 http://localhost:8001/hls/{stream_id}/playlist.m3u8
+```
+
+For **Direct streams** (.ts, .mp4, .mkv, etc.):
+```
+http://localhost:8001/stream/{stream_id}
 ```
 
 ## API Documentation

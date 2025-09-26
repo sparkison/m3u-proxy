@@ -37,7 +37,7 @@ class StreamInfo:
     current_failover_index: int = 0
     current_url: Optional[str] = None
     final_playlist_url: Optional[str] = None  # Track final URL after redirects
-    user_agent: str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"
+    user_agent: str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
 
 
 @dataclass
@@ -170,7 +170,7 @@ class StreamManager:
             now = datetime.now()
             # Use provided user agent or default
             if user_agent is None:
-                user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"
+                user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
 
             self.streams[stream_id] = StreamInfo(
                 stream_id=stream_id,
@@ -304,21 +304,23 @@ class StreamManager:
                 f"Client {client_id} requesting segment: {segment_url}")
 
             # Prepare headers with proper authentication
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36'
-            }
+            # Start with minimal headers - User-Agent will be set from stream info or additional headers
+            headers = {}
 
-            # Add any additional headers passed from the API request first
+            # Set default User-Agent as fallback
+            headers['User-Agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36'
+
+            # Add any additional headers passed from the API request (h_ query parameters take precedence over defaults)
             if additional_headers:
                 headers.update(additional_headers)
                 logger.info(f"Added additional headers: {additional_headers}")
 
-            # Get headers from client's stream if available - this will override any conflicting headers
+            # Get headers from client's stream if available - stream user agent takes highest precedence
             if client_id in self.clients:
                 client_info = self.clients[client_id]
                 if client_info.stream_id and client_info.stream_id in self.streams:
                     stream_info = self.streams[client_info.stream_id]
-                    # Stream's user agent takes precedence over any other user agent
+                    # Stream's user agent takes precedence over all other user agents
                     headers['User-Agent'] = stream_info.user_agent
                     
                     # Add authentication headers based on final playlist URL (after redirects)

@@ -343,16 +343,21 @@ async def get_direct_stream(
             logger.debug(
                 f"Reusing existing client {client_id} for stream {stream_id}")
 
-        # Determine content type and if it's a live stream
+        # Determine content type
         content_type = get_content_type(stream_url)
         
-        # Detect live streams based on URL patterns
+        # Detect live streams based on URL patterns (more specific detection)
         is_live_stream = (
             stream_url.endswith('.ts') or 
             '/live/' in stream_url or 
-            '.m3u8' in stream_url or 
-            content_type == "video/mp2t"
+            '.m3u8' in stream_url or
+            content_type == "video/mp2t" or
+            '/playlist.' in stream_url.lower()
         )
+        
+        # MP4 files are typically VOD, not live streams
+        if stream_url.endswith('.mp4'):
+            is_live_stream = False
         
         # Update stream info with live stream detection
         stream_info.is_live_stream = is_live_stream
@@ -360,10 +365,10 @@ async def get_direct_stream(
         # Get range header if present
         range_header = request.headers.get('range')
         
-        # For live MPEG-TS streams, we generally don't want to handle range requests
-        # as they represent continuous live content
+        # For live streams, we generally don't want to handle range requests
+        # For VOD (like MP4), we should support range requests
         if is_live_stream and range_header:
-            logger.info(f"Ignoring range request for live MPEG-TS stream: {range_header}")
+            logger.info(f"Ignoring range request for live stream: {range_header}")
             range_header = None
 
         # Prepare response headers
@@ -387,23 +392,122 @@ async def get_direct_stream(
             response_headers["accept-ranges"] = "bytes"
 
         logger.info(
-            f"Serving {'live MPEG-TS' if is_live_stream else 'direct'} stream to client {client_id} for stream {stream_id}")
+            f"Serving {'live' if is_live_stream else 'VOD'} stream to client {client_id} for stream {stream_id}")
         logger.info(f"Stream URL: {stream_url}")
         logger.info(f"Content-Type: {content_type}")
-        if is_live_stream:
-            logger.info("Configured for live streaming (chunked transfer, no range requests)")
+        if range_header:
+            logger.info(f"Range request: {range_header}")
 
         # Use unified live proxy for all streams
         return await stream_manager.stream_unified_response(
             stream_id, 
             client_id, 
-            is_hls_segment=False  # This is a continuous stream, not an HLS segment
+            is_hls_segment=False,  # This is a continuous stream, not an HLS segment
+            range_header=range_header  # Pass range header for VOD support
         )
 
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Error serving direct stream: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.head("/stream/{stream_id}")
+async def head_direct_stream(
+    stream_id: str,
+    request: Request,
+    client_id: Optional[str] = Query(
+        None, description="Client ID (auto-generated if not provided)"),
+    url: Optional[str] = Query(
+        None, description="Stream URL (for direct access)")
+):
+    """Handle HEAD requests for direct streams (needed for MP4 duration/seeking)"""
+    try:
+        # If URL is provided, create/get stream first
+        if url:
+            decoded_url = unquote(url)
+            stream_id = await stream_manager.get_or_create_stream(decoded_url)
+
+        # Get stream info first
+        if stream_id not in stream_manager.streams:
+            raise HTTPException(status_code=404, detail="Stream not found")
+
+        stream_info = stream_manager.streams[stream_id]
+        stream_url = stream_info.current_url or stream_info.original_url
+
+        # Determine content type
+        content_type = get_content_type(stream_url)
+        
+        # Check for Range header
+        range_header = request.headers.get('range')
+        
+        # For HEAD requests, we need to make a HEAD request to the origin server
+        # to get metadata like Content-Length for MP4 files
+        headers = {
+            'User-Agent': stream_info.user_agent or 'Mozilla/5.0 (compatible)',
+            'Accept': '*/*',
+        }
+        
+        # If this is a range request, add the Range header
+        if range_header:
+            headers['Range'] = range_header
+            logger.info(f"HEAD range request for stream {stream_id}: {stream_url}, Range: {range_header}")
+        else:
+            logger.info(f"HEAD request for stream {stream_id}: {stream_url}")
+        
+        try:
+            async with stream_manager.http_client.stream('HEAD', stream_url, headers=headers, follow_redirects=True) as response:
+                response.raise_for_status()
+                
+                # Build response headers based on origin server response
+                response_headers = {
+                    "Content-Type": content_type,
+                    "Accept-Ranges": "bytes",
+                    "Cache-Control": "no-cache, no-store, must-revalidate",
+                    "Pragma": "no-cache",
+                    "Expires": "0"
+                }
+                
+                # Determine status code
+                status_code = 200
+                if range_header and response.status_code == 206:
+                    status_code = 206
+                    # Forward range-related headers
+                    if 'content-range' in response.headers:
+                        response_headers["Content-Range"] = response.headers['content-range']
+                
+                # Forward important headers from origin
+                if 'content-length' in response.headers:
+                    response_headers["Content-Length"] = response.headers['content-length']
+                    logger.info(f"Content-Length for {stream_id}: {response.headers['content-length']}")
+                
+                if 'last-modified' in response.headers:
+                    response_headers["Last-Modified"] = response.headers['last-modified']
+                
+                return Response(
+                    content=None,
+                    status_code=status_code,
+                    headers=response_headers
+                )
+                
+        except Exception as e:
+            logger.warning(f"HEAD request failed for {stream_url}: {e}")
+            # Return basic HEAD response even if origin HEAD fails
+            return Response(
+                content=None,
+                status_code=200,
+                headers={
+                    "Content-Type": content_type,
+                    "Accept-Ranges": "bytes",
+                    "Cache-Control": "no-cache, no-store, must-revalidate",
+                }
+            )
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error handling HEAD request: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 

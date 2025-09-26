@@ -475,80 +475,223 @@ class StreamManager:
             logger.error(f"Error getting stream data for client {client_id}: {e}")
             return None
 
-    async def stream_unified_response(self, stream_id: str, client_id: str, is_hls_segment: bool = False) -> StreamingResponse:
+    async def _handle_range_request(self, stream_id: str, client_id: str, start: int, end: Optional[int] = None):
+        """Handle HTTP range requests for VOD content by proxying directly to origin"""
+        if stream_id not in self.streams:
+            raise HTTPException(status_code=404, detail="Stream not found")
+            
+        stream_info = self.streams[stream_id]
+        stream_url = stream_info.current_url or stream_info.original_url
+        
+        # Prepare headers for range request to origin
+        headers = {
+            'User-Agent': stream_info.user_agent or 'Mozilla/5.0 (compatible)',
+            'Accept': '*/*',
+            'Range': f'bytes={start}-{end if end is not None else ""}'
+        }
+        
+        logger.info(f"Proxying range request to origin: {stream_url}, Range: bytes={start}-{end if end is not None else ''}")
+        
+        try:
+            # Simple approach: make the range request and stream whatever we get back
+            async def proxy_range_generator():
+                bytes_served = 0
+                async with self.http_client.stream('GET', stream_url, headers=headers, follow_redirects=True) as response:
+                    logger.info(f"Origin range response: {response.status_code}")
+                    logger.info(f"Origin headers: Content-Length={response.headers.get('content-length')}, Content-Range={response.headers.get('content-range')}")
+                    
+                    # Stream whatever the origin server gives us
+                    async for chunk in response.aiter_bytes(chunk_size=32 * 1024):
+                        yield chunk
+                        bytes_served += len(chunk)
+                        
+                        if bytes_served % (5 * 1024 * 1024) == 0:  # Log every 5MB
+                            logger.info(f"Range proxy streamed {bytes_served} bytes")
+                
+                logger.info(f"Range proxy completed: {bytes_served} bytes total")
+            
+            # Make the actual request to get the real headers
+            async with self.http_client.stream('GET', stream_url, headers=headers, follow_redirects=True) as test_response:
+                # Get the actual response headers from the real request
+                content_type = test_response.headers.get('content-type', 'video/mp4')
+                content_length = test_response.headers.get('content-length')
+                content_range = test_response.headers.get('content-range')
+                
+                logger.info(f"Test response: {test_response.status_code}, Content-Type: {content_type}")
+                logger.info(f"Test headers: Content-Length={content_length}, Content-Range={content_range}")
+                
+                # Build response headers based on what the origin server returned
+                response_headers = {
+                    "Content-Type": content_type,
+                    "Accept-Ranges": "bytes",
+                    "Cache-Control": "no-cache"
+                }
+                
+                # Copy headers from origin if available
+                if content_length:
+                    response_headers["Content-Length"] = content_length
+                
+                if content_range:
+                    response_headers["Content-Range"] = content_range
+                
+                # If origin doesn't support range requests but we got data, simulate the range
+                if test_response.status_code == 200 and not content_range:
+                    # Calculate range headers manually
+                    total_size = content_length
+                    if total_size:
+                        if end is not None:
+                            range_length = str(end - start + 1)
+                            end_pos = end
+                        else:
+                            range_length = str(int(total_size) - start)
+                            end_pos = int(total_size) - 1
+                        
+                        response_headers["Content-Length"] = range_length
+                        response_headers["Content-Range"] = f"bytes {start}-{end_pos}/{total_size}"
+                
+                # Determine status code
+                status_code = 206 if (test_response.status_code == 206 or content_range or test_response.status_code == 200) else test_response.status_code
+                
+                logger.info(f"Range proxy response: {status_code}, headers: {response_headers}")
+                
+                return StreamingResponse(
+                    proxy_range_generator(),
+                    status_code=status_code,
+                    headers=response_headers
+                )
+            
+        except Exception as e:
+            logger.error(f"Error proxying range request for {stream_id}: {e}")
+            await self.remove_stream_consumer(stream_id, client_id)
+            raise HTTPException(status_code=500, detail=f"Range proxy failed: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"Range request failed: {e}")
+
+    async def stream_unified_response(self, stream_id: str, client_id: str, is_hls_segment: bool = False, range_header: Optional[str] = None) -> StreamingResponse:
         """Unified streaming response for both HLS segments and TS streams"""
-        logger.debug(f"stream_unified_response called: stream_id={stream_id}, client_id={client_id}, is_hls_segment={is_hls_segment}")
+        logger.info(f"Creating unified response: stream_id={stream_id}, client_id={client_id}, is_hls_segment={is_hls_segment}, range={range_header}")
         
         if stream_id not in self.streams:
             logger.error(f"Stream not found: {stream_id}")
             raise HTTPException(status_code=404, detail="Stream not found")
 
         stream_info = self.streams[stream_id]
-        logger.debug(f"Found stream_info for {stream_id}")
+        
+        # Handle range requests for VOD content
+        if range_header and not is_hls_segment:
+            logger.info(f"Range request received for stream {stream_id}: {range_header}")
+            # Parse range header (e.g., "bytes=2153050439-" or "bytes=0-1023")
+            try:
+                range_match = range_header.replace('bytes=', '').strip()
+                if '-' in range_match:
+                    start_str, end_str = range_match.split('-', 1)
+                    start = int(start_str) if start_str else 0
+                    end = int(end_str) if end_str else None
+                    
+                    logger.info(f"Parsed range request: start={start}, end={end}")
+                    
+                    # Return range response instead of full stream
+                    return await self._handle_range_request(stream_id, client_id, start, end)
+                else:
+                    logger.warning(f"Invalid range header format: {range_header}")
+            except Exception as e:
+                logger.error(f"Error parsing range header {range_header}: {e}")
+                # Fall through to normal streaming if range parsing fails
         
         # Add this client as a consumer
         consumer_added = await self.add_stream_consumer(stream_id, client_id)
-        logger.debug(f"Consumer added: {consumer_added}")
         
-        # For HLS segments, check if data will be available before creating the response
-        if is_hls_segment:
-            # Pre-check: wait a moment for provider connection to start or fail
-            await asyncio.sleep(0.1)  # Give provider connection time to start
+        # Wait for provider connection to start for both HLS and continuous streams
+        await asyncio.sleep(0.1)  # Give provider connection time to start
+        
+        # Check if provider connection failed immediately
+        if hasattr(stream_info, 'origin_task') and stream_info.origin_task and stream_info.origin_task.done():
+            try:
+                # Check if the task completed with an exception
+                stream_info.origin_task.result()
+            except Exception as e:
+                logger.error(f"Provider connection failed for stream {stream_id}: {e}")
+                await self.remove_stream_consumer(stream_id, client_id)
+                raise HTTPException(status_code=503, detail="Provider connection failed")
+        
+        # For continuous streams (non-HLS), wait for initial data to be available
+        if not is_hls_segment:
+            logger.info(f"Waiting for continuous stream data to start for {stream_id}")
+            # Wait up to 5 seconds for the first chunk to arrive
+            wait_start = asyncio.get_event_loop().time()
+            max_wait = 5.0
             
-            # If provider connection failed immediately, don't create a streaming response
-            if hasattr(stream_info, 'origin_task') and stream_info.origin_task and stream_info.origin_task.done():
-                try:
-                    # Check if the task completed with an exception
-                    stream_info.origin_task.result()
-                except Exception as e:
-                    logger.error(f"Provider connection failed for stream {stream_id}: {e}")
-                    await self.remove_stream_consumer(stream_id, client_id)
-                    raise HTTPException(status_code=503, detail="Provider connection failed")
-        
-        logger.debug(f"About to create async generator for {stream_id}")
+            while asyncio.get_event_loop().time() - wait_start < max_wait:
+                # Check if we have data in the buffer
+                if not stream_info.stream_buffer.empty():
+                    logger.info(f"Data available in buffer for stream {stream_id}")
+                    break
+                
+                # Check if provider task completed successfully or failed
+                if hasattr(stream_info, 'origin_task') and stream_info.origin_task and stream_info.origin_task.done():
+                    try:
+                        stream_info.origin_task.result()
+                        logger.info(f"Provider task completed for {stream_id}")
+                        # Even if completed, check if we got any data
+                        if not stream_info.stream_buffer.empty():
+                            break
+                        else:
+                            logger.warning(f"Provider task completed but no data received for {stream_id}")
+                            await self.remove_stream_consumer(stream_id, client_id)
+                            raise HTTPException(status_code=503, detail="Provider completed but no data received")
+                    except Exception as e:
+                        logger.error(f"Provider connection failed during wait for stream {stream_id}: {e}")
+                        await self.remove_stream_consumer(stream_id, client_id)
+                        raise HTTPException(status_code=503, detail=f"Provider connection failed: {e}")
+                
+                await asyncio.sleep(0.2)  # Check every 200ms
+            
+            # Final check - if still no data available after waiting
+            if stream_info.stream_buffer.empty():
+                logger.warning(f"No data available after {max_wait}s wait for stream {stream_id}")
+                await self.remove_stream_consumer(stream_id, client_id)
+                raise HTTPException(status_code=503, detail="No data available from provider after waiting")
+            
+            logger.info(f"Stream {stream_id} ready to start - data available in buffer")
         
         async def generate():
-            logger.debug(f"Generator started for {stream_id}, client {client_id}")
             try:
                 if is_hls_segment:
-                    logger.debug(f"HLS segment mode for {stream_id}")
                     # For HLS segments, wait for the complete segment data
                     segment_data = await self.get_complete_segment_data(stream_id, client_id)
-                    logger.debug(f"Segment data result: {type(segment_data)} with length {len(segment_data) if segment_data else 0}")
                     
                     if segment_data and len(segment_data) > 0:
-                        logger.debug(f"Yielding segment data: {len(segment_data)} bytes")
+                        logger.info(f"Yielding HLS segment data: {len(segment_data)} bytes")
                         yield segment_data
                     else:
                         # No data available - provider may have failed
                         logger.warning(f"No segment data available for stream {stream_id}, client {client_id}")
-                        # Force yield of empty bytes to prevent encoding errors
-                        logger.debug(f"Yielding empty bytes for {stream_id}")
                         yield b""
                 else:
-                    logger.debug(f"Continuous stream mode for {stream_id}")
                     # For continuous streams, keep streaming until client disconnects
+                    logger.info(f"Starting continuous stream for {stream_id}")
                     yielded_data = False
+                    chunk_count = 0
                     while stream_info.active_consumers > 0:
                         chunk = await self.get_stream_data(stream_id, client_id, timeout=30.0)
                         if chunk is None:
+                            logger.info(f"End of stream reached for {stream_id}")
                             break
                         yield chunk
                         yielded_data = True
+                        chunk_count += 1
+                        if chunk_count % 50 == 0:
+                            logger.info(f"Streamed {chunk_count} chunks for {stream_id}")
                     
+                    logger.info(f"Continuous stream ended for {stream_id}, yielded {chunk_count} chunks")
                     # Ensure we yield something for continuous streams too
                     if not yielded_data:
-                        logger.debug(f"No data yielded, yielding empty bytes for continuous stream {stream_id}")
+                        logger.warning(f"No data yielded for continuous stream {stream_id}")
                         yield b""
                         
             except Exception as e:
                 logger.error(f"Error in unified stream generator for client {client_id}: {e}")
-                logger.error(f"Exception type: {type(e)}")
-                # Always yield bytes on error, never None or strings
-                logger.debug(f"Exception occurred, yielding empty bytes for {stream_id}")
                 yield b""
             finally:
-                logger.debug(f"Generator cleanup for {stream_id}, client {client_id}")
                 # Remove this client as a consumer
                 await self.remove_stream_consumer(stream_id, client_id)
                 # Clean up client
@@ -556,36 +699,32 @@ class StreamManager:
                     await self.cleanup_client(client_id)
                 logger.info(f"Unified stream consumer {client_id} disconnected from stream {stream_id}")
         
-        logger.debug(f"About to determine content type for {stream_id}")
-        
         # Determine content type
         stream_url = stream_info.current_url or stream_info.original_url
-        logger.debug(f"Stream URL: {stream_url}")
         
         if stream_url.endswith('.ts') or '/live/' in stream_url:
             content_type = "video/mp2t"
         elif stream_url.endswith('.m3u8'):
             content_type = "application/vnd.apple.mpegurl"
+        elif stream_url.endswith('.mp4'):
+            content_type = "video/mp4"
         else:
             content_type = "application/octet-stream"
             
-        logger.debug(f"Content type determined: {content_type}")
-        
-        logger.debug(f"About to create StreamingResponse for {stream_id}")
+        logger.info(f"Starting stream response for {stream_id} with content-type: {content_type}")
         
         # Build headers, ensuring no None values
         headers = {
             "Content-Type": content_type,
             "Cache-Control": "no-cache, no-store, must-revalidate",
             "Pragma": "no-cache",
-            "Expires": "0"
+            "Expires": "0",
+            "Accept-Ranges": "bytes"  # Enable range request support
         }
         
         # Only add Transfer-Encoding if it's not an HLS segment
         if not is_hls_segment:
             headers["Transfer-Encoding"] = "chunked"
-        
-        logger.debug(f"Headers prepared: {headers}")
         
         try:
             response = StreamingResponse(
@@ -593,11 +732,10 @@ class StreamManager:
                 media_type=content_type,
                 headers=headers
             )
-            logger.debug(f"StreamingResponse created successfully for {stream_id}")
+            logger.info(f"StreamingResponse created successfully for {stream_id}")
             return response
         except Exception as e:
             logger.error(f"Error creating StreamingResponse for {stream_id}: {e}")
-            logger.error(f"Exception type: {type(e)}")
             raise
 
     async def start_live_stream(self, stream_id: str) -> bool:

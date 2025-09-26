@@ -323,11 +323,28 @@ async def get_direct_stream(
             logger.debug(
                 f"Reusing existing client {client_id} for stream {stream_id}")
 
-        # Determine content type
+        # Determine content type and if it's a live stream
         content_type = get_content_type(stream_url)
+        
+        # Detect live streams based on URL patterns
+        is_live_stream = (
+            stream_url.endswith('.ts') or 
+            '/live/' in stream_url or 
+            '.m3u8' in stream_url or 
+            content_type == "video/mp2t"
+        )
+        
+        # Update stream info with live stream detection
+        stream_info.is_live_stream = is_live_stream
 
         # Get range header if present
         range_header = request.headers.get('range')
+        
+        # For live MPEG-TS streams, we generally don't want to handle range requests
+        # as they represent continuous live content
+        if is_live_stream and range_header:
+            logger.info(f"Ignoring range request for live MPEG-TS stream: {range_header}")
+            range_header = None
 
         # Prepare response headers
         response_headers = {
@@ -338,20 +355,31 @@ async def get_direct_stream(
             "Pragma": "no-cache",
             "Expires": "0"
         }
+        
+        if is_live_stream:
+            # Additional headers for live MPEG-TS streams
+            response_headers.update({
+                "Transfer-Encoding": "chunked",
+                "Connection": "keep-alive"
+            })
+        
         if range_header:
             response_headers["accept-ranges"] = "bytes"
 
         logger.info(
-            f"Serving direct stream to client {client_id} for stream {stream_id}")
+            f"Serving {'live MPEG-TS' if is_live_stream else 'direct'} stream to client {client_id} for stream {stream_id}")
         logger.info(f"Stream URL: {stream_url}")
         logger.info(f"Content-Type: {content_type}")
+        if is_live_stream:
+            logger.info("Configured for live streaming (chunked transfer, no range requests)")
 
-        # Stream the content
-        return StreamingResponse(
-            stream_manager.proxy_segment(stream_url, client_id, range_header),
-            headers=response_headers,
-            status_code=206 if range_header else 200
-        )
+        # For live streams, start origin connection if not already running and use new architecture
+        if is_live_stream:
+            await stream_manager.start_live_stream(stream_id)
+            return await stream_manager.stream_to_client(stream_id, client_id)
+        else:
+            # For non-live streams, use the direct streaming method
+            return await stream_manager.proxy_direct_stream(stream_id, client_id)
 
     except HTTPException:
         raise

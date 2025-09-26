@@ -6,6 +6,11 @@ from typing import Dict, Optional, AsyncIterator, List, Set
 from urllib.parse import urljoin, urlparse, quote, unquote
 from datetime import datetime
 from dataclasses import dataclass, field
+import weakref
+from asyncio import Queue
+import sys
+from fastapi import HTTPException
+from fastapi.responses import StreamingResponse
 
 logger = logging.getLogger(__name__)
 
@@ -20,6 +25,8 @@ class ClientInfo:
     stream_id: Optional[str] = None
     bytes_served: int = 0
     segments_served: int = 0
+    is_connected: bool = True  # Track actual connection state
+    data_queue: Optional[Queue] = field(default_factory=lambda: Queue(maxsize=100))  # Buffer for stream data
 
 
 @dataclass
@@ -37,7 +44,11 @@ class StreamInfo:
     current_failover_index: int = 0
     current_url: Optional[str] = None
     final_playlist_url: Optional[str] = None  # Track final URL after redirects
-    user_agent: str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
+    user_agent: str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"
+    # Stream connection management
+    origin_task: Optional[asyncio.Task] = None  # Task fetching from origin
+    is_live_stream: bool = False  # Whether this is a continuous live stream
+    connected_clients: Set[str] = field(default_factory=set)  # Active client IDs
 
 
 @dataclass
@@ -55,7 +66,7 @@ class M3U8Processor:
     def __init__(self, base_url: str, client_id: str, user_agent: Optional[str] = None, original_url: Optional[str] = None):
         self.base_url = base_url
         self.client_id = client_id
-        self.user_agent = user_agent or 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36'
+        self.user_agent = user_agent or 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36'
         self.original_url = original_url or base_url
 
     def process_playlist(self, content: str, base_proxy_url: str, original_base_url: Optional[str] = None) -> str:
@@ -114,9 +125,14 @@ class StreamManager:
         self.stream_timeout = 300  # 5 minutes
         self.http_client = httpx.AsyncClient(
             timeout=30.0,
-            headers={'User-Agent': 'M3U-Proxy/2.0'},
             follow_redirects=True,  # Enable redirect following
             max_redirects=10        # Limit redirects to prevent loops
+        )
+        # Separate client for live streams with longer timeout
+        self.live_stream_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(connect=10.0, read=300.0, write=10.0, pool=10.0),  # 5 min read timeout for live streams
+            follow_redirects=True,
+            max_redirects=10
         )
         self._stats = ProxyStats()
         self._cleanup_task: Optional[asyncio.Task] = None
@@ -153,6 +169,7 @@ class StreamManager:
         if self._cleanup_task:
             self._cleanup_task.cancel()
         await self.http_client.aclose()
+        await self.live_stream_client.aclose()
         logger.info("Stream manager stopped")
 
     async def get_or_create_stream(
@@ -170,8 +187,11 @@ class StreamManager:
             now = datetime.now()
             # Use provided user agent or default
             if user_agent is None:
-                user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
+                user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"
 
+            # Detect if this is a live stream
+            is_live = stream_url.endswith('.ts') or '/live/' in stream_url or stream_url.endswith('.m3u8')
+            
             self.streams[stream_id] = StreamInfo(
                 stream_id=stream_id,
                 original_url=stream_url,
@@ -179,7 +199,8 @@ class StreamManager:
                 created_at=now,
                 last_access=now,
                 failover_urls=failover_urls or [],
-                user_agent=user_agent
+                user_agent=user_agent,
+                is_live_stream=is_live
             )
             self.stream_clients[stream_id] = set()
             self._stats.total_streams += 1
@@ -219,13 +240,122 @@ class StreamManager:
             self.stream_clients[stream_id].add(client_id)
             self.streams[stream_id].client_count = len(
                 self.stream_clients[stream_id])
+            # Add to connected clients set
+            self.streams[stream_id].connected_clients.add(client_id)
 
         # Update client info
         client_info = self.clients[client_id]
         client_info.last_access = now
         client_info.stream_id = stream_id
+        client_info.is_connected = True
 
         return client_info
+
+    async def start_live_stream(self, stream_id: str) -> bool:
+        """Start the origin connection for a live stream"""
+        if stream_id not in self.streams:
+            return False
+            
+        stream_info = self.streams[stream_id]
+        
+        # Only start if it's a live stream and not already running
+        if not stream_info.is_live_stream or stream_info.origin_task:
+            return False
+            
+        logger.info(f"Starting live stream origin connection for {stream_id}")
+        
+        # Start the origin fetching task
+        stream_info.origin_task = asyncio.create_task(
+            self._fetch_live_stream(stream_id)
+        )
+        
+        return True
+
+    async def _fetch_live_stream(self, stream_id: str):
+        """Fetch live stream from origin and distribute to clients"""
+        if stream_id not in self.streams:
+            return
+            
+        stream_info = self.streams[stream_id]
+        current_url = stream_info.current_url or stream_info.original_url
+        
+        try:
+            logger.info(f"Fetching live stream from: {current_url}")
+            
+            # Prepare headers
+            headers = {
+                'User-Agent': stream_info.user_agent,
+                'Referer': f"{urlparse(current_url).scheme}://{urlparse(current_url).netloc}/",
+                'Origin': f"{urlparse(current_url).scheme}://{urlparse(current_url).netloc}",
+                'Accept': '*/*',
+                'Connection': 'keep-alive'
+            }
+            
+            # Use appropriate client
+            is_live_stream = current_url.endswith('.ts') or '/live/' in current_url
+            client_to_use = self.live_stream_client if is_live_stream else self.http_client
+            
+            async with client_to_use.stream('GET', current_url, headers=headers, follow_redirects=True) as response:
+                response.raise_for_status()
+                
+                logger.info(f"Connected to live stream: {response.status_code}, Content-Type: {response.headers.get('content-type')}")
+                
+                chunk_count = 0
+                bytes_served = 0
+                
+                async for chunk in response.aiter_bytes(chunk_size=32768):
+                    if not stream_info.is_active or not stream_info.connected_clients:
+                        logger.info(f"Stopping live stream {stream_id} - no active clients")
+                        break
+                        
+                    bytes_served += len(chunk)
+                    chunk_count += 1
+                    
+                    if chunk_count == 1:
+                        logger.info(f"Live stream {stream_id} first chunk: {len(chunk)} bytes")
+                    elif chunk_count % 100 == 0:
+                        logger.debug(f"Live stream {stream_id} chunk {chunk_count}, total: {bytes_served} bytes, clients: {len(stream_info.connected_clients)}")
+                    
+                    # Distribute chunk to all connected clients
+                    disconnected_clients = []
+                    for client_id in list(stream_info.connected_clients):
+                        if client_id in self.clients:
+                            client_info = self.clients[client_id]
+                            try:
+                                # Try to put chunk in client queue (non-blocking)
+                                client_info.data_queue.put_nowait(chunk)
+                                client_info.bytes_served += len(chunk)
+                                client_info.last_access = datetime.now()
+                            except asyncio.QueueFull:
+                                # Client not consuming fast enough, disconnect them
+                                logger.warning(f"Client {client_id} queue full, disconnecting")
+                                disconnected_clients.append(client_id)
+                        else:
+                            disconnected_clients.append(client_id)
+                    
+                    # Clean up disconnected clients
+                    for client_id in disconnected_clients:
+                        stream_info.connected_clients.discard(client_id)
+                        if client_id in self.clients:
+                            self.clients[client_id].is_connected = False
+                
+                logger.info(f"Live stream {stream_id} completed: {chunk_count} chunks, {bytes_served} bytes")
+                
+        except Exception as e:
+            logger.error(f"Error in live stream {stream_id}: {e}")
+            stream_info.error_count += 1
+        finally:
+            # Clean up
+            stream_info.origin_task = None
+            for client_id in list(stream_info.connected_clients):
+                if client_id in self.clients:
+                    # Signal end of stream
+                    try:
+                        self.clients[client_id].data_queue.put_nowait(None)
+                    except asyncio.QueueFull:
+                        pass
+            stream_info.connected_clients.clear()
+            logger.info(f"Live stream {stream_id} origin connection closed")
 
     async def get_playlist_content(
         self,
@@ -308,7 +438,7 @@ class StreamManager:
             headers = {}
 
             # Set default User-Agent as fallback
-            headers['User-Agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36'
+            headers['User-Agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36'
 
             # Add any additional headers passed from the API request (h_ query parameters take precedence over defaults)
             if additional_headers:
@@ -355,9 +485,17 @@ class StreamManager:
             redirect_count = 0
             bytes_served = 0
             
+            # Use appropriate HTTP client based on URL/stream type
+            # Live MPEG-TS streams (.ts URLs) need longer timeouts
+            is_live_stream = segment_url.endswith('.ts') or '/live/' in segment_url
+            client_to_use = self.live_stream_client if is_live_stream else self.http_client
+            
+            if is_live_stream:
+                logger.debug("Using live stream client with extended timeouts")
+            
             while redirect_count < max_redirects:
                 try:
-                    async with self.http_client.stream('GET', current_url, headers=headers, follow_redirects=False) as response:
+                    async with client_to_use.stream('GET', current_url, headers=headers, follow_redirects=False) as response:
                         # Handle redirects manually
                         if response.status_code in (301, 302, 303, 307, 308):
                             location = response.headers.get('location')
@@ -392,15 +530,23 @@ class StreamManager:
                         content_length = response.headers.get('content-length')
                         if content_length:
                             logger.info(f"Expected content length: {content_length} bytes")
+                        else:
+                            logger.info("Content length unknown (likely live stream)")
+                        
+                        # Use larger chunk size for MPEG-TS streams (188 bytes * 32 = 6016, rounded to 8KB)
+                        # This improves performance for continuous streams
+                        chunk_size = 32768  # 32KB chunks for better MPEG-TS performance
                         
                         chunk_count = 0
-                        async for chunk in response.aiter_bytes(chunk_size=8192):
+                        last_log_count = 0
+                        async for chunk in response.aiter_bytes(chunk_size=chunk_size):
                             bytes_served += len(chunk)
                             chunk_count += 1
                             if chunk_count == 1:
-                                logger.info(f"First chunk received: {len(chunk)} bytes")
-                            elif chunk_count % 100 == 0:  # Log every 100th chunk
+                                logger.info(f"First chunk received: {len(chunk)} bytes (using {chunk_size} byte chunks)")
+                            elif chunk_count - last_log_count >= 50:  # Log every 50 chunks instead of 100
                                 logger.debug(f"Streaming chunk {chunk_count}, total bytes: {bytes_served}")
+                                last_log_count = chunk_count
                             yield chunk
                             
                         logger.info(f"Finished streaming {chunk_count} chunks, {bytes_served} total bytes")
@@ -567,6 +713,143 @@ class StreamManager:
                     del self.stream_clients[stream_id]
                 self._stats.active_streams -= 1
                 logger.info(f"Cleaned up inactive stream: {stream_id}")
+
+    async def stream_to_client(self, stream_id: str, client_id: str):
+        """Stream data from client queue for live streams"""
+        if stream_id not in self.streams or client_id not in self.clients:
+            logger.error(f"Stream {stream_id} or client {client_id} not found")
+            raise HTTPException(status_code=404, detail="Stream or client not found")
+
+        stream_info = self.streams[stream_id]
+        client_info = self.clients[client_id]
+        
+        # For live streams, use queue-based streaming
+        if stream_info.is_live_stream:
+            async def generate():
+                try:
+                    while client_info.is_connected and stream_info.is_active:
+                        try:
+                            # Wait for data with timeout using asyncio.Queue's get method
+                            chunk = await asyncio.wait_for(
+                                client_info.data_queue.get(), 
+                                timeout=30.0
+                            )
+                            
+                            # None signals end of stream
+                            if chunk is None:
+                                logger.info(f"End of stream signal for client {client_id}")
+                                break
+                                
+                            yield chunk
+                            
+                        except asyncio.TimeoutError:
+                            logger.debug(f"Timeout waiting for data for client {client_id}")
+                            # Check if stream is still active
+                            if not stream_info.is_active:
+                                break
+                                
+                        except Exception as e:
+                            logger.error(f"Error streaming to client {client_id}: {e}")
+                            break
+                            
+                except Exception as e:
+                    logger.error(f"Error in stream generator for client {client_id}: {e}")
+                finally:
+                    # Mark client as disconnected
+                    client_info.is_connected = False
+                    stream_info.connected_clients.discard(client_id)
+                    logger.info(f"Client {client_id} disconnected from stream {stream_id}")
+                    
+                    # For live streams, clean up client immediately instead of waiting for periodic cleanup
+                    if stream_info.is_live_stream:
+                        try:
+                            await self.cleanup_client(client_id)
+                        except Exception as e:
+                            logger.error(f"Error during immediate client cleanup: {e}")
+            
+            return StreamingResponse(
+                generate(),
+                media_type="video/mp2t",
+                headers={
+                    "Content-Type": "video/mp2t",
+                    "Cache-Control": "no-cache, no-store, must-revalidate",
+                    "Pragma": "no-cache",
+                    "Expires": "0",
+                    "Transfer-Encoding": "chunked"
+                }
+            )
+        else:
+            # For non-live streams, fall back to direct proxying
+            return await self.proxy_direct_stream(stream_id, client_id)
+
+    async def proxy_direct_stream(self, stream_id: str, client_id: str = None):
+        """Direct proxy for non-live streams"""
+        if stream_id not in self.streams:
+            logger.error(f"Stream {stream_id} not found")
+            raise HTTPException(status_code=404, detail="Stream not found")
+
+        stream_info = self.streams[stream_id]
+        current_url = stream_info.current_url or stream_info.original_url
+        
+        try:
+            # Prepare headers
+            headers = {
+                'User-Agent': stream_info.user_agent,
+                'Referer': f"{urlparse(current_url).scheme}://{urlparse(current_url).netloc}/",
+                'Origin': f"{urlparse(current_url).scheme}://{urlparse(current_url).netloc}",
+                'Accept': '*/*',
+                'Connection': 'keep-alive'
+            }
+            
+            # Use appropriate client
+            client_to_use = self.http_client
+            
+            async def generate():
+                async with client_to_use.stream('GET', current_url, headers=headers, follow_redirects=True) as response:
+                    response.raise_for_status()
+                    
+                    logger.info(f"Connected to stream: {response.status_code}, Content-Type: {response.headers.get('content-type')}")
+                    
+                    chunk_count = 0
+                    bytes_served = 0
+                    
+                    async for chunk in response.aiter_bytes(chunk_size=32768):
+                        bytes_served += len(chunk)
+                        chunk_count += 1
+                        
+                        if chunk_count == 1:
+                            logger.info(f"Stream {stream_id} first chunk: {len(chunk)} bytes")
+                        elif chunk_count % 100 == 0:
+                            logger.debug(f"Stream {stream_id} chunk {chunk_count}, total: {bytes_served} bytes")
+                        
+                        # Update stats
+                        stream_info.total_bytes_served += len(chunk)
+                        stream_info.last_access = datetime.now()
+                        
+                        if client_id and client_id in self.clients:
+                            self.clients[client_id].bytes_served += len(chunk)
+                            self.clients[client_id].last_access = datetime.now()
+                        
+                        yield chunk
+                    
+                    logger.info(f"Stream {stream_id} completed: {chunk_count} chunks, {bytes_served} bytes")
+            
+            return StreamingResponse(
+                generate(),
+                media_type="video/mp2t",
+                headers={
+                    "Content-Type": "video/mp2t",
+                    "Cache-Control": "no-cache, no-store, must-revalidate",
+                    "Pragma": "no-cache",
+                    "Expires": "0",
+                    "Transfer-Encoding": "chunked"
+                }
+            )
+
+        except Exception as e:
+            logger.error(f"Error proxying direct stream {current_url}: {e}")
+            stream_info.error_count += 1
+            raise HTTPException(status_code=500, detail=str(e))
 
     def get_stats(self) -> Dict:
         """Get comprehensive stats"""

@@ -568,12 +568,20 @@ class StreamManager:
 
     def get_stats(self) -> Dict:
         """Get comprehensive stats"""
+        # Calculate active streams (streams with active clients)
+        active_stream_count = sum(1 for stream in self.streams.values() 
+                                if stream.client_count > 0 and stream.is_active)
+        
+        # Calculate active clients (clients that accessed content recently)  
+        active_client_count = sum(1 for client in self.clients.values() 
+                                if (datetime.now() - client.last_access).seconds < self.client_timeout)
+        
         return {
             "proxy_stats": {
-                "total_streams": self._stats.total_streams,
-                "active_streams": self._stats.active_streams,
-                "total_clients": self._stats.total_clients,
-                "active_clients": self._stats.active_clients,
+                "total_streams": len(self.streams),
+                "active_streams": active_stream_count,
+                "total_clients": len(self.clients), 
+                "active_clients": active_client_count,
                 "total_bytes_served": self._stats.total_bytes_served,
                 "total_segments_served": self._stats.total_segments_served,
                 "uptime_seconds": (datetime.now() - self._stats.uptime_start).seconds

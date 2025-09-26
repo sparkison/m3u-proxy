@@ -49,6 +49,8 @@ class StreamInfo:
     origin_task: Optional[asyncio.Task] = None  # Task fetching from origin
     is_live_stream: bool = False  # Whether this is a continuous live stream
     connected_clients: Set[str] = field(default_factory=set)  # Active client IDs
+    active_consumers: int = 0  # Count of actively consuming clients (HLS segments + TS streams)
+    stream_buffer: Optional[Queue] = field(default_factory=lambda: Queue(maxsize=1000))  # Shared buffer for all clients
 
 
 @dataclass
@@ -250,6 +252,353 @@ class StreamManager:
         client_info.is_connected = True
 
         return client_info
+
+    async def add_stream_consumer(self, stream_id: str, client_id: str) -> bool:
+        """Add a consumer to a stream and start provider connection if needed"""
+        if stream_id not in self.streams:
+            return False
+            
+        stream_info = self.streams[stream_id]
+        stream_info.active_consumers += 1
+        
+        logger.info(f"Added consumer {client_id} to stream {stream_id} (total consumers: {stream_info.active_consumers})")
+        
+        # Start provider connection if this is the first consumer
+        if stream_info.active_consumers == 1 and not stream_info.origin_task:
+            logger.info(f"Starting provider connection for stream {stream_id} (first consumer)")
+            stream_info.origin_task = asyncio.create_task(
+                self._fetch_unified_stream(stream_id)
+            )
+            
+        return True
+
+    async def remove_stream_consumer(self, stream_id: str, client_id: str) -> bool:
+        """Remove a consumer from a stream and stop provider connection if no consumers remain"""
+        if stream_id not in self.streams:
+            return False
+            
+        stream_info = self.streams[stream_id]
+        if stream_info.active_consumers > 0:
+            stream_info.active_consumers -= 1
+            
+        logger.info(f"Removed consumer {client_id} from stream {stream_id} (remaining consumers: {stream_info.active_consumers})")
+        
+        # Stop provider connection if no consumers remain
+        if stream_info.active_consumers == 0 and stream_info.origin_task:
+            logger.info(f"Stopping provider connection for stream {stream_id} (no consumers)")
+            stream_info.origin_task.cancel()
+            stream_info.origin_task = None
+            
+            # Clear the buffer
+            try:
+                while not stream_info.stream_buffer.empty():
+                    stream_info.stream_buffer.get_nowait()
+            except:
+                pass
+                
+        return True
+
+    async def _fetch_unified_stream(self, stream_id: str):
+        """Unified stream fetcher that works for both HLS and TS streams"""
+        if stream_id not in self.streams:
+            return
+            
+        stream_info = self.streams[stream_id]
+        current_url = stream_info.current_url or stream_info.original_url
+        
+        try:
+            logger.info(f"Starting unified provider connection for stream {stream_id}: {current_url}")
+            
+            # Prepare headers
+            headers = {
+                'User-Agent': stream_info.user_agent,
+                'Referer': f"{urlparse(current_url).scheme}://{urlparse(current_url).netloc}/",
+                'Origin': f"{urlparse(current_url).scheme}://{urlparse(current_url).netloc}",
+                'Accept': '*/*',
+                'Connection': 'keep-alive'
+            }
+            
+            # Use appropriate client
+            is_live_stream = current_url.endswith('.ts') or '/live/' in current_url
+            client_to_use = self.live_stream_client if is_live_stream else self.http_client
+            
+            async with client_to_use.stream('GET', current_url, headers=headers, follow_redirects=True) as response:
+                response.raise_for_status()
+                
+                logger.info(f"Connected to provider stream {stream_id}: {response.status_code}, Content-Type: {response.headers.get('content-type')}")
+                
+                chunk_count = 0
+                bytes_served = 0
+                
+                async for chunk in response.aiter_bytes(chunk_size=32768):
+                    # Check if we still have consumers
+                    if stream_info.active_consumers == 0:
+                        logger.info(f"No consumers for stream {stream_id}, stopping provider connection")
+                        break
+                        
+                    bytes_served += len(chunk)
+                    chunk_count += 1
+                    
+                    if chunk_count == 1:
+                        logger.info(f"Provider stream {stream_id} first chunk: {len(chunk)} bytes")
+                    elif chunk_count % 100 == 0:
+                        logger.debug(f"Provider stream {stream_id} chunk {chunk_count}, total: {bytes_served} bytes, consumers: {stream_info.active_consumers}")
+                    
+                    # Put chunk in shared buffer (non-blocking, drop if buffer full)
+                    try:
+                        stream_info.stream_buffer.put_nowait(chunk)
+                    except asyncio.QueueFull:
+                        # Buffer full, drop oldest chunk and add new one
+                        try:
+                            stream_info.stream_buffer.get_nowait()
+                            stream_info.stream_buffer.put_nowait(chunk)
+                        except asyncio.QueueEmpty:
+                            pass
+                    
+                    # Update stream stats
+                    stream_info.total_bytes_served += len(chunk)
+                    stream_info.last_access = datetime.now()
+                
+                logger.info(f"Provider stream {stream_id} completed: {chunk_count} chunks, {bytes_served} bytes")
+                
+        except asyncio.CancelledError:
+            logger.info(f"Provider stream {stream_id} cancelled (no consumers)")
+        except Exception as e:
+            logger.error(f"Error in provider stream {stream_id}: {e}")
+            stream_info.error_count += 1
+        finally:
+            # Send end-of-stream signal to any waiting consumers
+            try:
+                stream_info.stream_buffer.put_nowait(None)
+            except asyncio.QueueFull:
+                # Clear buffer and send end signal
+                try:
+                    while not stream_info.stream_buffer.empty():
+                        stream_info.stream_buffer.get_nowait()
+                    stream_info.stream_buffer.put_nowait(None)
+                except asyncio.QueueEmpty:
+                    pass
+            # Clean up
+            stream_info.origin_task = None
+            logger.info(f"Provider connection closed for stream {stream_id}")
+
+    async def get_complete_segment_data(self, stream_id: str, client_id: str) -> Optional[bytes]:
+        """Get complete segment data for HLS segments (waits for full download)"""
+        if stream_id not in self.streams:
+            return None
+            
+        stream_info = self.streams[stream_id]
+        
+        try:
+            logger.debug(f"Waiting for segment data for stream {stream_id}")
+            
+            # Wait for provider connection to start and complete
+            max_wait_for_start = 10.0
+            start_time = asyncio.get_event_loop().time()
+            
+            # Wait for provider connection to start
+            while not (hasattr(stream_info, 'origin_task') and stream_info.origin_task):
+                if asyncio.get_event_loop().time() - start_time > max_wait_for_start:
+                    logger.warning(f"Provider connection did not start for stream {stream_id}")
+                    return None
+                await asyncio.sleep(0.1)
+            
+            logger.debug(f"Provider connection started for stream {stream_id}, waiting for completion")
+            
+            # Wait for the provider task to complete (it will collect the entire segment)
+            try:
+                await asyncio.wait_for(stream_info.origin_task, timeout=30.0)
+                logger.debug(f"Provider task completed for stream {stream_id}")
+            except asyncio.TimeoutError:
+                logger.warning(f"Timeout waiting for provider task completion for stream {stream_id}")
+                return None
+            except Exception as e:
+                logger.warning(f"Provider task failed for stream {stream_id}: {e}")
+                return None
+            
+            # Now collect all data from the buffer (it should be complete)
+            segment_data = b""
+            
+            # Collect all available data from the buffer
+            while True:
+                try:
+                    chunk = stream_info.stream_buffer.get_nowait()
+                    if chunk is None:  # End of stream signal
+                        break
+                    segment_data += chunk
+                except asyncio.QueueEmpty:
+                    break
+                    
+            # Update client stats
+            if client_id in self.clients and segment_data:
+                client_info = self.clients[client_id]
+                client_info.bytes_served += len(segment_data)
+                client_info.last_access = datetime.now()
+            
+            logger.info(f"Completed segment collection for stream {stream_id}: {len(segment_data)} bytes")
+            return segment_data if segment_data else None
+                    
+        except Exception as e:
+            logger.error(f"Error getting complete segment data for client {client_id}: {e}")
+            return None
+
+    async def get_stream_data(self, stream_id: str, client_id: str, timeout: float = 30.0) -> Optional[bytes]:
+        """Get stream data from shared buffer for any type of stream"""
+        if stream_id not in self.streams:
+            return None
+            
+        stream_info = self.streams[stream_id]
+        
+        try:
+            # Wait for data from shared buffer
+            chunk = await asyncio.wait_for(
+                stream_info.stream_buffer.get(), 
+                timeout=timeout
+            )
+            
+            # None signals end of stream
+            if chunk is None:
+                return None
+            
+            # Update client stats
+            if client_id in self.clients:
+                client_info = self.clients[client_id]
+                client_info.bytes_served += len(chunk)
+                client_info.last_access = datetime.now()
+            
+            return chunk
+            
+        except asyncio.TimeoutError:
+            logger.debug(f"Timeout waiting for stream data for client {client_id}")
+            return None
+        except Exception as e:
+            logger.error(f"Error getting stream data for client {client_id}: {e}")
+            return None
+
+    async def stream_unified_response(self, stream_id: str, client_id: str, is_hls_segment: bool = False) -> StreamingResponse:
+        """Unified streaming response for both HLS segments and TS streams"""
+        logger.debug(f"stream_unified_response called: stream_id={stream_id}, client_id={client_id}, is_hls_segment={is_hls_segment}")
+        
+        if stream_id not in self.streams:
+            logger.error(f"Stream not found: {stream_id}")
+            raise HTTPException(status_code=404, detail="Stream not found")
+
+        stream_info = self.streams[stream_id]
+        logger.debug(f"Found stream_info for {stream_id}")
+        
+        # Add this client as a consumer
+        consumer_added = await self.add_stream_consumer(stream_id, client_id)
+        logger.debug(f"Consumer added: {consumer_added}")
+        
+        # For HLS segments, check if data will be available before creating the response
+        if is_hls_segment:
+            # Pre-check: wait a moment for provider connection to start or fail
+            await asyncio.sleep(0.1)  # Give provider connection time to start
+            
+            # If provider connection failed immediately, don't create a streaming response
+            if hasattr(stream_info, 'origin_task') and stream_info.origin_task and stream_info.origin_task.done():
+                try:
+                    # Check if the task completed with an exception
+                    stream_info.origin_task.result()
+                except Exception as e:
+                    logger.error(f"Provider connection failed for stream {stream_id}: {e}")
+                    await self.remove_stream_consumer(stream_id, client_id)
+                    raise HTTPException(status_code=503, detail="Provider connection failed")
+        
+        logger.debug(f"About to create async generator for {stream_id}")
+        
+        async def generate():
+            logger.debug(f"Generator started for {stream_id}, client {client_id}")
+            try:
+                if is_hls_segment:
+                    logger.debug(f"HLS segment mode for {stream_id}")
+                    # For HLS segments, wait for the complete segment data
+                    segment_data = await self.get_complete_segment_data(stream_id, client_id)
+                    logger.debug(f"Segment data result: {type(segment_data)} with length {len(segment_data) if segment_data else 0}")
+                    
+                    if segment_data and len(segment_data) > 0:
+                        logger.debug(f"Yielding segment data: {len(segment_data)} bytes")
+                        yield segment_data
+                    else:
+                        # No data available - provider may have failed
+                        logger.warning(f"No segment data available for stream {stream_id}, client {client_id}")
+                        # Force yield of empty bytes to prevent encoding errors
+                        logger.debug(f"Yielding empty bytes for {stream_id}")
+                        yield b""
+                else:
+                    logger.debug(f"Continuous stream mode for {stream_id}")
+                    # For continuous streams, keep streaming until client disconnects
+                    yielded_data = False
+                    while stream_info.active_consumers > 0:
+                        chunk = await self.get_stream_data(stream_id, client_id, timeout=30.0)
+                        if chunk is None:
+                            break
+                        yield chunk
+                        yielded_data = True
+                    
+                    # Ensure we yield something for continuous streams too
+                    if not yielded_data:
+                        logger.debug(f"No data yielded, yielding empty bytes for continuous stream {stream_id}")
+                        yield b""
+                        
+            except Exception as e:
+                logger.error(f"Error in unified stream generator for client {client_id}: {e}")
+                logger.error(f"Exception type: {type(e)}")
+                # Always yield bytes on error, never None or strings
+                logger.debug(f"Exception occurred, yielding empty bytes for {stream_id}")
+                yield b""
+            finally:
+                logger.debug(f"Generator cleanup for {stream_id}, client {client_id}")
+                # Remove this client as a consumer
+                await self.remove_stream_consumer(stream_id, client_id)
+                # Clean up client
+                if client_id in self.clients:
+                    await self.cleanup_client(client_id)
+                logger.info(f"Unified stream consumer {client_id} disconnected from stream {stream_id}")
+        
+        logger.debug(f"About to determine content type for {stream_id}")
+        
+        # Determine content type
+        stream_url = stream_info.current_url or stream_info.original_url
+        logger.debug(f"Stream URL: {stream_url}")
+        
+        if stream_url.endswith('.ts') or '/live/' in stream_url:
+            content_type = "video/mp2t"
+        elif stream_url.endswith('.m3u8'):
+            content_type = "application/vnd.apple.mpegurl"
+        else:
+            content_type = "application/octet-stream"
+            
+        logger.debug(f"Content type determined: {content_type}")
+        
+        logger.debug(f"About to create StreamingResponse for {stream_id}")
+        
+        # Build headers, ensuring no None values
+        headers = {
+            "Content-Type": content_type,
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Pragma": "no-cache",
+            "Expires": "0"
+        }
+        
+        # Only add Transfer-Encoding if it's not an HLS segment
+        if not is_hls_segment:
+            headers["Transfer-Encoding"] = "chunked"
+        
+        logger.debug(f"Headers prepared: {headers}")
+        
+        try:
+            response = StreamingResponse(
+                generate(),
+                media_type=content_type,
+                headers=headers
+            )
+            logger.debug(f"StreamingResponse created successfully for {stream_id}")
+            return response
+        except Exception as e:
+            logger.error(f"Error creating StreamingResponse for {stream_id}: {e}")
+            logger.error(f"Exception type: {type(e)}")
+            raise
 
     async def start_live_stream(self, stream_id: str) -> bool:
         """Start the origin connection for a live stream"""

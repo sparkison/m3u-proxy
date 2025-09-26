@@ -151,3 +151,6 @@ logs/
 *.m3u
 *.zip
 *.gz
+
+# Internal notes
+proxy-dev.md

@@ -80,8 +80,8 @@ async def shutdown_event():
 def get_client_info(request: Request):
     """Extract client information from request"""
     return {
-        "user_agent": request.headers.get("user-agent"),
-        "ip_address": request.client.host if request.client else None
+        "user_agent": request.headers.get("user-agent") or "unknown",
+        "ip_address": request.client.host if request.client else "unknown"
     }
 
 
@@ -255,25 +255,45 @@ async def get_hls_segment(
                 logger.info(
                     f"Extracted header from query param: {header_name}={value}")
 
-        # Determine content type from the segment URL
-        content_type = get_content_type(segment_url)
-
-        # Prepare response headers
-        response_headers = {"content-type": content_type}
-        if range_header:
-            response_headers["accept-ranges"] = "bytes"
-
-        # Stream the segment with additional headers
-        return StreamingResponse(
-            stream_manager.proxy_segment(
-                segment_url, client_id, range_header, additional_headers),
-            headers=response_headers,
-            status_code=206 if range_header else 200
+        # For the unified live proxy, we need to create/get a stream for this segment URL
+        # This ensures all clients requesting the same stream share the provider connection
+        segment_stream_id = await stream_manager.get_or_create_stream(segment_url)
+        
+        logger.info(f"HLS segment request - Stream: {segment_stream_id}, Client: {client_id}, URL: {segment_url}")
+        
+        # Register client for this segment stream
+        client_info_data = get_client_info(request)
+        await stream_manager.register_client(
+            client_id,
+            segment_stream_id,
+            user_agent=client_info_data["user_agent"],
+            ip_address=client_info_data["ip_address"]
         )
+        
+        # Use unified streaming response for HLS segments
+        try:
+            response = await stream_manager.stream_unified_response(
+                segment_stream_id, 
+                client_id, 
+                is_hls_segment=True
+            )
+            return response
+        except Exception as stream_error:
+            logger.error(f"Stream response error: {stream_error}")
+            # Fall back to error response
+            return Response(
+                content=b"Stream unavailable",
+                status_code=503,
+                headers={"Content-Type": "text/plain"}
+            )
 
     except Exception as e:
         logger.error(f"Error serving segment: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Exception type: {type(e)}")
+        logger.error(f"Exception args: {e.args}")
+        # Ensure we have a string representation
+        error_detail = str(e) if e else "Unknown error"
+        raise HTTPException(status_code=500, detail=error_detail)
 
 
 @app.get("/stream/{stream_id}")
@@ -373,13 +393,12 @@ async def get_direct_stream(
         if is_live_stream:
             logger.info("Configured for live streaming (chunked transfer, no range requests)")
 
-        # For live streams, start origin connection if not already running and use new architecture
-        if is_live_stream:
-            await stream_manager.start_live_stream(stream_id)
-            return await stream_manager.stream_to_client(stream_id, client_id)
-        else:
-            # For non-live streams, use the direct streaming method
-            return await stream_manager.proxy_direct_stream(stream_id, client_id)
+        # Use unified live proxy for all streams
+        return await stream_manager.stream_unified_response(
+            stream_id, 
+            client_id, 
+            is_hls_segment=False  # This is a continuous stream, not an HLS segment
+        )
 
     except HTTPException:
         raise

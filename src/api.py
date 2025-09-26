@@ -2,6 +2,7 @@ from fastapi import FastAPI, HTTPException, Query, Response, Request
 from fastapi.responses import StreamingResponse
 import logging
 import uuid
+import hashlib
 from urllib.parse import unquote
 from typing import Optional, List
 from pydantic import BaseModel
@@ -150,35 +151,44 @@ async def get_hls_playlist(
 ):
     """Get HLS playlist for a stream"""
     try:
-        # Generate client ID if not provided
-        if not client_id:
-            client_id = str(uuid.uuid4())
-
         # If URL is provided, create/get stream first
         if url:
             decoded_url = unquote(url)
             stream_id = await stream_manager.get_or_create_stream(decoded_url)
 
-        # Register client
-        client_info_data = get_client_info(request)
-        client_info = await stream_manager.register_client(
-            client_id,
-            stream_id,
-            user_agent=client_info_data["user_agent"],
-            ip_address=client_info_data["ip_address"]
-        )
+        # Generate or reuse client ID based on request characteristics
+        # Use IP + User-Agent + Stream ID to create a consistent client ID
+        if not client_id:
+            client_info_data = get_client_info(request)
+            client_hash = hashlib.md5(
+                f"{client_info_data['ip_address']}-{client_info_data['user_agent']}-{stream_id}".encode()
+            ).hexdigest()[:16]
+            client_id = f"client_{client_hash}"
 
-        # Emit client connected event
-        event = StreamEvent(
-            event_type=EventType.CLIENT_CONNECTED,
-            stream_id=stream_id,
-            data={
-                "client_id": client_id,
-                "user_agent": client_info_data["user_agent"],
-                "ip_address": client_info_data["ip_address"]
-            }
-        )
-        await event_manager.emit_event(event)
+        # Only register client if not already registered for this stream
+        if client_id not in stream_manager.clients or stream_manager.clients[client_id].stream_id != stream_id:
+            client_info_data = get_client_info(request)
+            client_info = await stream_manager.register_client(
+                client_id,
+                stream_id,
+                user_agent=client_info_data["user_agent"],
+                ip_address=client_info_data["ip_address"]
+            )
+
+            # Emit client connected event
+            event = StreamEvent(
+                event_type=EventType.CLIENT_CONNECTED,
+                stream_id=stream_id,
+                data={
+                    "client_id": client_id,
+                    "user_agent": client_info_data["user_agent"],
+                    "ip_address": client_info_data["ip_address"]
+                }
+            )
+            await event_manager.emit_event(event)
+        else:
+            logger.debug(
+                f"Reusing existing client {client_id} for stream {stream_id}")
 
         # Build base URL for this stream
         base_proxy_url = f"http://localhost:8001/hls/{stream_id}"
@@ -222,6 +232,29 @@ async def get_hls_segment(
         # Get range header if present
         range_header = request.headers.get('range')
 
+        # Extract additional headers from query parameters (h_ prefixed)
+        additional_headers = {}
+        for key, value in request.query_params.items():
+            if key.startswith("h_"):
+                header_name = key[2:].replace('_', '-').lower()
+                # Special handling for common headers
+                if header_name == 'user-agent':
+                    header_name = 'User-Agent'
+                elif header_name == 'referer':
+                    header_name = 'Referer'
+                elif header_name == 'origin':
+                    header_name = 'Origin'
+                elif header_name == 'accept':
+                    header_name = 'Accept'
+                elif header_name == 'accept-encoding':
+                    header_name = 'Accept-Encoding'
+                elif header_name == 'accept-language':
+                    header_name = 'Accept-Language'
+
+                additional_headers[header_name] = value
+                logger.info(
+                    f"Extracted header from query param: {header_name}={value}")
+
         # Determine content type from the segment URL
         content_type = get_content_type(segment_url)
 
@@ -230,9 +263,10 @@ async def get_hls_segment(
         if range_header:
             response_headers["accept-ranges"] = "bytes"
 
-        # Stream the segment
+        # Stream the segment with additional headers
         return StreamingResponse(
-            stream_manager.proxy_segment(segment_url, client_id, range_header),
+            stream_manager.proxy_segment(
+                segment_url, client_id, range_header, additional_headers),
             headers=response_headers,
             status_code=206 if range_header else 200
         )
@@ -253,30 +287,41 @@ async def get_direct_stream(
 ):
     """Serve direct streams (.ts, .mp4, .mkv, etc.) for IPTV"""
     try:
-        # Generate client ID if not provided
-        if not client_id:
-            client_id = str(uuid.uuid4())
-
         # If URL is provided, create/get stream first
         if url:
             decoded_url = unquote(url)
             stream_id = await stream_manager.get_or_create_stream(decoded_url)
 
-        # Register client
-        client_info_data = get_client_info(request)
-        await stream_manager.register_client(
-            client_id,
-            stream_id,
-            user_agent=client_info_data["user_agent"],
-            ip_address=client_info_data["ip_address"]
-        )
-
-        # Get stream info
+        # Get stream info first
         if stream_id not in stream_manager.streams:
             raise HTTPException(status_code=404, detail="Stream not found")
 
         stream_info = stream_manager.streams[stream_id]
         stream_url = stream_info.current_url or stream_info.original_url
+
+        # Generate or reuse client ID based on request characteristics
+        # Use IP + User-Agent + Stream ID to create a consistent client ID
+        if not client_id:
+            client_info_data = get_client_info(request)
+            client_hash = hashlib.md5(
+                f"{client_info_data['ip_address']}-{client_info_data['user_agent']}-{stream_id}".encode()
+            ).hexdigest()[:16]
+            client_id = f"client_{client_hash}"
+
+        # Only register client if not already registered for this stream
+        if client_id not in stream_manager.clients or stream_manager.clients[client_id].stream_id != stream_id:
+            client_info_data = get_client_info(request)
+            await stream_manager.register_client(
+                client_id,
+                stream_id,
+                user_agent=client_info_data["user_agent"],
+                ip_address=client_info_data["ip_address"]
+            )
+            logger.info(
+                f"Registered client {client_id} for stream {stream_id}")
+        else:
+            logger.debug(
+                f"Reusing existing client {client_id} for stream {stream_id}")
 
         # Determine content type
         content_type = get_content_type(stream_url)
@@ -288,7 +333,10 @@ async def get_direct_stream(
         response_headers = {
             "content-type": content_type,
             "X-Client-ID": client_id,
-            "X-Stream-ID": stream_id
+            "X-Stream-ID": stream_id,
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Pragma": "no-cache",
+            "Expires": "0"
         }
         if range_header:
             response_headers["accept-ranges"] = "bytes"

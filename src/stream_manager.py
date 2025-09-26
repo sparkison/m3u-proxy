@@ -36,6 +36,7 @@ class StreamInfo:
     failover_urls: List[str] = field(default_factory=list)
     current_failover_index: int = 0
     current_url: Optional[str] = None
+    final_playlist_url: Optional[str] = None  # Track final URL after redirects
     user_agent: str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"
 
 
@@ -51,62 +52,54 @@ class ProxyStats:
 
 
 class M3U8Processor:
-    def __init__(self, base_url: str):
+    def __init__(self, base_url: str, client_id: str, user_agent: Optional[str] = None, original_url: Optional[str] = None):
         self.base_url = base_url
+        self.client_id = client_id
+        self.user_agent = user_agent or 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36'
+        self.original_url = original_url or base_url
 
-    async def process_playlist(self, content: str, original_base_url: str) -> str:
-        """Process M3U8 playlist content, rewriting URLs appropriately"""
+    def process_playlist(self, content: str, base_proxy_url: str, original_base_url: Optional[str] = None) -> str:
+        """Process M3U8 content and rewrite segment URLs"""
         lines = content.split('\n')
         processed_lines = []
 
-        # Check if this is a master playlist (contains #EXT-X-STREAM-INF)
-        is_master_playlist = any('#EXT-X-STREAM-INF' in line for line in lines)
-
         for line in lines:
-            original_line = line
-            line = line.strip()
-
-            if line and not line.startswith('#'):
-                # This is a direct URL line
-                if line.startswith('http'):
-                    full_url = line
-                else:
-                    # Relative URL - resolve it
-                    full_url = urljoin(original_base_url, line)
-
-                if is_master_playlist:
-                    # This is a variant playlist URL - proxy it as another playlist
-                    encoded_url = quote(full_url, safe='')
-                    proxy_url = f"{self.base_url}/playlist.m3u8?url={encoded_url}"
-                else:
-                    # This is a media segment URL - proxy it as a segment
-                    encoded_url = quote(full_url, safe='')
-                    proxy_url = f"{self.base_url}/segment?url={encoded_url}"
-
-                processed_lines.append(proxy_url)
-
-            elif line.startswith('#EXT-X-MAP:'):
-                # Process EXT-X-MAP URI
-                uri_match = re.search(r'URI="([^"]+)"', line)
-                if uri_match:
-                    uri = uri_match.group(1)
-                    if uri.startswith('http'):
-                        full_url = uri
-                    else:
-                        full_url = urljoin(original_base_url, uri)
-
-                    encoded_url = quote(full_url, safe='')
-                    proxy_url = f"{self.base_url}/segment?url={encoded_url}"
-
-                    # Replace the URI in the line
-                    new_line = line.replace(
-                        f'URI="{uri}"', f'URI="{proxy_url}"')
-                    processed_lines.append(new_line)
-                else:
-                    processed_lines.append(original_line)
-
+            stripped_line = line.strip()
+            if stripped_line and not stripped_line.startswith('#'):
+                # This is a segment URL
+                if not stripped_line.startswith('http'):
+                    # Convert relative URL to absolute using original base URL
+                    from urllib.parse import urljoin, urlparse
+                    resolve_base = original_base_url or self.original_url
+                    stripped_line = urljoin(resolve_base, stripped_line)
+                
+                # Encode the segment URL and add auth headers
+                encoded_url = quote(stripped_line, safe='')
+                segment_url = f"{base_proxy_url}/segment?url={encoded_url}&client_id={self.client_id}"
+                
+                # Add authentication headers to the segment URL based on original playlist domain
+                from urllib.parse import urlparse
+                original_parsed = urlparse(self.original_url)
+                
+                # Add headers as query parameters (following MediaFlow pattern)
+                auth_headers = {
+                    'referer': f"{original_parsed.scheme}://{original_parsed.netloc}/",
+                    'origin': f"{original_parsed.scheme}://{original_parsed.netloc}",
+                    'user-agent': self.user_agent,
+                    'accept': '*/*',
+                    'accept-encoding': 'gzip, deflate, br',
+                    'accept-language': 'en-US,en;q=0.9'
+                }
+                
+                # Add header parameters to segment URL
+                for header_name, header_value in auth_headers.items():
+                    encoded_header_value = quote(header_value, safe='')
+                    segment_url += f"&h_{header_name}={encoded_header_value}"
+                
+                processed_lines.append(segment_url)
+                logger.debug(f"Processed segment URL with auth headers: {stripped_line} -> {segment_url}")
             else:
-                processed_lines.append(original_line)
+                processed_lines.append(line)
 
         return '\n'.join(processed_lines)
 
@@ -257,8 +250,15 @@ class StreamManager:
             content = response.text
             logger.info(f"Received playlist content ({len(content)} chars)")
 
+            # Use the final URL after redirects for authentication
+            final_url = str(response.url)
+            logger.info(f"Final playlist URL after redirects: {final_url}")
+            
+            # Store the final URL in stream info for segment authentication
+            stream_info.final_playlist_url = final_url
+
             # Determine base URL for resolving relative URLs
-            parsed_url = urlparse(current_url)
+            parsed_url = urlparse(final_url)
             base_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
             if parsed_url.path:
                 path_parts = parsed_url.path.rsplit('/', 1)
@@ -269,9 +269,9 @@ class StreamManager:
             else:
                 base_url += '/'
 
-            # Process the playlist
-            processor = M3U8Processor(base_proxy_url)
-            processed_content = await processor.process_playlist(content, base_url)
+            # Process the playlist - use final URL for authentication headers
+            processor = M3U8Processor(base_proxy_url, client_id, stream_info.user_agent, final_url)
+            processed_content = processor.process_playlist(content, base_proxy_url, base_url)
 
             # Update stats
             stream_info.last_access = datetime.now()
@@ -295,24 +295,53 @@ class StreamManager:
         self,
         segment_url: str,
         client_id: str,
-        range_header: Optional[str] = None
+        range_header: Optional[str] = None,
+        additional_headers: Optional[dict] = None
     ) -> AsyncIterator[bytes]:
         """Proxy a segment request directly"""
         try:
             logger.info(
                 f"Client {client_id} requesting segment: {segment_url}")
 
-            # Prepare headers with user agent from stream
-            # default
+            # Prepare headers with proper authentication
             headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36'}
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36'
+            }
 
-            # Get user agent from client's stream if available
+            # Add any additional headers passed from the API request first
+            if additional_headers:
+                headers.update(additional_headers)
+                logger.info(f"Added additional headers: {additional_headers}")
+
+            # Get headers from client's stream if available - this will override any conflicting headers
             if client_id in self.clients:
                 client_info = self.clients[client_id]
                 if client_info.stream_id and client_info.stream_id in self.streams:
                     stream_info = self.streams[client_info.stream_id]
+                    # Stream's user agent takes precedence over any other user agent
                     headers['User-Agent'] = stream_info.user_agent
+                    
+                    # Add authentication headers based on final playlist URL (after redirects)
+                    from urllib.parse import urlparse
+                    # Use final playlist URL if available, otherwise fall back to original URL
+                    auth_url = stream_info.final_playlist_url or stream_info.original_url
+                    auth_parsed = urlparse(auth_url)
+                    segment_parsed = urlparse(segment_url)
+                    
+                    # Set Referer to the actual playlist domain for authentication
+                    headers['Referer'] = f"{auth_parsed.scheme}://{auth_parsed.netloc}/"
+                    headers['Origin'] = f"{auth_parsed.scheme}://{auth_parsed.netloc}"
+                    
+                    # Add Accept header for TS segments
+                    headers['Accept'] = '*/*'
+                    headers['Accept-Encoding'] = 'gzip, deflate, br'
+                    headers['Accept-Language'] = 'en-US,en;q=0.9'
+                    headers['Connection'] = 'keep-alive'
+                    
+                    # Log authentication headers being used
+                    logger.info(f"Using stream user agent: {stream_info.user_agent}")
+                    logger.info(f"Using authentication URL: {auth_url}")
+                    logger.info(f"Using authentication headers for segment request: Referer={headers['Referer']}, Origin={headers['Origin']}")
 
             if range_header:
                 headers['Range'] = range_header
@@ -352,11 +381,27 @@ class StreamManager:
                             continue
                         
                         # Not a redirect, process the response
-                        logger.debug(f"Streaming segment from final URL: {current_url} (after {redirect_count} redirects)")
+                        logger.info(f"Streaming segment from final URL: {current_url} (after {redirect_count} redirects)")
+                        logger.info(f"Response status: {response.status_code}, Content-Type: {response.headers.get('content-type', 'unknown')}")
+                        
                         response.raise_for_status()
+                        
+                        # Log the content length if available
+                        content_length = response.headers.get('content-length')
+                        if content_length:
+                            logger.info(f"Expected content length: {content_length} bytes")
+                        
+                        chunk_count = 0
                         async for chunk in response.aiter_bytes(chunk_size=8192):
                             bytes_served += len(chunk)
+                            chunk_count += 1
+                            if chunk_count == 1:
+                                logger.info(f"First chunk received: {len(chunk)} bytes")
+                            elif chunk_count % 100 == 0:  # Log every 100th chunk
+                                logger.debug(f"Streaming chunk {chunk_count}, total bytes: {bytes_served}")
                             yield chunk
+                            
+                        logger.info(f"Finished streaming {chunk_count} chunks, {bytes_served} total bytes")
                         break  # Successfully streamed, exit the redirect loop
                         
                 except Exception as e:

@@ -1,6 +1,6 @@
 # m3u-proxy
 
-A high-performance HTTP proxy server for HLS (HTTP Live Streaming) content with client management, statistics tracking, and failover support. Built with FastAPI and inspired by MediaFlow Proxy.
+A high-performance HTTP proxy server for IPTV content with client management, statistics tracking, and failover support. Built with FastAPI and inspired by MediaFlow Proxy.
 
 ## Features
 

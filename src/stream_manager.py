@@ -4,7 +4,7 @@ import re
 import logging
 from typing import Dict, Optional, AsyncIterator, List, Set
 from urllib.parse import urljoin, urlparse, quote, unquote
-from datetime import datetime
+from datetime import datetime, timedelta
 from dataclasses import dataclass, field
 import weakref
 from asyncio import Queue
@@ -496,19 +496,34 @@ class StreamManager:
             # Simple approach: make the range request and stream whatever we get back
             async def proxy_range_generator():
                 bytes_served = 0
-                async with self.http_client.stream('GET', stream_url, headers=headers, follow_redirects=True) as response:
-                    logger.info(f"Origin range response: {response.status_code}")
-                    logger.info(f"Origin headers: Content-Length={response.headers.get('content-length')}, Content-Range={response.headers.get('content-range')}")
-                    
-                    # Stream whatever the origin server gives us
-                    async for chunk in response.aiter_bytes(chunk_size=32 * 1024):
-                        yield chunk
-                        bytes_served += len(chunk)
+                try:
+                    async with self.http_client.stream('GET', stream_url, headers=headers, follow_redirects=True) as response:
+                        logger.info(f"Origin range response: {response.status_code}")
+                        logger.info(f"Origin headers: Content-Length={response.headers.get('content-length')}, Content-Range={response.headers.get('content-range')}")
                         
-                        if bytes_served % (5 * 1024 * 1024) == 0:  # Log every 5MB
-                            logger.info(f"Range proxy streamed {bytes_served} bytes")
+                        # Stream whatever the origin server gives us
+                        async for chunk in response.aiter_bytes(chunk_size=32 * 1024):
+                            yield chunk
+                            bytes_served += len(chunk)
+                            
+                            if bytes_served % (5 * 1024 * 1024) == 0:  # Log every 5MB
+                                logger.info(f"Range proxy streamed {bytes_served} bytes")
+                    
+                    logger.info(f"Range proxy completed: {bytes_served} bytes total")
                 
-                logger.info(f"Range proxy completed: {bytes_served} bytes total")
+                except GeneratorExit:
+                    logger.info(f"Range proxy generator stopped by client disconnect: {bytes_served} bytes served")
+                    # Mark client for cleanup (will be handled by the cleanup task)
+                    if client_id in self.clients:
+                        self.clients[client_id].last_seen = datetime.now() - timedelta(minutes=10)  # Force cleanup
+                    return
+                    
+                except Exception as e:
+                    logger.error(f"Error in range proxy generator: {e}")
+                    # Mark client for cleanup on error
+                    if client_id in self.clients:
+                        self.clients[client_id].last_seen = datetime.now() - timedelta(minutes=10)  # Force cleanup
+                    return
             
             # Make the actual request to get the real headers
             async with self.http_client.stream('GET', stream_url, headers=headers, follow_redirects=True) as test_response:
@@ -588,6 +603,9 @@ class StreamManager:
                     end = int(end_str) if end_str else None
                     
                     logger.info(f"Parsed range request: start={start}, end={end}")
+                    
+                    # Add client as consumer even for range requests to track them properly
+                    await self.add_stream_consumer(stream_id, client_id)
                     
                     # Return range response instead of full stream
                     return await self._handle_range_request(stream_id, client_id, start, end)

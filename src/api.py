@@ -3,9 +3,9 @@ from fastapi.responses import StreamingResponse
 import logging
 import uuid
 import hashlib
-from urllib.parse import unquote
+from urllib.parse import unquote, urlparse
 from typing import Optional, List
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator, ValidationError
 
 from stream_manager import StreamManager
 from events import EventManager
@@ -39,13 +39,60 @@ def is_direct_stream(url: str) -> bool:
     """Check if URL is a direct stream (not HLS playlist)"""
     return url.lower().endswith(('.ts', '.mp4', '.mkv', '.webm', '.avi'))
 
+
+def validate_url(url: str) -> str:
+    """Validate URL format and security"""
+    if not url or not url.strip():
+        raise ValueError("URL cannot be empty")
+
+    # Basic URL parsing validation
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        raise ValueError("Invalid URL format")
+
+    # Ensure scheme is http or https
+    if parsed.scheme.lower() not in ['http', 'https']:
+        raise ValueError("URL must use HTTP or HTTPS protocol")
+
+    # Ensure there's a valid netloc (domain)
+    if not parsed.netloc:
+        raise ValueError("URL must have a valid domain")
+
+    # Security checks
+    if url.lower().startswith('javascript:'):
+        raise ValueError("JavaScript URLs are not allowed")
+
+    if url.lower().startswith('file:'):
+        raise ValueError("File URLs are not allowed")
+
+    # Additional security check for malicious URLs
+    dangerous_patterns = ['<script', 'javascript:', 'data:', 'vbscript:']
+    url_lower = url.lower()
+    for pattern in dangerous_patterns:
+        if pattern in url_lower:
+            raise ValueError(f"URL contains dangerous pattern: {pattern}")
+
+    return url
+
+
 # Request models
-
-
 class StreamCreateRequest(BaseModel):
     url: str
     failover_urls: Optional[List[str]] = None
     user_agent: Optional[str] = None
+
+    @field_validator('url')
+    @classmethod
+    def validate_primary_url(cls, v):
+        return validate_url(v)
+
+    @field_validator('failover_urls')
+    @classmethod
+    def validate_failover_urls(cls, v):
+        if v is not None:
+            return [validate_url(url) for url in v]
+        return v
 
 
 app = FastAPI(
@@ -88,10 +135,13 @@ def get_client_info(request: Request):
 @app.get("/")
 async def root():
     stats = stream_manager.get_stats()
+    proxy_stats = stats["proxy_stats"]
     return {
+        "status": "running",
         "message": "m3u-proxy Enhanced is running",
         "version": "2.0.0",
-        "stats": stats["proxy_stats"]
+        "uptime": proxy_stats["uptime_seconds"],
+        "stats": proxy_stats
     }
 
 
@@ -133,6 +183,9 @@ async def create_stream(request: StreamCreateRequest):
             "user_agent": request.user_agent or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36",
             "stream_type": stream_type,
             "stream_endpoint": stream_endpoint,
+            "playlist_url": stream_endpoint,  # For test compatibility
+            # For test compatibility
+            "direct_url": f"/stream/{stream_id}" if stream_type == "direct" else stream_endpoint,
             "message": f"Stream created successfully ({stream_type})"
         }
     except Exception as e:
@@ -258,9 +311,10 @@ async def get_hls_segment(
         # For HLS segments, we don't create separate streams for each segment URL
         # Instead, we use the parent HLS stream_id and handle segment fetching directly
         # This prevents creating many individual streams for each .ts segment
-        
-        logger.info(f"HLS segment request - Stream: {stream_id}, Client: {client_id}, URL: {segment_url}")
-        
+
+        logger.info(
+            f"HLS segment request - Stream: {stream_id}, Client: {client_id}, URL: {segment_url}")
+
         # Register client for the parent HLS stream (not the segment)
         client_info_data = get_client_info(request)
         await stream_manager.register_client(
@@ -269,7 +323,7 @@ async def get_hls_segment(
             user_agent=client_info_data["user_agent"],
             ip_address=client_info_data["ip_address"]
         )
-        
+
         # For HLS segments, we need to fetch the segment directly without creating a separate stream
         # Use a special segment proxy function that doesn't create a new stream
         try:
@@ -347,30 +401,31 @@ async def get_direct_stream(
 
         # Determine content type
         content_type = get_content_type(stream_url)
-        
+
         # Detect live streams based on URL patterns (more specific detection)
         is_live_stream = (
-            stream_url.endswith('.ts') or 
-            '/live/' in stream_url or 
+            stream_url.endswith('.ts') or
+            '/live/' in stream_url or
             '.m3u8' in stream_url or
             content_type == "video/mp2t" or
             '/playlist.' in stream_url.lower()
         )
-        
+
         # MP4 files are typically VOD, not live streams
         if stream_url.endswith('.mp4'):
             is_live_stream = False
-        
+
         # Update stream info with live stream detection
         stream_info.is_live_stream = is_live_stream
 
         # Get range header if present
         range_header = request.headers.get('range')
-        
+
         # For live streams, we generally don't want to handle range requests
         # For VOD (like MP4), we should support range requests
         if is_live_stream and range_header:
-            logger.info(f"Ignoring range request for live stream: {range_header}")
+            logger.info(
+                f"Ignoring range request for live stream: {range_header}")
             range_header = None
 
         # Prepare response headers
@@ -382,14 +437,14 @@ async def get_direct_stream(
             "Pragma": "no-cache",
             "Expires": "0"
         }
-        
+
         if is_live_stream:
             # Additional headers for live MPEG-TS streams
             response_headers.update({
                 "Transfer-Encoding": "chunked",
                 "Connection": "keep-alive"
             })
-        
+
         if range_header:
             response_headers["accept-ranges"] = "bytes"
 
@@ -402,8 +457,8 @@ async def get_direct_stream(
 
         # Use unified live proxy for all streams
         return await stream_manager.stream_unified_response(
-            stream_id, 
-            client_id, 
+            stream_id,
+            client_id,
             is_hls_segment=False,  # This is a continuous stream, not an HLS segment
             range_header=range_header  # Pass range header for VOD support
         )
@@ -440,28 +495,29 @@ async def head_direct_stream(
 
         # Determine content type
         content_type = get_content_type(stream_url)
-        
+
         # Check for Range header
         range_header = request.headers.get('range')
-        
+
         # For HEAD requests, we need to make a HEAD request to the origin server
         # to get metadata like Content-Length for MP4 files
         headers = {
             'User-Agent': stream_info.user_agent or 'Mozilla/5.0 (compatible)',
             'Accept': '*/*',
         }
-        
+
         # If this is a range request, add the Range header
         if range_header:
             headers['Range'] = range_header
-            logger.info(f"HEAD range request for stream {stream_id}: {stream_url}, Range: {range_header}")
+            logger.info(
+                f"HEAD range request for stream {stream_id}: {stream_url}, Range: {range_header}")
         else:
             logger.info(f"HEAD request for stream {stream_id}: {stream_url}")
-        
+
         try:
             async with stream_manager.http_client.stream('HEAD', stream_url, headers=headers, follow_redirects=True) as response:
                 response.raise_for_status()
-                
+
                 # Build response headers based on origin server response
                 response_headers = {
                     "Content-Type": content_type,
@@ -470,7 +526,7 @@ async def head_direct_stream(
                     "Pragma": "no-cache",
                     "Expires": "0"
                 }
-                
+
                 # Determine status code
                 status_code = 200
                 if range_header and response.status_code == 206:
@@ -478,21 +534,22 @@ async def head_direct_stream(
                     # Forward range-related headers
                     if 'content-range' in response.headers:
                         response_headers["Content-Range"] = response.headers['content-range']
-                
+
                 # Forward important headers from origin
                 if 'content-length' in response.headers:
                     response_headers["Content-Length"] = response.headers['content-length']
-                    logger.info(f"Content-Length for {stream_id}: {response.headers['content-length']}")
-                
+                    logger.info(
+                        f"Content-Length for {stream_id}: {response.headers['content-length']}")
+
                 if 'last-modified' in response.headers:
                     response_headers["Last-Modified"] = response.headers['last-modified']
-                
+
                 return Response(
                     content=None,
                     status_code=status_code,
                     headers=response_headers
                 )
-                
+
         except Exception as e:
             logger.warning(f"HEAD request failed for {stream_url}: {e}")
             # Return basic HEAD response even if origin HEAD fails
@@ -505,7 +562,7 @@ async def head_direct_stream(
                     "Cache-Control": "no-cache, no-store, must-revalidate",
                 }
             )
-            
+
     except HTTPException:
         raise
     except Exception as e:
@@ -528,7 +585,12 @@ async def disconnect_client(stream_id: str, client_id: str):
 async def get_stats():
     """Get comprehensive proxy statistics"""
     try:
-        return stream_manager.get_stats()
+        stats = stream_manager.get_stats()
+        # Flatten the response for test compatibility
+        result = stats["proxy_stats"].copy()
+        result["streams"] = stats["streams"]
+        result["clients"] = stats["clients"]
+        return result
     except Exception as e:
         logger.error(f"Error getting stats: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -560,6 +622,12 @@ async def get_client_stats():
     except Exception as e:
         logger.error(f"Error getting client stats: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/clients")
+async def list_clients():
+    """List all active clients (alias for /stats/clients)"""
+    return await get_client_stats()
 
 
 @app.get("/streams")
@@ -667,13 +735,15 @@ async def health_check():
     """Health check endpoint with detailed status"""
     try:
         stats = stream_manager.get_stats()
+        proxy_stats = stats["proxy_stats"]
         return {
             "status": "healthy",
             "version": "2.0.0",
-            "uptime_seconds": stats["proxy_stats"]["uptime_seconds"],
-            "active_streams": stats["proxy_stats"]["active_streams"],
-            "active_clients": stats["proxy_stats"]["active_clients"],
-            "total_bytes_served": stats["proxy_stats"]["total_bytes_served"]
+            "uptime_seconds": proxy_stats["uptime_seconds"],
+            "active_streams": proxy_stats["active_streams"],
+            "active_clients": proxy_stats["active_clients"],
+            "total_bytes_served": proxy_stats["total_bytes_served"],
+            "stats": proxy_stats
         }
     except Exception as e:
         logger.error(f"Error in health check: {e}")

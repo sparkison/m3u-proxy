@@ -6,6 +6,7 @@ import hashlib
 from urllib.parse import unquote, urlparse
 from typing import Optional, List
 from pydantic import BaseModel, field_validator, ValidationError
+from datetime import datetime
 
 from stream_manager import StreamManager
 from events import EventManager
@@ -593,6 +594,43 @@ async def get_stats():
         return result
     except Exception as e:
         logger.error(f"Error getting stats: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/stats/detailed")
+async def get_detailed_stats():
+    """Get detailed statistics including performance and monitoring metrics"""
+    try:
+        stats = stream_manager.get_stats()
+        return {
+            "proxy_stats": stats["proxy_stats"],
+            "connection_pool_stats": stats["proxy_stats"].get("connection_pool_stats", {}),
+            "failover_stats": stats["proxy_stats"].get("failover_stats", {}),
+            "performance_metrics": stats["proxy_stats"].get("performance_metrics", {}),
+            "error_stats": stats["proxy_stats"].get("error_stats", {}),
+            "stream_count": len(stats["streams"]),
+            "client_count": len(stats["clients"])
+        }
+    except Exception as e:
+        logger.error(f"Error getting detailed stats: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/stats/performance")
+async def get_performance_stats():
+    """Get performance-specific statistics"""
+    try:
+        stats = stream_manager.get_stats()
+        proxy_stats = stats["proxy_stats"]
+        return {
+            "connection_pool": proxy_stats.get("connection_pool_stats", {}),
+            "performance_metrics": proxy_stats.get("performance_metrics", {}),
+            "failover_stats": proxy_stats.get("failover_stats", {}),
+            "error_stats": proxy_stats.get("error_stats", {}),
+            "timestamp": datetime.now().isoformat()
+        }
+    except Exception as e:
+        logger.error(f"Error getting performance stats: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 

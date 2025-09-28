@@ -55,6 +55,15 @@ class StreamInfo:
     active_consumers: int = 0
     stream_buffer: Optional[Queue] = field(default_factory=lambda: Queue(
         maxsize=1000))  # Shared buffer for all clients
+    # Enhanced failover management
+    failover_attempts: int = 0  # Count of failover attempts
+    last_failover_time: Optional[datetime] = None  # Track last failover
+    connection_timeout: float = 30.0  # Connection timeout in seconds
+    read_timeout: float = 300.0  # Read timeout for live streams
+    max_retries: int = 3  # Maximum retry attempts per URL
+    backoff_factor: float = 1.5  # Exponential backoff factor
+    health_check_interval: float = 300.0  # Health check interval in seconds
+    last_health_check: Optional[datetime] = None  # Last health check time
 
 
 @dataclass
@@ -66,6 +75,11 @@ class ProxyStats:
     total_bytes_served: int = 0
     total_segments_served: int = 0
     uptime_start: datetime = field(default_factory=datetime.now)
+    # Enhanced monitoring metrics
+    connection_pool_stats: Dict = field(default_factory=dict)
+    failover_stats: Dict = field(default_factory=dict)
+    performance_metrics: Dict = field(default_factory=dict)
+    error_stats: Dict = field(default_factory=dict)
 
 
 class M3U8Processor:
@@ -170,13 +184,19 @@ class StreamManager:
         """Start the stream manager"""
         self._running = True
         self._cleanup_task = asyncio.create_task(self._periodic_cleanup())
-        logger.info("Stream manager started")
+        self._health_check_task = asyncio.create_task(self._periodic_health_check())
+        self._monitoring_task = asyncio.create_task(self._monitoring_update_task())
+        logger.info("Stream manager started with health monitoring and performance tracking")
 
     async def stop(self):
         """Stop the stream manager"""
         self._running = False
         if self._cleanup_task:
             self._cleanup_task.cancel()
+        if hasattr(self, '_health_check_task') and self._health_check_task:
+            self._health_check_task.cancel()
+        if hasattr(self, '_monitoring_task') and self._monitoring_task:
+            self._monitoring_task.cancel()
         await self.http_client.aclose()
         await self.live_stream_client.aclose()
         logger.info("Stream manager stopped")
@@ -345,12 +365,25 @@ class StreamManager:
                 'Connection': 'keep-alive'
             }
 
-            # Use appropriate client
+            # Use appropriate client with custom timeouts based on stream info
             is_live_stream = current_url.endswith(
                 '.ts') or '/live/' in current_url
+            
+            # Create custom timeout for this stream
+            custom_timeout = httpx.Timeout(
+                connect=stream_info.connection_timeout,
+                read=stream_info.read_timeout if is_live_stream else 30.0,
+                write=10.0,
+                pool=10.0
+            )
+            
             client_to_use = self.live_stream_client if is_live_stream else self.http_client
+            
+            # Set up timeout detection
+            start_time = datetime.now()
+            last_data_time = start_time
 
-            async with client_to_use.stream('GET', current_url, headers=headers, follow_redirects=True) as response:
+            async with client_to_use.stream('GET', current_url, headers=headers, follow_redirects=True, timeout=custom_timeout) as response:
                 response.raise_for_status()
 
                 logger.info(
@@ -365,6 +398,16 @@ class StreamManager:
                         logger.info(
                             f"No consumers for stream {stream_id}, stopping provider connection")
                         break
+                        
+                    # Update last data received time
+                    last_data_time = datetime.now()
+                    
+                    # Check for stale connection (no data for too long)
+                    if is_live_stream:
+                        time_since_data = (last_data_time - start_time).total_seconds()
+                        if chunk_count > 0 and time_since_data > stream_info.read_timeout:
+                            logger.warning(f"Stream {stream_id} appears stale, no data for {time_since_data:.1f}s")
+                            raise httpx.ReadTimeout(f"No data received for {time_since_data:.1f}s")
 
                     bytes_served += len(chunk)
                     chunk_count += 1
@@ -409,33 +452,81 @@ class StreamManager:
                 "reason": "no_consumers",
                 "consumer_count": stream_info.active_consumers
             })
-        except Exception as e:
-            logger.error(f"Error in provider stream {stream_id}: {e}")
+        except (httpx.TimeoutException, httpx.ConnectTimeout, httpx.ReadTimeout) as e:
+            logger.warning(f"Timeout error in provider stream {stream_id}: {e}")
             stream_info.error_count += 1
-
-            # Try automatic failover
+            
+            # Determine failure reason for better failover decisions
+            if isinstance(e, httpx.ConnectTimeout):
+                reason = "connection_timeout"
+            elif isinstance(e, httpx.ReadTimeout):
+                reason = "read_timeout"
+            else:
+                reason = "general_timeout"
+            
+            # Try automatic failover for timeout errors
             if len(stream_info.failover_urls) > 0:
-                logger.info(
-                    f"Attempting automatic failover for stream {stream_id}")
-                failover_success = await self._try_failover(stream_id)
+                logger.info(f"Attempting automatic failover for stream {stream_id} due to {reason}")
+                failover_success = await self._try_failover(stream_id, reason)
                 if failover_success:
-                    logger.info(
-                        f"Automatic failover successful for stream {stream_id}, retrying connection")
-                    # Retry with new URL - recursive call with limit to prevent infinite loops
-                    if not hasattr(stream_info, '_failover_retry_count'):
-                        stream_info._failover_retry_count = 0
-                    if stream_info._failover_retry_count < 3:
-                        stream_info._failover_retry_count += 1
-                        await asyncio.sleep(1)  # Brief delay before retry
-                        await self._fetch_unified_stream(stream_id)
-                        return
-                    else:
-                        logger.error(
-                            f"Maximum failover retries reached for stream {stream_id}")
-
-            # Emit stream_failed event
+                    logger.info(f"Timeout-triggered failover successful for stream {stream_id}, retrying connection")
+                    # Retry with backoff
+                    await asyncio.sleep(2.0)  # Brief delay before retry
+                    await self._fetch_unified_stream(stream_id)
+                    return
+            
+            # Emit stream_failed event for timeout
             await self._emit_event("STREAM_FAILED", stream_id, {
                 "error": str(e),
+                "error_type": "timeout",
+                "error_count": stream_info.error_count,
+                "consumer_count": stream_info.active_consumers,
+                "failover_attempted": len(stream_info.failover_urls) > 0,
+                "reason": reason
+            })
+        except (httpx.NetworkError, httpx.HTTPError) as e:
+            logger.error(f"Network/HTTP error in provider stream {stream_id}: {e}")
+            stream_info.error_count += 1
+            
+            # Try automatic failover for network/HTTP errors
+            if len(stream_info.failover_urls) > 0:
+                reason = "network_error" if isinstance(e, httpx.NetworkError) else "http_error"
+                logger.info(f"Attempting automatic failover for stream {stream_id} due to {reason}")
+                failover_success = await self._try_failover(stream_id, reason)
+                if failover_success:
+                    logger.info(f"Network error-triggered failover successful for stream {stream_id}, retrying connection")
+                    await asyncio.sleep(1.0)  # Brief delay before retry
+                    await self._fetch_unified_stream(stream_id)
+                    return
+            
+            # Emit stream_failed event for network/HTTP errors
+            await self._emit_event("STREAM_FAILED", stream_id, {
+                "error": str(e),
+                "error_type": "network" if isinstance(e, httpx.NetworkError) else "http",
+                "error_count": stream_info.error_count,
+                "consumer_count": stream_info.active_consumers,
+                "failover_attempted": len(stream_info.failover_urls) > 0
+            })
+        except Exception as e:
+            logger.error(f"Unexpected error in provider stream {stream_id}: {e}")
+            stream_info.error_count += 1
+
+            # Try automatic failover for unexpected errors
+            if len(stream_info.failover_urls) > 0:
+                logger.info(
+                    f"Attempting automatic failover for stream {stream_id} due to unexpected error")
+                failover_success = await self._try_failover(stream_id, "unexpected_error")
+                if failover_success:
+                    logger.info(
+                        f"Error-triggered failover successful for stream {stream_id}, retrying connection")
+                    await asyncio.sleep(1.0)  # Brief delay before retry
+                    await self._fetch_unified_stream(stream_id)
+                    return
+
+            # Emit stream_failed event for unexpected errors
+            await self._emit_event("STREAM_FAILED", stream_id, {
+                "error": str(e),
+                "error_type": "unexpected",
                 "error_count": stream_info.error_count,
                 "consumer_count": stream_info.active_consumers,
                 "failover_attempted": len(stream_info.failover_urls) > 0
@@ -1312,8 +1403,8 @@ class StreamManager:
             logger.error(f"Error proxying segment for client {client_id}: {e}")
             raise
 
-    async def _try_failover(self, stream_id: str) -> bool:
-        """Try to failover to next available URL"""
+    async def _try_failover(self, stream_id: str, reason: str = "connection_failed") -> bool:
+        """Try to failover to next available URL with exponential backoff"""
         if stream_id not in self.streams:
             return False
 
@@ -1324,42 +1415,319 @@ class StreamManager:
                 f"No failover URLs available for stream {stream_id}")
             return False
 
+        # Check if we've exceeded maximum retry attempts
+        if stream_info.failover_attempts >= len(stream_info.failover_urls) * stream_info.max_retries:
+            logger.error(f"Maximum failover attempts exceeded for stream {stream_id}")
+            return False
+
+        # Calculate backoff delay
+        backoff_delay = min(30.0, stream_info.backoff_factor ** stream_info.failover_attempts)
+        
+        # If this is not the first attempt, apply backoff
+        if stream_info.last_failover_time:
+            time_since_last = (datetime.now() - stream_info.last_failover_time).total_seconds()
+            if time_since_last < backoff_delay:
+                remaining_wait = backoff_delay - time_since_last
+                logger.info(f"Applying backoff for stream {stream_id}: waiting {remaining_wait:.1f}s")
+                await asyncio.sleep(remaining_wait)
+
         # Try next failover URL
         next_index = (stream_info.current_failover_index +
                       1) % len(stream_info.failover_urls)
         next_url = stream_info.failover_urls[next_index]
 
         logger.info(
-            f"Attempting failover for stream {stream_id} to: {next_url}")
+            f"Attempting failover #{stream_info.failover_attempts + 1} for stream {stream_id} to: {next_url} (reason: {reason})")
 
         try:
-            # Test the failover URL with stream's user agent
+            # Test the failover URL with stream's user agent and custom timeouts
             headers = {'User-Agent': stream_info.user_agent}
-            response = await self.http_client.head(next_url, headers=headers, timeout=10.0)
+            timeout = httpx.Timeout(connect=stream_info.connection_timeout, read=30.0)
+            response = await self.http_client.head(next_url, headers=headers, timeout=timeout)
             response.raise_for_status()
 
-            # Failover successful
+            # Failover successful - reset counters and update stream
             old_url = stream_info.current_url
             stream_info.current_url = next_url
             stream_info.current_failover_index = next_index
+            stream_info.failover_attempts += 1
+            stream_info.last_failover_time = datetime.now()
+            
             logger.info(f"Failover successful for stream {stream_id}")
 
-            # Emit failover event
+            # Emit failover event with enhanced data
             await self._emit_event(
                 "FAILOVER_TRIGGERED",
                 stream_id,
                 {
                     "old_url": old_url,
                     "new_url": next_url,
-                    "failover_index": next_index
+                    "failover_index": next_index,
+                    "attempt_number": stream_info.failover_attempts,
+                    "reason": reason,
+                    "backoff_applied": backoff_delay
                 }
             )
 
             return True
 
         except Exception as e:
-            logger.error(f"Failover failed for stream {stream_id}: {e}")
+            stream_info.failover_attempts += 1
+            stream_info.last_failover_time = datetime.now()
+            logger.error(f"Failover attempt #{stream_info.failover_attempts} failed for stream {stream_id}: {e}")
             return False
+
+    async def _health_check_stream(self, stream_id: str) -> bool:
+        """Perform health check on a stream URL"""
+        if stream_id not in self.streams:
+            return False
+
+        stream_info = self.streams[stream_id]
+        current_url = stream_info.current_url or stream_info.original_url
+
+        try:
+            headers = {'User-Agent': stream_info.user_agent}
+            timeout = httpx.Timeout(connect=10.0, read=30.0)
+            
+            # For HLS streams, check the playlist; for others, do a HEAD request
+            if current_url.endswith('.m3u8'):
+                response = await self.http_client.get(current_url, headers=headers, timeout=timeout)
+            else:
+                response = await self.http_client.head(current_url, headers=headers, timeout=timeout)
+            
+            response.raise_for_status()
+            stream_info.last_health_check = datetime.now()
+            return True
+
+        except Exception as e:
+            logger.warning(f"Health check failed for stream {stream_id}: {e}")
+            return False
+
+    async def _periodic_health_check(self):
+        """Periodic health check for all active streams"""
+        while self._running:
+            try:
+                current_time = datetime.now()
+                
+                for stream_id, stream_info in list(self.streams.items()):
+                    # Only check streams with active consumers
+                    if stream_info.active_consumers == 0:
+                        continue
+                        
+                    # Check if health check is due
+                    if (stream_info.last_health_check is None or 
+                        (current_time - stream_info.last_health_check).total_seconds() >= stream_info.health_check_interval):
+                        
+                        logger.debug(f"Running health check for stream {stream_id}")
+                        
+                        # Perform health check
+                        is_healthy = await self._health_check_stream(stream_id)
+                        
+                        if not is_healthy and len(stream_info.failover_urls) > 0:
+                            logger.warning(f"Stream {stream_id} failed health check, attempting failover")
+                            success = await self._try_failover(stream_id, "health_check_failed")
+                            
+                            if success:
+                                logger.info(f"Proactive failover successful for stream {stream_id}")
+                            else:
+                                logger.error(f"Proactive failover failed for stream {stream_id}")
+                
+                await asyncio.sleep(60)  # Check every minute
+                
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Error in periodic health check: {e}")
+                await asyncio.sleep(60)
+
+    def _update_connection_pool_stats(self):
+        """Update connection pool statistics"""
+        try:
+            # Count active provider connections
+            active_connections = sum(1 for stream in self.streams.values() 
+                                   if stream.origin_task and not stream.origin_task.done())
+            
+            # Count connection reuse (multiple clients per stream)
+            shared_connections = sum(1 for stream in self.streams.values() 
+                                   if stream.active_consumers > 1)
+            
+            # Calculate connection efficiency
+            total_consumers = sum(stream.active_consumers for stream in self.streams.values())
+            connection_efficiency = (total_consumers / max(1, active_connections)) if active_connections > 0 else 0
+            
+            self._stats.connection_pool_stats = {
+                "active_provider_connections": active_connections,
+                "total_streams": len(self.streams),
+                "shared_connections": shared_connections,
+                "total_consumers": total_consumers,
+                "connection_efficiency": round(connection_efficiency, 2),
+                "average_consumers_per_connection": round(total_consumers / max(1, active_connections), 2)
+            }
+            
+        except Exception as e:
+            logger.error(f"Error updating connection pool stats: {e}")
+
+    def _update_failover_stats(self):
+        """Update failover statistics"""
+        try:
+            total_failovers = sum(stream.failover_attempts for stream in self.streams.values())
+            streams_with_failover = sum(1 for stream in self.streams.values() 
+                                      if len(stream.failover_urls) > 0)
+            failed_streams = sum(1 for stream in self.streams.values() 
+                               if stream.error_count > 0)
+            
+            self._stats.failover_stats = {
+                "total_failover_attempts": total_failovers,
+                "streams_with_failover_urls": streams_with_failover,
+                "failed_streams": failed_streams,
+                "failover_success_rate": 0.0  # Will be calculated based on events
+            }
+            
+        except Exception as e:
+            logger.error(f"Error updating failover stats: {e}")
+
+    def _update_performance_metrics(self):
+        """Update performance metrics"""
+        try:
+            current_time = datetime.now()
+            uptime_seconds = (current_time - self._stats.uptime_start).total_seconds()
+            
+            # Calculate throughput metrics
+            bytes_per_second = self._stats.total_bytes_served / max(1, uptime_seconds)
+            segments_per_second = self._stats.total_segments_served / max(1, uptime_seconds)
+            
+            # Calculate average stream duration
+            total_stream_duration = sum((current_time - stream.created_at).total_seconds() 
+                                      for stream in self.streams.values())
+            avg_stream_duration = total_stream_duration / max(1, len(self.streams))
+            
+            self._stats.performance_metrics = {
+                "uptime_seconds": int(uptime_seconds),
+                "bytes_per_second": round(bytes_per_second, 2),
+                "segments_per_second": round(segments_per_second, 2),
+                "average_stream_duration_seconds": round(avg_stream_duration, 2),
+                "memory_usage_mb": 0  # Can be enhanced with psutil if needed
+            }
+            
+        except Exception as e:
+            logger.error(f"Error updating performance metrics: {e}")
+
+    def _update_error_stats(self):
+        """Update error statistics"""
+        try:
+            total_errors = sum(stream.error_count for stream in self.streams.values())
+            error_rate = total_errors / max(1, len(self.streams))
+            
+            # Categorize streams by health
+            healthy_streams = sum(1 for stream in self.streams.values() 
+                                if stream.error_count == 0 and stream.is_active)
+            problematic_streams = sum(1 for stream in self.streams.values() 
+                                    if stream.error_count > 0)
+            
+            self._stats.error_stats = {
+                "total_errors": total_errors,
+                "error_rate": round(error_rate, 2),
+                "healthy_streams": healthy_streams,
+                "problematic_streams": problematic_streams,
+                "error_distribution": {}  # Can be enhanced to track error types
+            }
+            
+        except Exception as e:
+            logger.error(f"Error updating error stats: {e}")
+
+    async def _monitoring_update_task(self):
+        """Periodic task to update monitoring statistics"""
+        while self._running:
+            try:
+                self._update_connection_pool_stats()
+                self._update_failover_stats()
+                self._update_performance_metrics()
+                self._update_error_stats()
+                
+                # Check for connection pool health issues every few cycles
+                if not hasattr(self, '_health_check_counter'):
+                    self._health_check_counter = 0
+                self._health_check_counter += 1
+                
+                if self._health_check_counter >= 4:  # Every 2 minutes (4 * 30s)
+                    await self._check_connection_pool_health()
+                    self._health_check_counter = 0
+                
+                # Log important metrics periodically
+                if hasattr(self, '_last_metrics_log'):
+                    time_since_log = (datetime.now() - self._last_metrics_log).total_seconds()
+                    if time_since_log >= 300:  # Log every 5 minutes
+                        self._log_key_metrics()
+                        self._last_metrics_log = datetime.now()
+                else:
+                    self._last_metrics_log = datetime.now()
+                
+                await asyncio.sleep(30)  # Update every 30 seconds
+                
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Error in monitoring update task: {e}")
+                await asyncio.sleep(30)
+
+    def _log_key_metrics(self):
+        """Log key performance metrics"""
+        try:
+            pool_stats = self._stats.connection_pool_stats
+            perf_stats = self._stats.performance_metrics
+            
+            logger.info(f"Stream Manager Metrics: "
+                       f"Connections: {pool_stats.get('active_provider_connections', 0)}, "
+                       f"Streams: {pool_stats.get('total_streams', 0)}, "
+                       f"Efficiency: {pool_stats.get('connection_efficiency', 0)}x, "
+                       f"Throughput: {perf_stats.get('bytes_per_second', 0):.1f} B/s, "
+                       f"Errors: {self._stats.error_stats.get('total_errors', 0)}")
+                       
+        except Exception as e:
+            logger.error(f"Error logging key metrics: {e}")
+
+    async def _check_connection_pool_health(self):
+        """Check for connection pool issues and alert if needed"""
+        try:
+            pool_stats = self._stats.connection_pool_stats
+            error_stats = self._stats.error_stats
+            
+            # Alert if connection efficiency is too low (too many connections for few consumers)
+            efficiency = pool_stats.get('connection_efficiency', 0)
+            if efficiency < 0.5 and pool_stats.get('active_provider_connections', 0) > 5:
+                await self._emit_event("CONNECTION_POOL_ALERT", "system", {
+                    "alert_type": "low_efficiency",
+                    "efficiency": efficiency,
+                    "active_connections": pool_stats.get('active_provider_connections', 0),
+                    "message": f"Low connection efficiency: {efficiency:.2f} consumers per connection"
+                })
+                logger.warning(f"Connection pool efficiency is low: {efficiency:.2f}")
+            
+            # Alert if error rate is too high
+            error_rate = error_stats.get('error_rate', 0)
+            if error_rate > 0.3 and len(self.streams) > 5:  # More than 30% error rate
+                await self._emit_event("CONNECTION_POOL_ALERT", "system", {
+                    "alert_type": "high_error_rate",
+                    "error_rate": error_rate,
+                    "total_streams": len(self.streams),
+                    "message": f"High error rate detected: {error_rate:.2f} errors per stream"
+                })
+                logger.warning(f"High error rate detected: {error_rate:.2f}")
+            
+            # Alert if too many connections without consumers (potential leaks)
+            active_connections = pool_stats.get('active_provider_connections', 0)
+            total_consumers = pool_stats.get('total_consumers', 0)
+            if active_connections > 10 and total_consumers == 0:
+                await self._emit_event("CONNECTION_POOL_ALERT", "system", {
+                    "alert_type": "potential_connection_leak",
+                    "active_connections": active_connections,
+                    "total_consumers": total_consumers,
+                    "message": f"Detected {active_connections} active connections with no consumers"
+                })
+                logger.error(f"Potential connection leak: {active_connections} connections, 0 consumers")
+                
+        except Exception as e:
+            logger.error(f"Error checking connection pool health: {e}")
 
     async def cleanup_client(self, client_id: str):
         """Clean up a client"""

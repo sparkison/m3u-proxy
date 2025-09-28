@@ -607,11 +607,21 @@ class StreamManager:
                     
                     logger.info(f"HLS segment completed: {bytes_served} bytes")
                     
-                    # Update client's last access time
+                    # Update client's last access time and stats
                     if client_id in self.clients:
                         self.clients[client_id].last_access = datetime.now()
                         self.clients[client_id].bytes_served += bytes_served
                         self.clients[client_id].segments_served += 1
+                    
+                    # Update stream stats
+                    if stream_id in self.streams:
+                        self.streams[stream_id].total_bytes_served += bytes_served
+                        self.streams[stream_id].total_segments_served += 1
+                        self.streams[stream_id].last_access = datetime.now()
+                    
+                    # Update global stats
+                    self._stats.total_bytes_served += bytes_served
+                    self._stats.total_segments_served += 1
                         
                 except Exception as e:
                     logger.error(f"Error streaming HLS segment: {e}")

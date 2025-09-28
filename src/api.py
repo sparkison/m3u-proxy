@@ -255,27 +255,29 @@ async def get_hls_segment(
                 logger.info(
                     f"Extracted header from query param: {header_name}={value}")
 
-        # For the unified live proxy, we need to create/get a stream for this segment URL
-        # This ensures all clients requesting the same stream share the provider connection
-        segment_stream_id = await stream_manager.get_or_create_stream(segment_url)
+        # For HLS segments, we don't create separate streams for each segment URL
+        # Instead, we use the parent HLS stream_id and handle segment fetching directly
+        # This prevents creating many individual streams for each .ts segment
         
-        logger.info(f"HLS segment request - Stream: {segment_stream_id}, Client: {client_id}, URL: {segment_url}")
+        logger.info(f"HLS segment request - Stream: {stream_id}, Client: {client_id}, URL: {segment_url}")
         
-        # Register client for this segment stream
+        # Register client for the parent HLS stream (not the segment)
         client_info_data = get_client_info(request)
         await stream_manager.register_client(
             client_id,
-            segment_stream_id,
+            stream_id,  # Use the parent HLS stream ID
             user_agent=client_info_data["user_agent"],
             ip_address=client_info_data["ip_address"]
         )
         
-        # Use unified streaming response for HLS segments
+        # For HLS segments, we need to fetch the segment directly without creating a separate stream
+        # Use a special segment proxy function that doesn't create a new stream
         try:
-            response = await stream_manager.stream_unified_response(
-                segment_stream_id, 
-                client_id, 
-                is_hls_segment=True
+            response = await stream_manager.proxy_hls_segment(
+                stream_id,  # Parent HLS stream
+                client_id,
+                segment_url,  # The actual segment URL to fetch
+                range_header
             )
             return response
         except Exception as stream_error:

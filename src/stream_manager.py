@@ -510,19 +510,22 @@ class StreamManager:
                                 logger.info(f"Range proxy streamed {bytes_served} bytes")
                     
                     logger.info(f"Range proxy completed: {bytes_served} bytes total")
+                    
+                    # Update client's last access time for successful completion
+                    if client_id in self.clients:
+                        self.clients[client_id].last_access = datetime.now()
                 
                 except GeneratorExit:
                     logger.info(f"Range proxy generator stopped by client disconnect: {bytes_served} bytes served")
-                    # Mark client for cleanup (will be handled by the cleanup task)
-                    if client_id in self.clients:
-                        self.clients[client_id].last_seen = datetime.now() - timedelta(minutes=10)  # Force cleanup
+                    # For range requests, don't force cleanup - client might make more range requests
+                    # Let the normal timeout-based cleanup handle inactive clients
                     return
                     
                 except Exception as e:
                     logger.error(f"Error in range proxy generator: {e}")
-                    # Mark client for cleanup on error
+                    # Only force cleanup on actual errors, not normal completion
                     if client_id in self.clients:
-                        self.clients[client_id].last_seen = datetime.now() - timedelta(minutes=10)  # Force cleanup
+                        self.clients[client_id].last_access = datetime.now() - timedelta(minutes=10)  # Force cleanup on error
                     return
             
             # Make the actual request to get the real headers
@@ -579,7 +582,65 @@ class StreamManager:
             logger.error(f"Error proxying range request for {stream_id}: {e}")
             await self.remove_stream_consumer(stream_id, client_id)
             raise HTTPException(status_code=500, detail=f"Range proxy failed: {str(e)}")
-            raise HTTPException(status_code=500, detail=f"Range request failed: {e}")
+
+    async def proxy_hls_segment(self, stream_id: str, client_id: str, segment_url: str, range_header: Optional[str] = None) -> StreamingResponse:
+        """Proxy an individual HLS segment without creating a separate stream"""
+        logger.info(f"Proxying HLS segment for stream {stream_id}, client {client_id}: {segment_url}")
+        
+        try:
+            # Prepare headers for the segment request
+            headers = {}
+            if range_header:
+                headers['Range'] = range_header
+                
+            # Fetch the segment directly
+            async def segment_generator():
+                bytes_served = 0
+                try:
+                    async with self.http_client.stream('GET', segment_url, headers=headers, follow_redirects=True) as response:
+                        logger.info(f"HLS segment response: {response.status_code}")
+                        
+                        # Stream the segment data
+                        async for chunk in response.aiter_bytes(chunk_size=32 * 1024):
+                            yield chunk
+                            bytes_served += len(chunk)
+                    
+                    logger.info(f"HLS segment completed: {bytes_served} bytes")
+                    
+                    # Update client's last access time
+                    if client_id in self.clients:
+                        self.clients[client_id].last_access = datetime.now()
+                        self.clients[client_id].bytes_served += bytes_served
+                        self.clients[client_id].segments_served += 1
+                        
+                except Exception as e:
+                    logger.error(f"Error streaming HLS segment: {e}")
+                    raise
+            
+            # Make a test request to get headers
+            async with self.http_client.stream('GET', segment_url, headers=headers, follow_redirects=True) as test_response:
+                content_type = test_response.headers.get('content-type', 'video/MP2T')
+                content_length = test_response.headers.get('content-length')
+                
+                response_headers = {
+                    "Content-Type": content_type,
+                    "Cache-Control": "no-cache"
+                }
+                
+                if content_length:
+                    response_headers["Content-Length"] = content_length
+                
+                status_code = test_response.status_code
+                
+                return StreamingResponse(
+                    segment_generator(),
+                    status_code=status_code,
+                    headers=response_headers
+                )
+                
+        except Exception as e:
+            logger.error(f"Error proxying HLS segment for {stream_id}: {e}")
+            raise HTTPException(status_code=500, detail=f"HLS segment proxy failed: {str(e)}")
 
     async def stream_unified_response(self, stream_id: str, client_id: str, is_hls_segment: bool = False, range_header: Optional[str] = None) -> StreamingResponse:
         """Unified streaming response for both HLS segments and TS streams"""

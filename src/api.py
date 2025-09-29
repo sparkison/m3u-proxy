@@ -375,6 +375,17 @@ async def get_hls_segment(
         raise HTTPException(status_code=500, detail=error_detail)
 
 
+@app.get("/hls/{stream_id}/segment.ts")
+async def get_hls_segment_ts(
+    stream_id: str,
+    request: Request,
+    client_id: str = Query(..., description="Client ID"),
+    url: str = Query(..., description="The segment URL to proxy")
+):
+    """Proxy HLS segment with .ts extension for better ffplay compatibility"""
+    return await get_hls_segment(stream_id, request, client_id, url)
+
+
 @app.get("/stream/{stream_id}")
 async def get_direct_stream(
     request: Request,

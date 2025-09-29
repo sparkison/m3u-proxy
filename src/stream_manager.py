@@ -136,8 +136,8 @@ class M3U8Processor:
             # This is a nested playlist
             return f"{base_proxy_url}/playlist.m3u8?url={encoded_url}&client_id={self.client_id}"
         else:
-            # This is a segment
-            return f"{base_proxy_url}/segment?url={encoded_url}&client_id={self.client_id}"
+            # This is a segment - use the segment endpoint
+            return f"{base_proxy_url}/segment.ts?url={encoded_url}&client_id={self.client_id}"
 
 
 class StreamManager:

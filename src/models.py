@@ -5,16 +5,16 @@ from datetime import datetime
 import uuid
 
 try:
-    from config import config
+    from config import settings
 except ImportError:
     # Fallback for when config is not available
-    class MockConfig:
-        enable_hardware_acceleration = False
-        default_buffer_size = 1024 * 1024
-        default_timeout = 30
-        default_retry_attempts = 3
-        default_retry_delay = 5
-    config = MockConfig()
+    class MockSettings:
+        ENABLE_HARDWARE_ACCELERATION = False
+        DEFAULT_BUFFER_SIZE = 1024 * 1024
+        DEFAULT_TIMEOUT = 30
+        DEFAULT_RETRY_ATTEMPTS = 3
+        DEFAULT_RETRY_DELAY = 5
+    settings = MockSettings()
 
 
 class StreamFormat(str, Enum):
@@ -58,25 +58,25 @@ class StreamConfig(BaseModel):
     def model_post_init(self, __context) -> None:
         """Set defaults from config after validation."""
         if self.enable_hardware_acceleration is None:
-            self.enable_hardware_acceleration = config.enable_hardware_acceleration
+            self.enable_hardware_acceleration = settings.ENABLE_HARDWARE_ACCELERATION
         # Treat 0 or None as "use default"
         if self.buffer_size is None or self.buffer_size == 0:
-            self.buffer_size = config.default_buffer_size
+            self.buffer_size = settings.DEFAULT_BUFFER_SIZE
         elif self.buffer_size < 64 * 1024:
             raise ValueError(f"buffer_size must be at least {64 * 1024} bytes")
             
         if self.timeout is None or self.timeout == 0:
-            self.timeout = config.default_timeout
+            self.timeout = settings.DEFAULT_TIMEOUT
         elif self.timeout < 5:
             raise ValueError("timeout must be at least 5 seconds")
             
         if self.retry_attempts is None or self.retry_attempts == 0:
-            self.retry_attempts = config.default_retry_attempts
+            self.retry_attempts = settings.DEFAULT_RETRY_ATTEMPTS
         elif self.retry_attempts < 1:
             raise ValueError("retry_attempts must be at least 1")
             
         if self.retry_delay is None or self.retry_delay == 0:
-            self.retry_delay = config.default_retry_delay
+            self.retry_delay = settings.DEFAULT_RETRY_DELAY
         elif self.retry_delay < 1:
             raise ValueError("retry_delay must be at least 1 second")
 

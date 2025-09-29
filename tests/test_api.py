@@ -268,7 +268,7 @@ class TestStreamValidation:
         valid_urls = [
             "http://example.com/stream.m3u8",
             "https://secure.example.com/playlist.m3u8",
-            "http://192.168.1.100:8080/live/stream.ts",
+            "http://192.168.1.100:8085/live/stream.ts",
             "https://cdn.example.com/video.mp4"
         ]
 

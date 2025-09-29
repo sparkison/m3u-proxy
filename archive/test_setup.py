@@ -10,7 +10,7 @@ from typing import Dict, Any
 
 
 class M3UProxyTest:
-    def __init__(self, base_url: str = "http://localhost:8080"):
+    def __init__(self, base_url: str = "http://localhost:8085"):
         self.base_url = base_url
         
     async def test_health(self) -> bool:
@@ -164,7 +164,7 @@ async def main():
     import sys
     
     # Check if server URL was provided
-    base_url = sys.argv[1] if len(sys.argv) > 1 else "http://localhost:8080"
+    base_url = sys.argv[1] if len(sys.argv) > 1 else "http://localhost:8085"
     
     tester = M3UProxyTest(base_url)
     success = await tester.run_all_tests()

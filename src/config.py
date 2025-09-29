@@ -26,6 +26,15 @@ class Settings(BaseSettings):
     DEFAULT_MAX_RETRIES: int = 3
     DEFAULT_BACKOFF_FACTOR: float = 1.5
     DEFAULT_HEALTH_CHECK_INTERVAL: float = 300.0
+    
+    # Additional configuration from .env file
+    DEFAULT_BUFFER_SIZE: int = 1048576
+    DEFAULT_TIMEOUT: int = 30
+    DEFAULT_RETRY_ATTEMPTS: int = 3
+    DEFAULT_RETRY_DELAY: int = 5
+    ENABLE_HARDWARE_ACCELERATION: bool = True
+    TEMP_DIR: str = "/tmp/m3u-proxy-streams"
+    LOG_FILE: str = "m3u-proxy.log"
 
     # Optional Redis Configuration for distributed systems (not yet implemented)
     REDIS_HOST: Optional[str] = None
@@ -36,7 +45,7 @@ class Settings(BaseSettings):
         env_file=".env",
         env_file_encoding="utf-8",
         case_sensitive=False,
-        env_prefix="M3U_PROXY_"  # e.g., M3U_PROXY_HOST
+        env_prefix=""  # No prefix, read directly from .env
     )
 
 # Global settings instance

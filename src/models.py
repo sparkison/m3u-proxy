@@ -64,17 +64,17 @@ class StreamConfig(BaseModel):
             self.buffer_size = settings.DEFAULT_BUFFER_SIZE
         elif self.buffer_size < 64 * 1024:
             raise ValueError(f"buffer_size must be at least {64 * 1024} bytes")
-            
+
         if self.timeout is None or self.timeout == 0:
             self.timeout = settings.DEFAULT_TIMEOUT
         elif self.timeout < 5:
             raise ValueError("timeout must be at least 5 seconds")
-            
+
         if self.retry_attempts is None or self.retry_attempts == 0:
             self.retry_attempts = settings.DEFAULT_RETRY_ATTEMPTS
         elif self.retry_attempts < 1:
             raise ValueError("retry_attempts must be at least 1")
-            
+
         if self.retry_delay is None or self.retry_delay == 0:
             self.retry_delay = settings.DEFAULT_RETRY_DELAY
         elif self.retry_delay < 1:

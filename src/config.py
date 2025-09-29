@@ -1,6 +1,7 @@
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from typing import Optional
 
+
 class Settings(BaseSettings):
     """
     Application configuration loaded from environment variables.
@@ -26,7 +27,7 @@ class Settings(BaseSettings):
     DEFAULT_MAX_RETRIES: int = 3
     DEFAULT_BACKOFF_FACTOR: float = 1.5
     DEFAULT_HEALTH_CHECK_INTERVAL: float = 300.0
-    
+
     # Additional configuration from .env file
     DEFAULT_BUFFER_SIZE: int = 1048576
     DEFAULT_TIMEOUT: int = 30
@@ -47,6 +48,7 @@ class Settings(BaseSettings):
         case_sensitive=False,
         env_prefix=""  # No prefix, read directly from .env
     )
+
 
 # Global settings instance
 settings = Settings()

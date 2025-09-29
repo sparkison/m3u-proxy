@@ -23,23 +23,28 @@ def run_command(cmd):
 
 def main():
     parser = argparse.ArgumentParser(description="Run tests for m3u-proxy")
-    parser.add_argument("--unit", action="store_true", help="Run only unit tests")
-    parser.add_argument("--integration", action="store_true", help="Run only integration tests")
-    parser.add_argument("--coverage", action="store_true", help="Run with coverage report")
-    parser.add_argument("--verbose", "-v", action="store_true", help="Verbose output")
+    parser.add_argument("--unit", action="store_true",
+                        help="Run only unit tests")
+    parser.add_argument("--integration", action="store_true",
+                        help="Run only integration tests")
+    parser.add_argument("--coverage", action="store_true",
+                        help="Run with coverage report")
+    parser.add_argument("--verbose", "-v",
+                        action="store_true", help="Verbose output")
     parser.add_argument("--file", help="Run specific test file")
-    
+
     args = parser.parse_args()
-    
+
     # Base pytest command
     cmd = ["python", "-m", "pytest"]
-    
+
     if args.verbose:
         cmd.append("-vv")
-    
+
     if args.coverage:
-        cmd.extend(["--cov=src", "--cov-report=html", "--cov-report=term-missing"])
-    
+        cmd.extend(["--cov=src", "--cov-report=html",
+                   "--cov-report=term-missing"])
+
     # Select which tests to run
     if args.unit:
         cmd.extend(["-m", "not integration"])
@@ -50,15 +55,15 @@ def main():
     else:
         # Run all tests
         cmd.append("tests/")
-    
+
     # Run the tests
     exit_code = run_command(cmd)
-    
+
     if exit_code == 0:
         print("\n✅ All tests passed!")
     else:
         print(f"\n❌ Tests failed with exit code {exit_code}")
-    
+
     return exit_code
 
 

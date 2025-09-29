@@ -1,13 +1,12 @@
 # Add src to path first
+import json
+from unittest.mock import Mock, AsyncMock, patch
+from fastapi.testclient import TestClient
+import pytest
+from api import app, get_content_type, is_direct_stream
 import sys
 import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
-
-from api import app, get_content_type, is_direct_stream
-import pytest
-from fastapi.testclient import TestClient
-from unittest.mock import Mock, AsyncMock, patch
-import json
 
 
 class TestHelperFunctions:
@@ -45,7 +44,7 @@ class TestAPI:
         with patch('api.stream_manager') as mock:
             # Mock the streams dict to include test_stream_123
             mock.streams = {"test_stream_123": Mock()}
-            
+
             mock.get_or_create_stream = AsyncMock(
                 return_value="test_stream_123")
             mock.get_stream_info = Mock(return_value=Mock(
@@ -175,7 +174,7 @@ class TestAPI:
         assert isinstance(data["clients"], list)
 
     def test_playlist_endpoint(self, client, mock_stream_manager):
-        # Mock the get_playlist_content method used by the endpoint  
+        # Mock the get_playlist_content method used by the endpoint
         mock_stream_manager.get_playlist_content = AsyncMock(
             return_value="#EXTM3U\nsegment1.ts")
         mock_stream_manager.register_client = AsyncMock(return_value=Mock())
@@ -195,16 +194,19 @@ class TestAPI:
     def test_proxy_endpoint_segment(self, client, mock_stream_manager):
         # Mock the proxy_hls_segment method used by the endpoint
         from starlette.responses import StreamingResponse
-        
+
         async def mock_response_generator():
             yield b"segment_data_chunk_1"
             yield b"segment_data_chunk_2"
 
-        mock_response = StreamingResponse(mock_response_generator(), media_type="video/mp2t")
-        mock_stream_manager.proxy_hls_segment = AsyncMock(return_value=mock_response)
+        mock_response = StreamingResponse(
+            mock_response_generator(), media_type="video/mp2t")
+        mock_stream_manager.proxy_hls_segment = AsyncMock(
+            return_value=mock_response)
         mock_stream_manager.register_client = AsyncMock(return_value=Mock())
 
-        response = client.get("/hls/test_stream_123/segment?client_id=test_client&url=http://example.com/segment1.ts")
+        response = client.get(
+            "/hls/test_stream_123/segment?client_id=test_client&url=http://example.com/segment1.ts")
         assert response.status_code == 200
         # Note: In tests, the media_type might not be set exactly as expected
 
@@ -216,14 +218,16 @@ class TestAPI:
 
     def test_direct_stream_endpoint(self, client, mock_stream_manager):
         from starlette.responses import StreamingResponse
-        
+
         async def mock_stream_generator():
             yield b"stream_data_chunk_1"
             yield b"stream_data_chunk_2"
 
         # Mock the stream_unified_response method used by the endpoint
-        mock_response = StreamingResponse(mock_stream_generator(), media_type="video/mp4")
-        mock_stream_manager.stream_unified_response = AsyncMock(return_value=mock_response)
+        mock_response = StreamingResponse(
+            mock_stream_generator(), media_type="video/mp4")
+        mock_stream_manager.stream_unified_response = AsyncMock(
+            return_value=mock_response)
         mock_stream_manager.register_client = AsyncMock(return_value=Mock())
         mock_stream_manager.clients = {}
 

@@ -148,7 +148,8 @@ async def root():
 
 async def resolve_stream_id(
     stream_id: str,
-    url: Optional[str] = Query(None, description="Stream URL (for direct access, overrides stream_id in path)")
+    url: Optional[str] = Query(
+        None, description="Stream URL (for direct access, overrides stream_id in path)")
 ) -> str:
     """
     Dependency to get a stream_id. If a URL is provided in the query,
@@ -161,10 +162,12 @@ async def resolve_stream_id(
             validate_url(decoded_url)
             return await stream_manager.get_or_create_stream(decoded_url)
         except ValueError as e:
-            raise HTTPException(status_code=400, detail=f"Invalid URL provided: {e}")
+            raise HTTPException(
+                status_code=400, detail=f"Invalid URL provided: {e}")
         except Exception as e:
             logger.error(f"Error creating stream from URL parameter: {e}")
-            raise HTTPException(status_code=500, detail="Failed to process stream from URL")
+            raise HTTPException(
+                status_code=500, detail="Failed to process stream from URL")
 
     if stream_id not in stream_manager.streams:
         raise HTTPException(status_code=404, detail="Stream not found")

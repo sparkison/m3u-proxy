@@ -9,7 +9,7 @@ class Settings(BaseSettings):
 
     # Server Configuration
     HOST: str = "0.0.0.0"
-    PORT: int = 8001
+    PORT: int = 8085
     LOG_LEVEL: str = "INFO"
     DEBUG: bool = False
     RELOAD: bool = False

@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 
 class PerformanceTest:
-    def __init__(self, proxy_url: str = "http://localhost:8001"):
+    def __init__(self, proxy_url: str = "http://localhost:8085"):
         self.proxy_url = proxy_url
         self.client = httpx.AsyncClient(timeout=30.0)
         self.results = {}
@@ -371,7 +371,7 @@ async def main():
     parser = argparse.ArgumentParser(
         description='m3u-proxy Performance Testing')
     parser.add_argument(
-        '--proxy-url', default='http://localhost:8001', help='Proxy URL')
+        '--proxy-url', default='http://localhost:8085', help='Proxy URL')
     parser.add_argument('--output', help='Output file for results (JSON)')
     parser.add_argument('--verbose', action='store_true',
                         help='Verbose logging')

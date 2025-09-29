@@ -31,27 +31,27 @@ A high-performance HTTP proxy server for IPTV content with client management, st
 ### 1. Install Dependencies
 
 ```bash
-pip install fastapi uvicorn httpx
+pip install -r requirements.txt
 ```
 
 ### 2. Start the Server
 
 ```bash
-python main.py
+python main.py --debug
 ```
 
-Server will start on `http://localhost:8001`
+Server will start on `http://localhost:8085`
 
 ### 3. Create a Stream
 
 ```bash
 # HLS stream with custom user agent
-curl -X POST "http://localhost:8001/streams" \
+curl -X POST "http://localhost:8085/streams" \
   -H "Content-Type: application/json" \
   -d '{"url": "https://your-stream.m3u8", "user_agent": "MyApp/1.0"}'
 
 # Direct IPTV stream with failover
-curl -X POST "http://localhost:8001/streams" \
+curl -X POST "http://localhost:8085/streams" \
   -H "Content-Type: application/json" \
   -d '{
     "url": "http://server.com/stream.ts",
@@ -68,12 +68,12 @@ python m3u_client.py create "http://server.com/movie.mkv" --failover "http://bac
 
 For **HLS streams** (.m3u8):
 ```
-http://localhost:8001/hls/{stream_id}/playlist.m3u8
+http://localhost:8085/hls/{stream_id}/playlist.m3u8
 ```
 
 For **Direct streams** (.ts, .mp4, .mkv, etc.):
 ```
-http://localhost:8001/stream/{stream_id}
+http://localhost:8085/stream/{stream_id}
 ```
 
 ## API Documentation
@@ -166,7 +166,7 @@ python m3u_client.py delete <stream_id>
 ```bash
 # Server configuration
 M3U_PROXY_HOST=0.0.0.0
-M3U_PROXY_PORT=8001
+M3U_PROXY_PORT=8085
 
 # Client timeout (seconds)
 CLIENT_TIMEOUT=300
@@ -297,18 +297,18 @@ python main.py --debug
 ### HTML5 Video Player
 ```html
 <video controls>
-  <source src="http://localhost:8001/hls/{stream_id}/playlist.m3u8" type="application/x-mpegURL">
+  <source src="http://localhost:8085/hls/{stream_id}/playlist.m3u8" type="application/x-mpegURL">
 </video>
 ```
 
 ### FFmpeg
 ```bash
-ffplay "http://localhost:8001/hls/{stream_id}/playlist.m3u8"
+ffplay "http://localhost:8085/hls/{stream_id}/playlist.m3u8"
 ```
 
 ### VLC
 ```bash
-vlc "http://localhost:8001/hls/{stream_id}/playlist.m3u8"
+vlc "http://localhost:8085/hls/{stream_id}/playlist.m3u8"
 ```
 
 ## 📡 Event System & Webhooks
@@ -318,7 +318,7 @@ The proxy includes a comprehensive event system for monitoring and integration:
 ### Webhook Configuration
 ```bash
 # Add webhook to receive events
-curl -X POST "http://localhost:8001/webhooks" \
+curl -X POST "http://localhost:8085/webhooks" \
   -H "Content-Type: application/json" \
   -d '{
     "url": "https://your-server.com/webhook",

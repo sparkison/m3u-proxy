@@ -125,7 +125,7 @@ When events occur, webhooks receive POST requests with this structure:
 Set up a webhook to monitor stream health:
 
 ```bash
-curl -X POST http://localhost:8001/webhooks \
+curl -X POST http://localhost:8085/webhooks \
   -H "Content-Type: application/json" \
   -d '{
     "url": "https://monitor.yoursite.com/iptv-alerts",
@@ -140,7 +140,7 @@ curl -X POST http://localhost:8001/webhooks \
 Track all stream lifecycle events:
 
 ```bash
-curl -X POST http://localhost:8001/webhooks \
+curl -X POST http://localhost:8085/webhooks \
   -H "Content-Type: application/json" \
   -d '{
     "url": "https://analytics.yoursite.com/iptv-events", 
@@ -159,7 +159,7 @@ curl -X POST http://localhost:8001/webhooks \
 Real-time dashboard updates:
 
 ```bash
-curl -X POST http://localhost:8001/webhooks \
+curl -X POST http://localhost:8085/webhooks \
   -H "Content-Type: application/json" \
   -d '{
     "url": "wss://dashboard.yoursite.com/iptv-updates",
@@ -237,7 +237,7 @@ Or test webhooks with a real endpoint:
 
 ```bash
 # Test with webhook.site for debugging
-curl -X POST http://localhost:8001/webhooks \
+curl -X POST http://localhost:8085/webhooks \
   -H "Content-Type: application/json" \
   -d '{
     "url": "https://webhook.site/your-unique-id",
@@ -246,7 +246,7 @@ curl -X POST http://localhost:8001/webhooks \
   }'
 
 # Create a stream to trigger the event
-curl -X POST http://localhost:8001/streams \
+curl -X POST http://localhost:8085/streams \
   -H "Content-Type: application/json" \
   -d '{
     "url": "http://example.com/test.m3u8"

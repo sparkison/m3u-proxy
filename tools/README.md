@@ -9,7 +9,7 @@ Performance testing utility for benchmarking the m3u-proxy server.
 
 **Usage:**
 ```bash
-python tools/performance_test.py --proxy-url http://localhost:8001 --output results.json --verbose
+python tools/performance_test.py --proxy-url http://localhost:8085 --output results.json --verbose
 ```
 
 **Features:**

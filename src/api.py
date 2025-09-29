@@ -267,7 +267,7 @@ async def get_hls_playlist(
                 f"Reusing existing client {client_id} for stream {stream_id}")
 
         # Build base URL for this stream
-        base_proxy_url = f"http://localhost:8001/hls/{stream_id}"
+        base_proxy_url = f"http://localhost:8085/hls/{stream_id}"
 
         # Get processed playlist content
         content = await stream_manager.get_playlist_content(stream_id, client_id, base_proxy_url)

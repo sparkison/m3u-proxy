@@ -8,7 +8,7 @@ from urllib.parse import quote
 
 
 class M3UProxyClient:
-    def __init__(self, base_url="http://localhost:8001"):
+    def __init__(self, base_url="http://localhost:8085"):
         self.base_url = base_url
 
     def create_stream(self, url, failover_urls=None, user_agent=None):
@@ -112,7 +112,7 @@ class M3UProxyClient:
 
 def main():
     parser = argparse.ArgumentParser(description="m3u-proxy Client")
-    parser.add_argument("--base-url", default="http://localhost:8001",
+    parser.add_argument("--base-url", default="http://localhost:8085",
                         help="Base URL of the proxy server")
 
     subparsers = parser.add_subparsers(

@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Query, Response, Request
+from fastapi import FastAPI, HTTPException, Query, Response, Request, Depends
 from fastapi.responses import StreamingResponse
 import logging
 import uuid
@@ -146,6 +146,32 @@ async def root():
     }
 
 
+async def resolve_stream_id(
+    stream_id: str,
+    url: Optional[str] = Query(None, description="Stream URL (for direct access, overrides stream_id in path)")
+) -> str:
+    """
+    Dependency to get a stream_id. If a URL is provided in the query,
+    it will be used to create/retrieve a stream, overriding the path stream_id.
+    Also validates that the stream exists.
+    """
+    if url:
+        try:
+            decoded_url = unquote(url)
+            validate_url(decoded_url)
+            return await stream_manager.get_or_create_stream(decoded_url)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=f"Invalid URL provided: {e}")
+        except Exception as e:
+            logger.error(f"Error creating stream from URL parameter: {e}")
+            raise HTTPException(status_code=500, detail="Failed to process stream from URL")
+
+    if stream_id not in stream_manager.streams:
+        raise HTTPException(status_code=404, detail="Stream not found")
+
+    return stream_id
+
+
 @app.post("/streams")
 async def create_stream(request: StreamCreateRequest):
     """Create a new stream with optional failover URLs and custom user agent"""
@@ -196,20 +222,13 @@ async def create_stream(request: StreamCreateRequest):
 
 @app.get("/hls/{stream_id}/playlist.m3u8")
 async def get_hls_playlist(
-    stream_id: str,
     request: Request,
+    stream_id: str = Depends(resolve_stream_id),
     client_id: Optional[str] = Query(
-        None, description="Client ID (auto-generated if not provided)"),
-    url: Optional[str] = Query(
-        None, description="Stream URL (for direct access)")
+        None, description="Client ID (auto-generated if not provided)")
 ):
     """Get HLS playlist for a stream"""
     try:
-        # If URL is provided, create/get stream first
-        if url:
-            decoded_url = unquote(url)
-            stream_id = await stream_manager.get_or_create_stream(decoded_url)
-
         # Generate or reuse client ID based on request characteristics
         # Use IP + User-Agent + Stream ID to create a consistent client ID
         if not client_id:
@@ -355,24 +374,14 @@ async def get_hls_segment(
 
 @app.get("/stream/{stream_id}")
 async def get_direct_stream(
-    stream_id: str,
     request: Request,
+    stream_id: str = Depends(resolve_stream_id),
     client_id: Optional[str] = Query(
-        None, description="Client ID (auto-generated if not provided)"),
-    url: Optional[str] = Query(
-        None, description="Stream URL (for direct access)")
+        None, description="Client ID (auto-generated if not provided)")
 ):
     """Serve direct streams (.ts, .mp4, .mkv, etc.) for IPTV"""
     try:
-        # If URL is provided, create/get stream first
-        if url:
-            decoded_url = unquote(url)
-            stream_id = await stream_manager.get_or_create_stream(decoded_url)
-
-        # Get stream info first
-        if stream_id not in stream_manager.streams:
-            raise HTTPException(status_code=404, detail="Stream not found")
-
+        # The stream_id is now validated by the resolve_stream_id dependency
         stream_info = stream_manager.streams[stream_id]
         stream_url = stream_info.current_url or stream_info.original_url
 
@@ -473,24 +482,14 @@ async def get_direct_stream(
 
 @app.head("/stream/{stream_id}")
 async def head_direct_stream(
-    stream_id: str,
     request: Request,
+    stream_id: str = Depends(resolve_stream_id),
     client_id: Optional[str] = Query(
-        None, description="Client ID (auto-generated if not provided)"),
-    url: Optional[str] = Query(
-        None, description="Stream URL (for direct access)")
+        None, description="Client ID (auto-generated if not provided)")
 ):
     """Handle HEAD requests for direct streams (needed for MP4 duration/seeking)"""
     try:
-        # If URL is provided, create/get stream first
-        if url:
-            decoded_url = unquote(url)
-            stream_id = await stream_manager.get_or_create_stream(decoded_url)
-
-        # Get stream info first
-        if stream_id not in stream_manager.streams:
-            raise HTTPException(status_code=404, detail="Stream not found")
-
+        # The stream_id is now validated by the resolve_stream_id dependency
         stream_info = stream_manager.streams[stream_id]
         stream_url = stream_info.current_url or stream_info.original_url
 

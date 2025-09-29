@@ -73,15 +73,26 @@ segment2.ts
         assert "#EXT-X-VERSION:3" in result
     
     def test_rewrite_absolute_urls(self):
+        from urllib.parse import quote
         processor = M3U8Processor("http://original.com/", "stream123")
         
         playlist = """#EXTM3U
+#EXTINF:10.0,
 http://original.com/segment1.ts
+#EXTINF:10.0,
 http://original.com/segment2.ts"""
         
-        result = processor.process_playlist(playlist, "http://proxy.com")
+        proxy_base_url = "http://proxy.com/hls/stream123"
+        result = processor.process_playlist(playlist, proxy_base_url, "http://original.com/")
         
-        assert "segment" in result  # URLs should be processed
+        # Verify that the segment URLs are correctly rewritten and encoded
+        encoded_segment1 = quote("http://original.com/segment1.ts", safe='')
+        expected_url1 = f"{proxy_base_url}/segment?url={encoded_segment1}&client_id=stream123"
+        assert expected_url1 in result
+
+        encoded_segment2 = quote("http://original.com/segment2.ts", safe='')
+        expected_url2 = f"{proxy_base_url}/segment?url={encoded_segment2}&client_id=stream123"
+        assert expected_url2 in result
 
 
 class TestStreamManager:

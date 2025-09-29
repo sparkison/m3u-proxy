@@ -5,7 +5,6 @@ A high-performance IPTV streaming proxy with client management and failover supp
 """
 
 import uvicorn
-import argparse
 import logging
 import sys
 import os
@@ -13,33 +12,32 @@ import os
 # Add the src directory to Python path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
 
+from config import settings
+
 def main():
-    parser = argparse.ArgumentParser(description="m3u-proxy Enhanced Server")
-    parser.add_argument("--host", default="0.0.0.0", help="Host to bind to")
-    parser.add_argument("--port", type=int, default=8001, help="Port to bind to")
-    parser.add_argument("--debug", action="store_true", help="Enable debug mode")
-    parser.add_argument("--reload", action="store_true", help="Enable auto-reload")
-    parser.add_argument("--log-level", choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'], 
-                       default='INFO', help="Logging level")
-    
-    args = parser.parse_args()
+    """Main function to start the m3u-proxy server."""
     
     # Configure logging
     logging.basicConfig(
-        level=getattr(logging, args.log_level),
+        level=settings.LOG_LEVEL.upper(),
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     )
     
     logger = logging.getLogger(__name__)
-    logger.info(f"Starting m3u-proxy on {args.host}:{args.port}")
-    
-    # Start the server
+    logger.info(f"Starting m3u-proxy on {settings.HOST}:{settings.PORT}")
+    logger.info(f"Log level set to: {settings.LOG_LEVEL}")
+    if settings.DEBUG:
+        logger.warning("Debug mode is enabled. Do not use in production.")
+    if settings.RELOAD:
+        logger.info("Auto-reload is enabled.")
+
+    # Start the server using settings from the config object
     uvicorn.run(
         "api:app",
-        host=args.host,
-        port=args.port,
-        reload=args.reload,
-        log_level=args.log_level.lower()
+        host=settings.HOST,
+        port=settings.PORT,
+        reload=settings.RELOAD,
+        log_level=settings.LOG_LEVEL.lower()
     )
 
 if __name__ == "__main__":

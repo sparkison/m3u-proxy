@@ -1,109 +1,43 @@
-import os
-from pathlib import Path
+from pydantic_settings import BaseSettings, SettingsConfigDict
 from typing import Optional
-from dotenv import load_dotenv
 
-
-class Config:
-    """Application configuration loaded from environment variables and .env file."""
-
-    def __init__(self):
-        # Load .env file if it exists
-        env_file = Path(__file__).parent.parent / ".env"
-        if env_file.exists():
-            load_dotenv(env_file)
+class Settings(BaseSettings):
+    """
+    Application configuration loaded from environment variables.
+    Utilizes pydantic-settings for robust validation and type-casting.
+    """
 
     # Server Configuration
-    @property
-    def host(self) -> str:
-        return os.getenv("HOST", "0.0.0.0")
-
-    @property
-    def port(self) -> int:
-        return int(os.getenv("PORT", "8080"))
-
-    @property
-    def log_level(self) -> str:
-        return os.getenv("LOG_LEVEL", "INFO").upper()
-
-    @property
-    def debug(self) -> bool:
-        return os.getenv("DEBUG", "false").lower() in ("true", "1", "yes", "on")
+    HOST: str = "0.0.0.0"
+    PORT: int = 8001
+    LOG_LEVEL: str = "INFO"
+    DEBUG: bool = False
+    RELOAD: bool = False
 
     # Stream Configuration
-    @property
-    def default_buffer_size(self) -> int:
-        return int(os.getenv("DEFAULT_BUFFER_SIZE", "1048576"))  # 1MB
+    CLIENT_TIMEOUT: int = 30
+    STREAM_TIMEOUT: int = 300
+    CLEANUP_INTERVAL: int = 60
 
-    @property
-    def default_timeout(self) -> int:
-        return int(os.getenv("DEFAULT_TIMEOUT", "30"))
+    # Default stream properties (can be overridden per stream)
+    DEFAULT_USER_AGENT: str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"
+    DEFAULT_CONNECTION_TIMEOUT: float = 10.0
+    DEFAULT_READ_TIMEOUT: float = 30.0
+    DEFAULT_MAX_RETRIES: int = 3
+    DEFAULT_BACKOFF_FACTOR: float = 1.5
+    DEFAULT_HEALTH_CHECK_INTERVAL: float = 300.0
 
-    @property
-    def default_retry_attempts(self) -> int:
-        return int(os.getenv("DEFAULT_RETRY_ATTEMPTS", "3"))
+    # Optional Redis Configuration for distributed systems (not yet implemented)
+    REDIS_HOST: Optional[str] = None
+    REDIS_PORT: int = 6379
 
-    @property
-    def default_retry_delay(self) -> int:
-        return int(os.getenv("DEFAULT_RETRY_DELAY", "5"))
+    # Model configuration
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        case_sensitive=False,
+        env_prefix="M3U_PROXY_"  # e.g., M3U_PROXY_HOST
+    )
 
-    # Hardware Acceleration
-    @property
-    def enable_hardware_acceleration(self) -> bool:
-        return os.getenv("ENABLE_HARDWARE_ACCELERATION", "true").lower() in ("true", "1", "yes", "on")
-
-    # Paths
-    @property
-    def temp_dir(self) -> str:
-        return os.getenv("TEMP_DIR", "/tmp/m3u-proxy-streams")
-
-    @property
-    def log_file(self) -> str:
-        return os.getenv("LOG_FILE", "m3u-proxy.log")
-
-    # Optional Redis Configuration
-    @property
-    def redis_host(self) -> Optional[str]:
-        return os.getenv("REDIS_HOST")
-
-    @property
-    def redis_port(self) -> int:
-        return int(os.getenv("REDIS_PORT", "6379"))
-
-    @property
-    def redis_db(self) -> int:
-        return int(os.getenv("REDIS_DB", "0"))
-
-    # Optional Metrics Configuration
-    @property
-    def enable_metrics(self) -> bool:
-        return os.getenv("ENABLE_METRICS", "false").lower() in ("true", "1", "yes", "on")
-
-    @property
-    def metrics_port(self) -> int:
-        return int(os.getenv("METRICS_PORT", "9090"))
-
-    def to_dict(self) -> dict:
-        """Return configuration as dictionary for debugging."""
-        return {
-            "host": self.host,
-            "port": self.port,
-            "log_level": self.log_level,
-            "debug": self.debug,
-            "default_buffer_size": self.default_buffer_size,
-            "default_timeout": self.default_timeout,
-            "default_retry_attempts": self.default_retry_attempts,
-            "default_retry_delay": self.default_retry_delay,
-            "enable_hardware_acceleration": self.enable_hardware_acceleration,
-            "temp_dir": self.temp_dir,
-            "log_file": self.log_file,
-            "redis_host": self.redis_host,
-            "redis_port": self.redis_port,
-            "redis_db": self.redis_db,
-            "enable_metrics": self.enable_metrics,
-            "metrics_port": self.metrics_port,
-        }
-
-
-# Global configuration instance
-config = Config()
+# Global settings instance
+settings = Settings()

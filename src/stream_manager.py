@@ -12,6 +12,8 @@ import sys
 from fastapi import HTTPException
 from fastapi.responses import StreamingResponse
 
+from config import settings
+
 logger = logging.getLogger(__name__)
 
 
@@ -45,7 +47,7 @@ class StreamInfo:
     current_failover_index: int = 0
     current_url: Optional[str] = None
     final_playlist_url: Optional[str] = None  # Track final URL after redirects
-    user_agent: str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"
+    user_agent: str = settings.DEFAULT_USER_AGENT
     # Stream connection management
     origin_task: Optional[asyncio.Task] = None  # Task fetching from origin
     is_live_stream: bool = False  # Whether this is a continuous live stream
@@ -58,11 +60,11 @@ class StreamInfo:
     # Enhanced failover management
     failover_attempts: int = 0  # Count of failover attempts
     last_failover_time: Optional[datetime] = None  # Track last failover
-    connection_timeout: float = 30.0  # Connection timeout in seconds
-    read_timeout: float = 300.0  # Read timeout for live streams
-    max_retries: int = 3  # Maximum retry attempts per URL
-    backoff_factor: float = 1.5  # Exponential backoff factor
-    health_check_interval: float = 300.0  # Health check interval in seconds
+    connection_timeout: float = settings.DEFAULT_CONNECTION_TIMEOUT
+    read_timeout: float = settings.DEFAULT_READ_TIMEOUT
+    max_retries: int = settings.DEFAULT_MAX_RETRIES
+    backoff_factor: float = settings.DEFAULT_BACKOFF_FACTOR
+    health_check_interval: float = settings.DEFAULT_HEALTH_CHECK_INTERVAL
     last_health_check: Optional[datetime] = None  # Last health check time
 
 
@@ -82,58 +84,56 @@ class ProxyStats:
     error_stats: Dict = field(default_factory=dict)
 
 
+import m3u8
+
 class M3U8Processor:
     def __init__(self, base_url: str, client_id: str, user_agent: Optional[str] = None, original_url: Optional[str] = None):
         self.base_url = base_url
         self.client_id = client_id
-        self.user_agent = user_agent or 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36'
+        self.user_agent = user_agent or settings.DEFAULT_USER_AGENT
         self.original_url = original_url or base_url
 
     def process_playlist(self, content: str, base_proxy_url: str, original_base_url: Optional[str] = None) -> str:
-        """Process M3U8 content and rewrite segment URLs"""
-        lines = content.split('\n')
-        processed_lines = []
+        """Process M3U8 content and rewrite segment URLs using the m3u8 library."""
+        try:
+            playlist = m3u8.loads(content, uri=original_base_url or self.original_url)
 
-        for line in lines:
-            stripped_line = line.strip()
-            if stripped_line and not stripped_line.startswith('#'):
-                # This is a segment URL
-                if not stripped_line.startswith('http'):
-                    # Convert relative URL to absolute using original base URL
-                    from urllib.parse import urljoin, urlparse
-                    resolve_base = original_base_url or self.original_url
-                    stripped_line = urljoin(resolve_base, stripped_line)
+            # Handle both variant playlists (master) and media playlists
+            if playlist.is_variant:
+                # Process variant streams (master playlist)
+                for variant in playlist.playlists:
+                    variant.uri = self._rewrite_url(variant.absolute_uri, base_proxy_url)
 
-                # Encode the segment URL and add auth headers
-                encoded_url = quote(stripped_line, safe='')
-                segment_url = f"{base_proxy_url}/segment?url={encoded_url}&client_id={self.client_id}"
+                # Process alternative media (audio, video, subtitles)
+                for media in playlist.media:
+                    if media.uri:
+                         media.uri = self._rewrite_url(media.absolute_uri, base_proxy_url)
 
-                # Add authentication headers to the segment URL based on original playlist domain
-                from urllib.parse import urlparse
-                original_parsed = urlparse(self.original_url)
-
-                # Add headers as query parameters (following MediaFlow pattern)
-                auth_headers = {
-                    'referer': f"{original_parsed.scheme}://{original_parsed.netloc}/",
-                    'origin': f"{original_parsed.scheme}://{original_parsed.netloc}",
-                    'user-agent': self.user_agent,
-                    'accept': '*/*',
-                    'accept-encoding': 'gzip, deflate, br',
-                    'accept-language': 'en-US,en;q=0.9'
-                }
-
-                # Add header parameters to segment URL
-                for header_name, header_value in auth_headers.items():
-                    encoded_header_value = quote(header_value, safe='')
-                    segment_url += f"&h_{header_name}={encoded_header_value}"
-
-                processed_lines.append(segment_url)
-                logger.debug(
-                    f"Processed segment URL with auth headers: {stripped_line} -> {segment_url}")
             else:
-                processed_lines.append(line)
+                # Process media segments (media playlist)
+                for segment in playlist.segments:
+                    segment.uri = self._rewrite_url(segment.absolute_uri, base_proxy_url)
 
-        return '\n'.join(processed_lines)
+                # Process initialization sections (EXT-X-MAP)
+                if playlist.segment_map and playlist.segment_map.uri:
+                    playlist.segment_map.uri = self._rewrite_url(playlist.segment_map.absolute_uri, base_proxy_url)
+
+            return playlist.dumps()
+
+        except Exception as e:
+            logger.error(f"Error processing M3U8 playlist: {e}")
+            # Fallback to original content on parsing error
+            return content
+
+    def _rewrite_url(self, original_url: str, base_proxy_url: str) -> str:
+        """Rewrites a URL to point to the proxy, encoding the original URL."""
+        encoded_url = quote(original_url, safe='')
+        if original_url.endswith('.m3u8'):
+            # This is a nested playlist
+            return f"{base_proxy_url}/playlist.m3u8?url={encoded_url}&client_id={self.client_id}"
+        else:
+            # This is a segment
+            return f"{base_proxy_url}/segment?url={encoded_url}&client_id={self.client_id}"
 
 
 class StreamManager:
@@ -142,18 +142,21 @@ class StreamManager:
         self.clients: Dict[str, ClientInfo] = {}
         # stream_id -> client_ids
         self.stream_clients: Dict[str, Set[str]] = {}
-        self.client_timeout = 30  # seconds
-        self.stream_timeout = 300  # 5 minutes
+        self.client_timeout = settings.CLIENT_TIMEOUT
+        self.stream_timeout = settings.STREAM_TIMEOUT
         self.http_client = httpx.AsyncClient(
-            timeout=30.0,
-            follow_redirects=True,  # Enable redirect following
-            max_redirects=10        # Limit redirects to prevent loops
+            timeout=settings.DEFAULT_CONNECTION_TIMEOUT,
+            follow_redirects=True,
+            max_redirects=10
         )
         # Separate client for live streams with longer timeout
         self.live_stream_client = httpx.AsyncClient(
-            # 5 min read timeout for live streams
-            timeout=httpx.Timeout(connect=10.0, read=300.0,
-                                  write=10.0, pool=10.0),
+            timeout=httpx.Timeout(
+                connect=settings.DEFAULT_CONNECTION_TIMEOUT,
+                read=settings.DEFAULT_READ_TIMEOUT,
+                write=10.0,
+                pool=10.0
+            ),
             follow_redirects=True,
             max_redirects=10
         )

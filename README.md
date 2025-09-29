@@ -367,8 +367,15 @@ python demo_events.py
 │   ├── models.py          # Data models and schemas
 │   ├── config.py          # Configuration management
 │   └── events.py          # Event system
+├── tests/                 # Test suite
+│   ├── integration/       # Integration tests
+│   └── test_*.py          # Unit tests
+├── tools/                 # Utility scripts and tools
+│   ├── performance_test.py # Performance testing
+│   ├── m3u_client.py      # CLI client
+│   ├── demo_events.py     # Event system demo
+│   └── run_tests.py       # Enhanced test runner
 ├── main.py                # Server entry point
-├── m3u_client.py          # CLI client
 └── README.md              # This file
 ```
 

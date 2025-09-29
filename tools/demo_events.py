@@ -3,14 +3,15 @@
 Demo script showing the event system working
 """
 import logging
-from models import StreamEvent, EventType, WebhookConfig
-from events import EventManager
 import asyncio
 import sys
 import os
 
-# Add src to path
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
+# Add src to path (now we're in tools/, so go up one level to reach src/)
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
+
+from models import StreamEvent, EventType, WebhookConfig
+from events import EventManager
 
 
 # Set up logging

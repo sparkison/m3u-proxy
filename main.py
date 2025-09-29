@@ -4,7 +4,6 @@ m3u-proxy - Main Entry Point
 A high-performance IPTV streaming proxy with client management and failover support.
 """
 
-from config import settings
 import uvicorn
 import logging
 import sys
@@ -12,6 +11,9 @@ import os
 
 # Add the src directory to Python path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
+
+# Import config after setting up the path
+from config import settings
 
 
 def main():

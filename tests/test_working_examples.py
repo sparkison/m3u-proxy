@@ -98,10 +98,12 @@ class TestBasicFunctionality:
         """Test M3U8Processor can be created"""
         # Arrange & Act
         base_url = "http://proxy.com"
-        processor = M3U8Processor(base_url)
+        client_id = "test_client"
+        processor = M3U8Processor(base_url, client_id)
         
         # Assert
         assert processor.base_url == base_url
+        assert processor.client_id == client_id
     
     def test_stream_manager_stats(self):
         """Test getting stats from StreamManager"""

@@ -1468,7 +1468,7 @@ class StreamManager:
             # Test the failover URL with stream's user agent and custom timeouts
             headers = {'User-Agent': stream_info.user_agent}
             timeout = httpx.Timeout(
-                connect=stream_info.connection_timeout, read=30.0)
+                connect=stream_info.connection_timeout, read=30.0, write=10.0, pool=10.0)
             response = await self.http_client.head(next_url, headers=headers, timeout=timeout)
             response.raise_for_status()
 
@@ -1514,7 +1514,7 @@ class StreamManager:
 
         try:
             headers = {'User-Agent': stream_info.user_agent}
-            timeout = httpx.Timeout(connect=10.0, read=30.0)
+            timeout = httpx.Timeout(connect=10.0, read=30.0, write=10.0, pool=10.0)
 
             # For HLS streams, check the playlist; for others, do a HEAD request
             if current_url.endswith('.m3u8'):

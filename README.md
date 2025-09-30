@@ -30,7 +30,13 @@ A high-performance HTTP proxy server for IPTV content with client management, st
 
 ### 1. Install Dependencies
 
+#### Prerequisits
+
+- `python` installed on your system: `>=3.10`
+- `pip` installed on your system: `>=23`
+
 ```bash
+git clone https://github.com/sparkison/m3u-proxy.git && cd m3u-proxy
 pip install -r requirements.txt
 ```
 

@@ -9,8 +9,6 @@ services:
       - /tmp/m3u-proxy-streams:/tmp/m3u-proxy-streams
       - ./logs:/app/logs
       - ./.env:/app/.env
-    devices:
-      - /dev/dri:/dev/dri  # Hardware acceleration support
     environment:
       - PYTHONPATH=/app
       - PORT=${PORT:-8085}

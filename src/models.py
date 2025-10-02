@@ -9,7 +9,6 @@ try:
 except ImportError:
     # Fallback for when config is not available
     class MockSettings:
-        ENABLE_HARDWARE_ACCELERATION = False
         DEFAULT_BUFFER_SIZE = 1024 * 1024
         DEFAULT_TIMEOUT = 30
         DEFAULT_RETRY_ATTEMPTS = 3
@@ -49,7 +48,6 @@ class StreamConfig(BaseModel):
     failover_urls: List[HttpUrl] = Field(default_factory=list)
     format: Optional[StreamFormat] = None
     auto_detect_format: bool = True
-    enable_hardware_acceleration: Optional[bool] = None
     buffer_size: Optional[int] = None
     timeout: Optional[int] = None
     retry_attempts: Optional[int] = None
@@ -57,8 +55,6 @@ class StreamConfig(BaseModel):
 
     def model_post_init(self, __context) -> None:
         """Set defaults from config after validation."""
-        if self.enable_hardware_acceleration is None:
-            self.enable_hardware_acceleration = settings.ENABLE_HARDWARE_ACCELERATION
         # Treat 0 or None as "use default"
         if self.buffer_size is None or self.buffer_size == 0:
             self.buffer_size = settings.DEFAULT_BUFFER_SIZE

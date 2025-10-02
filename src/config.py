@@ -33,7 +33,6 @@ class Settings(BaseSettings):
     DEFAULT_TIMEOUT: int = 30
     DEFAULT_RETRY_ATTEMPTS: int = 3
     DEFAULT_RETRY_DELAY: int = 5
-    ENABLE_HARDWARE_ACCELERATION: bool = True
     TEMP_DIR: str = "/tmp/m3u-proxy-streams"
     LOG_FILE: str = "m3u-proxy.log"
 

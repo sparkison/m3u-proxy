@@ -361,7 +361,7 @@ curl -X POST "http://localhost:8085/webhooks" \
 python demo_events.py
 ```
 
-📖 **Full Documentation**: See [EVENT_SYSTEM.md](EVENT_SYSTEM.md) for complete webhook integration guide.
+📖 **Full Documentation**: See [EVENT_SYSTEM.md](docs/EVENT_SYSTEM.md) for complete webhook integration guide.
 
 ## Development
 

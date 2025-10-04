@@ -28,7 +28,39 @@ A high-performance HTTP proxy server for IPTV content with **true live proxying*
 
 ## Quick Start
 
-### 1. Install Dependencies
+#### 🐳 Docker compose example
+
+Use the below example to run using the precompiled Dockerhub image.
+You can also replace `latest` with `dev` or `experimental` to try another branch.
+
+```yaml
+services:
+  m3u-proxy:
+    image: sparkison/m3u-proxy:latest
+    container_name: m3u-proxy
+    ports:
+      - "8085:8085"
+    environment:
+      # Server Configuration
+      - M3U_PROXY_HOST=0.0.0.0
+      - M3U_PROXY_PORT=8085
+      - LOG_LEVEL=INFO
+      
+      # Timeouts (optional)
+      - CLIENT_TIMEOUT=300
+      - CLEANUP_INTERVAL=60
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8085/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+```
+
+## Building from source
+
+### 1. Clone Repo & Install Dependencies
 
 #### Prerequisits
 

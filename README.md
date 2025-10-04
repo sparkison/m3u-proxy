@@ -277,7 +277,6 @@ StreamInfo(
 ## Performance
 
 ### Architecture Wins
-- **98% Memory Reduction**: 640KB vs 32MB for 10 simultaneous clients
 - **True Ephemeral**: Provider connections exist only when actively serving
 - **Zero Buffer Bloat**: No shared buffers, no pre-buffering delays
 - **Immediate Cleanup**: Connections close instantly on client disconnect

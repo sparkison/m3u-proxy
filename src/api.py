@@ -426,65 +426,22 @@ async def get_direct_stream(
         # Determine content type
         content_type = get_content_type(stream_url)
 
-        # Detect live streams based on URL patterns (more specific detection)
-        is_live_stream = (
-            stream_url.endswith('.ts') or
-            '/live/' in stream_url or
-            '.m3u8' in stream_url or
-            content_type == "video/mp2t" or
-            '/playlist.' in stream_url.lower()
-        )
-
-        # MP4 files are typically VOD, not live streams
-        if stream_url.endswith('.mp4'):
-            is_live_stream = False
-
-        # Update stream info with live stream detection
-        stream_info.is_live_stream = is_live_stream
-
         # Get range header if present
         range_header = request.headers.get('range')
 
-        # For live streams, we generally don't want to handle range requests
-        # For VOD (like MP4), we should support range requests
-        if is_live_stream and range_header:
-            logger.info(
-                f"Ignoring range request for live stream: {range_header}")
-            range_header = None
-
-        # Prepare response headers
-        response_headers = {
-            "content-type": content_type,
-            "X-Client-ID": client_id,
-            "X-Stream-ID": stream_id,
-            "Cache-Control": "no-cache, no-store, must-revalidate",
-            "Pragma": "no-cache",
-            "Expires": "0"
-        }
-
-        if is_live_stream:
-            # Additional headers for live MPEG-TS streams
-            response_headers.update({
-                "Transfer-Encoding": "chunked",
-                "Connection": "keep-alive"
-            })
-
-        if range_header:
-            response_headers["accept-ranges"] = "bytes"
-
         logger.info(
-            f"Serving {'live' if is_live_stream else 'VOD'} stream to client {client_id} for stream {stream_id}")
+            f"Serving direct stream to client {client_id} for stream {stream_id}")
         logger.info(f"Stream URL: {stream_url}")
         logger.info(f"Content-Type: {content_type}")
         if range_header:
             logger.info(f"Range request: {range_header}")
 
-        # Use unified live proxy for all streams
-        return await stream_manager.stream_unified_response(
+        # Use direct proxy for continuous streams
+        # This provides true byte-for-byte proxying with per-client connections
+        return await stream_manager.stream_continuous_direct(
             stream_id,
             client_id,
-            is_hls_segment=False,  # This is a continuous stream, not an HLS segment
-            range_header=range_header  # Pass range header for VOD support
+            range_header=range_header
         )
 
     except HTTPException:
@@ -761,7 +718,8 @@ async def trigger_failover(stream_id: str):
         if stream_id not in stream_manager.streams:
             raise HTTPException(status_code=404, detail="Stream not found")
 
-        success = await stream_manager._try_failover(stream_id)
+        # Update to next failover URL
+        success = await stream_manager._try_update_failover_url(stream_id)
 
         if success:
             stream_info = stream_manager.streams[stream_id]

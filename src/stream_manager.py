@@ -1,15 +1,18 @@
+"""
+Stream Manager with Separate Proxy Paths
+This version implements efficient per-client proxying for continuous streams
+while maintaining the shared buffer approach for HLS segments.
+"""
+
 import m3u8
 import asyncio
 import httpx
-import re
 import logging
 from typing import Dict, Optional, AsyncIterator, List, Set
 from urllib.parse import urljoin, urlparse, quote, unquote
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field
-import weakref
 from asyncio import Queue
-import sys
 from fastapi import HTTPException
 from fastapi.responses import StreamingResponse
 
@@ -28,9 +31,7 @@ class ClientInfo:
     stream_id: Optional[str] = None
     bytes_served: int = 0
     segments_served: int = 0
-    is_connected: bool = True  # Track actual connection state
-    data_queue: Optional[Queue] = field(
-        default_factory=lambda: Queue(maxsize=100))  # Buffer for stream data
+    is_connected: bool = True
 
 
 @dataclass
@@ -47,26 +48,23 @@ class StreamInfo:
     failover_urls: List[str] = field(default_factory=list)
     current_failover_index: int = 0
     current_url: Optional[str] = None
-    final_playlist_url: Optional[str] = None  # Track final URL after redirects
+    final_playlist_url: Optional[str] = None
     user_agent: str = settings.DEFAULT_USER_AGENT
-    # Stream connection management
-    origin_task: Optional[asyncio.Task] = None  # Task fetching from origin
-    is_live_stream: bool = False  # Whether this is a continuous live stream
-    connected_clients: Set[str] = field(
-        default_factory=set)  # Active client IDs
-    # Count of actively consuming clients (HLS segments + TS streams)
-    active_consumers: int = 0
-    stream_buffer: Optional[Queue] = field(default_factory=lambda: Queue(
-        maxsize=1000))  # Shared buffer for all clients
-    # Enhanced failover management
-    failover_attempts: int = 0  # Count of failover attempts
-    last_failover_time: Optional[datetime] = None  # Track last failover
+    # Track connected clients for stats
+    connected_clients: Set[str] = field(default_factory=set)
+    # Failover management
+    failover_attempts: int = 0
+    last_failover_time: Optional[datetime] = None
     connection_timeout: float = settings.DEFAULT_CONNECTION_TIMEOUT
     read_timeout: float = settings.DEFAULT_READ_TIMEOUT
     max_retries: int = settings.DEFAULT_MAX_RETRIES
     backoff_factor: float = settings.DEFAULT_BACKOFF_FACTOR
     health_check_interval: float = settings.DEFAULT_HEALTH_CHECK_INTERVAL
-    last_health_check: Optional[datetime] = None  # Last health check time
+    last_health_check: Optional[datetime] = None
+    # Stream type detection
+    is_hls: bool = False
+    is_vod: bool = False
+    is_live_continuous: bool = False
 
 
 @dataclass
@@ -78,11 +76,8 @@ class ProxyStats:
     total_bytes_served: int = 0
     total_segments_served: int = 0
     uptime_start: datetime = field(default_factory=datetime.now)
-    # Enhanced monitoring metrics
     connection_pool_stats: Dict = field(default_factory=dict)
     failover_stats: Dict = field(default_factory=dict)
-    performance_metrics: Dict = field(default_factory=dict)
-    error_stats: Dict = field(default_factory=dict)
 
 
 class M3U8Processor:
@@ -95,48 +90,34 @@ class M3U8Processor:
     def process_playlist(self, content: str, base_proxy_url: str, original_base_url: Optional[str] = None) -> str:
         """Process M3U8 content and rewrite segment URLs using the m3u8 library."""
         try:
-            playlist = m3u8.loads(
-                content, uri=original_base_url or self.original_url)
+            playlist = m3u8.loads(content, uri=original_base_url or self.original_url)
 
             # Handle both variant playlists (master) and media playlists
             if playlist.is_variant:
-                # Process variant streams (master playlist)
                 for variant in playlist.playlists:
-                    variant.uri = self._rewrite_url(
-                        variant.absolute_uri, base_proxy_url)
-
-                # Process alternative media (audio, video, subtitles)
+                    variant.uri = self._rewrite_url(variant.absolute_uri, base_proxy_url)
                 for media in playlist.media:
                     if media.uri:
-                        media.uri = self._rewrite_url(
-                            media.absolute_uri, base_proxy_url)
-
+                        media.uri = self._rewrite_url(media.absolute_uri, base_proxy_url)
             else:
-                # Process media segments (media playlist)
                 for segment in playlist.segments:
-                    segment.uri = self._rewrite_url(
-                        segment.absolute_uri, base_proxy_url)
-
-                # Process initialization sections (EXT-X-MAP)
-                if playlist.segment_map and playlist.segment_map.uri:
-                    playlist.segment_map.uri = self._rewrite_url(
-                        playlist.segment_map.absolute_uri, base_proxy_url)
+                    segment.uri = self._rewrite_url(segment.absolute_uri, base_proxy_url)
+                # Handle initialization section if present
+                for seg_map in (playlist.segment_map if isinstance(playlist.segment_map, list) else []):
+                    if hasattr(seg_map, 'uri') and seg_map.uri:
+                        seg_map.uri = self._rewrite_url(seg_map.absolute_uri, base_proxy_url)
 
             return playlist.dumps()
-
         except Exception as e:
             logger.error(f"Error processing M3U8 playlist: {e}")
-            # Fallback to original content on parsing error
             return content
 
     def _rewrite_url(self, original_url: str, base_proxy_url: str) -> str:
         """Rewrites a URL to point to the proxy, encoding the original URL."""
         encoded_url = quote(original_url, safe='')
         if original_url.endswith('.m3u8'):
-            # This is a nested playlist
             return f"{base_proxy_url}/playlist.m3u8?url={encoded_url}&client_id={self.client_id}"
         else:
-            # This is a segment - use the segment endpoint
             return f"{base_proxy_url}/segment.ts?url={encoded_url}&client_id={self.client_id}"
 
 
@@ -144,16 +125,22 @@ class StreamManager:
     def __init__(self):
         self.streams: Dict[str, StreamInfo] = {}
         self.clients: Dict[str, ClientInfo] = {}
-        # stream_id -> client_ids
         self.stream_clients: Dict[str, Set[str]] = {}
         self.client_timeout = settings.CLIENT_TIMEOUT
         self.stream_timeout = settings.STREAM_TIMEOUT
+        
+        # Optimized HTTP clients with connection pooling
         self.http_client = httpx.AsyncClient(
             timeout=settings.DEFAULT_CONNECTION_TIMEOUT,
             follow_redirects=True,
-            max_redirects=10
+            max_redirects=10,
+            limits=httpx.Limits(
+                max_keepalive_connections=20,
+                max_connections=100,
+                keepalive_expiry=30.0
+            )
         )
-        # Separate client for live streams with longer timeout
+        
         self.live_stream_client = httpx.AsyncClient(
             timeout=httpx.Timeout(
                 connect=settings.DEFAULT_CONNECTION_TIMEOUT,
@@ -162,12 +149,19 @@ class StreamManager:
                 pool=10.0
             ),
             follow_redirects=True,
-            max_redirects=10
+            max_redirects=10,
+            limits=httpx.Limits(
+                max_keepalive_connections=10,
+                max_connections=50,
+                keepalive_expiry=30.0
+            )
         )
+        
         self._stats = ProxyStats()
         self._cleanup_task: Optional[asyncio.Task] = None
+        self._health_check_task: Optional[asyncio.Task] = None
         self._running = False
-        self.event_manager = None  # Will be set by API
+        self.event_manager = None
 
     def set_event_manager(self, event_manager):
         """Set the event manager for emitting events"""
@@ -191,25 +185,38 @@ class StreamManager:
         """Start the stream manager"""
         self._running = True
         self._cleanup_task = asyncio.create_task(self._periodic_cleanup())
-        self._health_check_task = asyncio.create_task(
-            self._periodic_health_check())
-        self._monitoring_task = asyncio.create_task(
-            self._monitoring_update_task())
-        logger.info(
-            "Stream manager started with health monitoring and performance tracking")
+        self._health_check_task = asyncio.create_task(self._periodic_health_check())
+        logger.info("Stream manager started with optimized connection pooling and direct proxy architecture")
 
     async def stop(self):
         """Stop the stream manager"""
         self._running = False
         if self._cleanup_task:
             self._cleanup_task.cancel()
-        if hasattr(self, '_health_check_task') and self._health_check_task:
+        if self._health_check_task:
             self._health_check_task.cancel()
-        if hasattr(self, '_monitoring_task') and self._monitoring_task:
-            self._monitoring_task.cancel()
         await self.http_client.aclose()
         await self.live_stream_client.aclose()
         logger.info("Stream manager stopped")
+
+    def _detect_stream_type(self, url: str) -> tuple[bool, bool, bool]:
+        """Detect stream type: (is_hls, is_vod, is_live_continuous)"""
+        url_lower = url.lower()
+        
+        # HLS detection
+        if url_lower.endswith('.m3u8'):
+            return (True, False, False)
+        
+        # VOD detection (typically non-.ts video files)
+        if url_lower.endswith(('.mp4', '.mkv', '.webm', '.avi')):
+            return (False, True, False)
+        
+        # Live continuous stream (.ts or live path)
+        if url_lower.endswith('.ts') or '/live/' in url_lower:
+            return (False, False, True)
+        
+        # Default: treat as live continuous
+        return (False, False, True)
 
     async def get_or_create_stream(
         self,
@@ -218,19 +225,16 @@ class StreamManager:
         user_agent: Optional[str] = None
     ) -> str:
         """Get or create a stream and return its ID"""
-        # Create a stream ID based on the URL
         import hashlib
         stream_id = hashlib.md5(stream_url.encode()).hexdigest()
 
         if stream_id not in self.streams:
             now = datetime.now()
-            # Use provided user agent or default
             if user_agent is None:
-                user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"
+                user_agent = settings.DEFAULT_USER_AGENT
 
-            # Detect if this is a live stream
-            is_live = stream_url.endswith(
-                '.ts') or '/live/' in stream_url or stream_url.endswith('.m3u8')
+            # Detect stream type
+            is_hls, is_vod, is_live_continuous = self._detect_stream_type(stream_url)
 
             self.streams[stream_id] = StreamInfo(
                 stream_id=stream_id,
@@ -240,15 +244,17 @@ class StreamManager:
                 last_access=now,
                 failover_urls=failover_urls or [],
                 user_agent=user_agent,
-                is_live_stream=is_live
+                is_hls=is_hls,
+                is_vod=is_vod,
+                is_live_continuous=is_live_continuous
             )
             self.stream_clients[stream_id] = set()
             self._stats.total_streams += 1
             self._stats.active_streams += 1
-            logger.info(
-                f"Created new stream: {stream_id} with user agent: {user_agent}")
+            
+            stream_type = "HLS" if is_hls else ("VOD" if is_vod else "Live Continuous")
+            logger.info(f"Created new stream: {stream_id} ({stream_type}) with user agent: {user_agent}")
 
-        # Update last access
         self.streams[stream_id].last_access = datetime.now()
         return stream_id
 
@@ -275,21 +281,16 @@ class StreamManager:
             self._stats.active_clients += 1
             logger.info(f"Registered new client: {client_id}")
 
-        # Add client to stream
         if stream_id in self.stream_clients:
             self.stream_clients[stream_id].add(client_id)
-            self.streams[stream_id].client_count = len(
-                self.stream_clients[stream_id])
-            # Add to connected clients set
+            self.streams[stream_id].client_count = len(self.stream_clients[stream_id])
             self.streams[stream_id].connected_clients.add(client_id)
 
-        # Update client info
         client_info = self.clients[client_id]
         client_info.last_access = now
         client_info.stream_id = stream_id
         client_info.is_connected = True
 
-        # Emit client_connected event
         await self._emit_event("CLIENT_CONNECTED", stream_id, {
             "client_id": client_id,
             "user_agent": user_agent,
@@ -299,883 +300,270 @@ class StreamManager:
 
         return client_info
 
-    async def add_stream_consumer(self, stream_id: str, client_id: str) -> bool:
-        """Add a consumer to a stream and start provider connection if needed"""
+    async def cleanup_client(self, client_id: str):
+        """Clean up a client"""
+        if client_id in self.clients:
+            client_info = self.clients[client_id]
+            stream_id = client_info.stream_id
+
+            if stream_id and stream_id in self.stream_clients:
+                self.stream_clients[stream_id].discard(client_id)
+                if stream_id in self.streams:
+                    self.streams[stream_id].client_count = len(self.stream_clients[stream_id])
+                    self.streams[stream_id].connected_clients.discard(client_id)
+
+            await self._emit_event("CLIENT_DISCONNECTED", stream_id or "unknown", {
+                "client_id": client_id,
+                "bytes_served": client_info.bytes_served,
+                "segments_served": client_info.segments_served
+            })
+
+            del self.clients[client_id]
+            self._stats.active_clients -= 1
+            logger.info(f"Cleaned up client: {client_id}")
+
+    # ============================================================================
+    # DIRECT PROXY FOR CONTINUOUS STREAMS (New Architecture)
+    # ============================================================================
+
+    async def stream_continuous_direct(
+        self,
+        stream_id: str,
+        client_id: str,
+        range_header: Optional[str] = None
+    ) -> StreamingResponse:
+        """
+        Direct byte-for-byte proxy for continuous streams (.ts, .mp4, .mkv).
+        Each client gets their own provider connection - NO shared buffer.
+        Provider connection is truly ephemeral and only open while streaming.
+        """
         if stream_id not in self.streams:
-            return False
-
-        stream_info = self.streams[stream_id]
-        stream_info.active_consumers += 1
-
-        logger.info(
-            f"Added consumer {client_id} to stream {stream_id} (total consumers: {stream_info.active_consumers})")
-
-        # Start provider connection if this is the first consumer
-        if stream_info.active_consumers == 1 and not stream_info.origin_task:
-            logger.info(
-                f"Starting provider connection for stream {stream_id} (first consumer)")
-            stream_info.origin_task = asyncio.create_task(
-                self._fetch_unified_stream(stream_id)
-            )
-
-        return True
-
-    async def remove_stream_consumer(self, stream_id: str, client_id: str) -> bool:
-        """Remove a consumer from a stream and stop provider connection if no consumers remain"""
-        if stream_id not in self.streams:
-            return False
-
-        stream_info = self.streams[stream_id]
-        if stream_info.active_consumers > 0:
-            stream_info.active_consumers -= 1
-
-        logger.info(
-            f"Removed consumer {client_id} from stream {stream_id} (remaining consumers: {stream_info.active_consumers})")
-
-        # Stop provider connection if no consumers remain
-        if stream_info.active_consumers == 0 and stream_info.origin_task:
-            logger.info(
-                f"Stopping provider connection for stream {stream_id} (no consumers)")
-            stream_info.origin_task.cancel()
-            stream_info.origin_task = None
-
-            # Clear the buffer
-            try:
-                while not stream_info.stream_buffer.empty():
-                    stream_info.stream_buffer.get_nowait()
-            except:
-                pass
-
-        return True
-
-    async def _fetch_unified_stream(self, stream_id: str):
-        """Unified stream fetcher that works for both HLS and TS streams"""
-        if stream_id not in self.streams:
-            return
+            raise HTTPException(status_code=404, detail="Stream not found")
 
         stream_info = self.streams[stream_id]
         current_url = stream_info.current_url or stream_info.original_url
 
-        try:
-            logger.info(
-                f"Starting unified provider connection for stream {stream_id}: {current_url}")
+        # Register this client
+        if client_id not in self.clients:
+            await self.register_client(client_id, stream_id)
 
-            # Emit stream_started event
-            await self._emit_event("STREAM_STARTED", stream_id, {
-                "url": current_url,
-                "consumer_count": stream_info.active_consumers
-            })
+        logger.info(f"Starting direct proxy for client {client_id}, stream {stream_id}")
 
-            # Prepare headers
-            headers = {
-                'User-Agent': stream_info.user_agent,
-                'Referer': f"{urlparse(current_url).scheme}://{urlparse(current_url).netloc}/",
-                'Origin': f"{urlparse(current_url).scheme}://{urlparse(current_url).netloc}",
-                'Accept': '*/*',
-                'Connection': 'keep-alive'
-            }
+        async def generate():
+            """Generator that directly proxies bytes from provider to client"""
+            bytes_served = 0
+            chunk_count = 0
+            response = None
+            
+            try:
+                # Emit stream started event
+                await self._emit_event("STREAM_STARTED", stream_id, {
+                    "url": current_url,
+                    "client_id": client_id,
+                    "mode": "direct_proxy"
+                })
 
-            # Use appropriate client with custom timeouts based on stream info
-            is_live_stream = current_url.endswith(
-                '.ts') or '/live/' in current_url
+                # Prepare headers
+                headers = {
+                    'User-Agent': stream_info.user_agent,
+                    'Referer': f"{urlparse(current_url).scheme}://{urlparse(current_url).netloc}/",
+                    'Origin': f"{urlparse(current_url).scheme}://{urlparse(current_url).netloc}",
+                    'Accept': '*/*',
+                    'Connection': 'keep-alive'
+                }
 
-            # Create custom timeout for this stream
-            custom_timeout = httpx.Timeout(
-                connect=stream_info.connection_timeout,
-                read=stream_info.read_timeout if is_live_stream else 30.0,
-                write=10.0,
-                pool=10.0
-            )
+                if range_header:
+                    headers['Range'] = range_header
 
-            client_to_use = self.live_stream_client if is_live_stream else self.http_client
+                # Select appropriate HTTP client
+                client_to_use = self.live_stream_client if stream_info.is_live_continuous else self.http_client
 
-            # Set up timeout detection
-            start_time = datetime.now()
-            last_data_time = start_time
-
-            async with client_to_use.stream('GET', current_url, headers=headers, follow_redirects=True, timeout=custom_timeout) as response:
+                # OPEN provider connection - happens ONLY when client starts consuming
+                logger.info(f"Opening provider connection for {stream_id} to {current_url}")
+                response = await client_to_use.stream('GET', current_url, headers=headers, follow_redirects=True).__aenter__()
                 response.raise_for_status()
 
-                logger.info(
-                    f"Connected to provider stream {stream_id}: {response.status_code}, Content-Type: {response.headers.get('content-type')}")
+                logger.info(f"Provider connected: {response.status_code}, Content-Type: {response.headers.get('content-type')}")
 
-                chunk_count = 0
-                bytes_served = 0
-
+                # Direct byte-for-byte proxy - NO buffering, NO transcoding
                 async for chunk in response.aiter_bytes(chunk_size=32768):
-                    # Check if we still have consumers
-                    if stream_info.active_consumers == 0:
-                        logger.info(
-                            f"No consumers for stream {stream_id}, stopping provider connection")
-                        break
-
-                    # Update last data received time
-                    last_data_time = datetime.now()
-
-                    # Check for stale connection (no data for too long)
-                    if is_live_stream:
-                        time_since_data = (
-                            last_data_time - start_time).total_seconds()
-                        if chunk_count > 0 and time_since_data > stream_info.read_timeout:
-                            logger.warning(
-                                f"Stream {stream_id} appears stale, no data for {time_since_data:.1f}s")
-                            raise httpx.ReadTimeout(
-                                f"No data received for {time_since_data:.1f}s")
-
+                    yield chunk
                     bytes_served += len(chunk)
                     chunk_count += 1
 
+                    # Update stats (lightweight)
                     if chunk_count == 1:
-                        logger.info(
-                            f"Provider stream {stream_id} first chunk: {len(chunk)} bytes")
+                        logger.info(f"First chunk delivered to client {client_id}: {len(chunk)} bytes")
                     elif chunk_count % 100 == 0:
-                        logger.debug(
-                            f"Provider stream {stream_id} chunk {chunk_count}, total: {bytes_served} bytes, consumers: {stream_info.active_consumers}")
+                        logger.debug(f"Client {client_id}: {chunk_count} chunks, {bytes_served} bytes")
 
-                    # Put chunk in shared buffer (non-blocking, drop if buffer full)
-                    try:
-                        stream_info.stream_buffer.put_nowait(chunk)
-                    except asyncio.QueueFull:
-                        # Buffer full, drop oldest chunk and add new one
-                        try:
-                            stream_info.stream_buffer.get_nowait()
-                            stream_info.stream_buffer.put_nowait(chunk)
-                        except asyncio.QueueEmpty:
-                            pass
+                logger.info(f"Stream completed for client {client_id}: {chunk_count} chunks, {bytes_served} bytes")
 
-                    # Update stream stats
-                    stream_info.total_bytes_served += len(chunk)
-                    stream_info.last_access = datetime.now()
-
-                logger.info(
-                    f"Provider stream {stream_id} completed: {chunk_count} chunks, {bytes_served} bytes")
-
-                # Emit stream_stopped event
+                # Emit stream stopped event
                 await self._emit_event("STREAM_STOPPED", stream_id, {
+                    "client_id": client_id,
                     "bytes_served": bytes_served,
-                    "chunks_served": chunk_count,
-                    "consumer_count": stream_info.active_consumers
+                    "chunks_served": chunk_count
                 })
 
-        except asyncio.CancelledError:
-            logger.info(
-                f"Provider stream {stream_id} cancelled (no consumers)")
-            # Emit stream_stopped event for cancelled streams
-            await self._emit_event("STREAM_STOPPED", stream_id, {
-                "reason": "no_consumers",
-                "consumer_count": stream_info.active_consumers
-            })
-        except (httpx.TimeoutException, httpx.ConnectTimeout, httpx.ReadTimeout) as e:
-            logger.warning(
-                f"Timeout error in provider stream {stream_id}: {e}")
-            stream_info.error_count += 1
-
-            # Determine failure reason for better failover decisions
-            if isinstance(e, httpx.ConnectTimeout):
-                reason = "connection_timeout"
-            elif isinstance(e, httpx.ReadTimeout):
-                reason = "read_timeout"
-            else:
-                reason = "general_timeout"
-
-            # Try automatic failover for timeout errors
-            if len(stream_info.failover_urls) > 0:
-                logger.info(
-                    f"Attempting automatic failover for stream {stream_id} due to {reason}")
-                failover_success = await self._try_failover(stream_id, reason)
-                if failover_success:
-                    logger.info(
-                        f"Timeout-triggered failover successful for stream {stream_id}, retrying connection")
-                    # Retry with backoff
-                    await asyncio.sleep(2.0)  # Brief delay before retry
-                    await self._fetch_unified_stream(stream_id)
-                    return
-
-            # Emit stream_failed event for timeout
-            await self._emit_event("STREAM_FAILED", stream_id, {
-                "error": str(e),
-                "error_type": "timeout",
-                "error_count": stream_info.error_count,
-                "consumer_count": stream_info.active_consumers,
-                "failover_attempted": len(stream_info.failover_urls) > 0,
-                "reason": reason
-            })
-        except (httpx.NetworkError, httpx.HTTPError) as e:
-            logger.error(
-                f"Network/HTTP error in provider stream {stream_id}: {e}")
-            stream_info.error_count += 1
-
-            # Try automatic failover for network/HTTP errors
-            if len(stream_info.failover_urls) > 0:
-                reason = "network_error" if isinstance(
-                    e, httpx.NetworkError) else "http_error"
-                logger.info(
-                    f"Attempting automatic failover for stream {stream_id} due to {reason}")
-                failover_success = await self._try_failover(stream_id, reason)
-                if failover_success:
-                    logger.info(
-                        f"Network error-triggered failover successful for stream {stream_id}, retrying connection")
-                    await asyncio.sleep(1.0)  # Brief delay before retry
-                    await self._fetch_unified_stream(stream_id)
-                    return
-
-            # Emit stream_failed event for network/HTTP errors
-            await self._emit_event("STREAM_FAILED", stream_id, {
-                "error": str(e),
-                "error_type": "network" if isinstance(e, httpx.NetworkError) else "http",
-                "error_count": stream_info.error_count,
-                "consumer_count": stream_info.active_consumers,
-                "failover_attempted": len(stream_info.failover_urls) > 0
-            })
-        except Exception as e:
-            logger.error(
-                f"Unexpected error in provider stream {stream_id}: {e}")
-            stream_info.error_count += 1
-
-            # Try automatic failover for unexpected errors
-            if len(stream_info.failover_urls) > 0:
-                logger.info(
-                    f"Attempting automatic failover for stream {stream_id} due to unexpected error")
-                failover_success = await self._try_failover(stream_id, "unexpected_error")
-                if failover_success:
-                    logger.info(
-                        f"Error-triggered failover successful for stream {stream_id}, retrying connection")
-                    await asyncio.sleep(1.0)  # Brief delay before retry
-                    await self._fetch_unified_stream(stream_id)
-                    return
-
-            # Emit stream_failed event for unexpected errors
-            await self._emit_event("STREAM_FAILED", stream_id, {
-                "error": str(e),
-                "error_type": "unexpected",
-                "error_count": stream_info.error_count,
-                "consumer_count": stream_info.active_consumers,
-                "failover_attempted": len(stream_info.failover_urls) > 0
-            })
-        finally:
-            # Send end-of-stream signal to any waiting consumers
-            try:
-                stream_info.stream_buffer.put_nowait(None)
-            except asyncio.QueueFull:
-                # Clear buffer and send end signal
-                try:
-                    while not stream_info.stream_buffer.empty():
-                        stream_info.stream_buffer.get_nowait()
-                    stream_info.stream_buffer.put_nowait(None)
-                except asyncio.QueueEmpty:
-                    pass
-            # Clean up
-            stream_info.origin_task = None
-            logger.info(f"Provider connection closed for stream {stream_id}")
-
-    async def get_complete_segment_data(self, stream_id: str, client_id: str) -> Optional[bytes]:
-        """Get complete segment data for HLS segments (waits for full download)"""
-        if stream_id not in self.streams:
-            return None
-
-        stream_info = self.streams[stream_id]
-
-        try:
-            logger.debug(f"Waiting for segment data for stream {stream_id}")
-
-            # Wait for provider connection to start and complete
-            max_wait_for_start = 10.0
-            start_time = asyncio.get_event_loop().time()
-
-            # Wait for provider connection to start
-            while not (hasattr(stream_info, 'origin_task') and stream_info.origin_task):
-                if asyncio.get_event_loop().time() - start_time > max_wait_for_start:
-                    logger.warning(
-                        f"Provider connection did not start for stream {stream_id}")
-                    return None
-                await asyncio.sleep(0.1)
-
-            logger.debug(
-                f"Provider connection started for stream {stream_id}, waiting for completion")
-
-            # Wait for the provider task to complete (it will collect the entire segment)
-            try:
-                await asyncio.wait_for(stream_info.origin_task, timeout=30.0)
-                logger.debug(f"Provider task completed for stream {stream_id}")
-            except asyncio.TimeoutError:
-                logger.warning(
-                    f"Timeout waiting for provider task completion for stream {stream_id}")
-                return None
-            except Exception as e:
-                logger.warning(
-                    f"Provider task failed for stream {stream_id}: {e}")
-                return None
-
-            # Now collect all data from the buffer (it should be complete)
-            segment_data = b""
-
-            # Collect all available data from the buffer
-            while True:
-                try:
-                    chunk = stream_info.stream_buffer.get_nowait()
-                    if chunk is None:  # End of stream signal
-                        break
-                    segment_data += chunk
-                except asyncio.QueueEmpty:
-                    break
-
-            # Update client stats
-            if client_id in self.clients and segment_data:
-                client_info = self.clients[client_id]
-                client_info.bytes_served += len(segment_data)
-                client_info.last_access = datetime.now()
-
-            logger.info(
-                f"Completed segment collection for stream {stream_id}: {len(segment_data)} bytes")
-            return segment_data if segment_data else None
-
-        except Exception as e:
-            logger.error(
-                f"Error getting complete segment data for client {client_id}: {e}")
-            return None
-
-    async def get_stream_data(self, stream_id: str, client_id: str, timeout: float = 30.0) -> Optional[bytes]:
-        """Get stream data from shared buffer for any type of stream"""
-        if stream_id not in self.streams:
-            return None
-
-        stream_info = self.streams[stream_id]
-
-        try:
-            # Wait for data from shared buffer
-            chunk = await asyncio.wait_for(
-                stream_info.stream_buffer.get(),
-                timeout=timeout
-            )
-
-            # None signals end of stream
-            if chunk is None:
-                return None
-
-            # Update client stats
-            if client_id in self.clients:
-                client_info = self.clients[client_id]
-                client_info.bytes_served += len(chunk)
-                client_info.last_access = datetime.now()
-
-            return chunk
-
-        except asyncio.TimeoutError:
-            logger.debug(
-                f"Timeout waiting for stream data for client {client_id}")
-            return None
-        except Exception as e:
-            logger.error(
-                f"Error getting stream data for client {client_id}: {e}")
-            return None
-
-    async def _handle_range_request(self, stream_id: str, client_id: str, start: int, end: Optional[int] = None):
-        """Handle HTTP range requests for VOD content by proxying directly to origin"""
-        if stream_id not in self.streams:
-            raise HTTPException(status_code=404, detail="Stream not found")
-
-        stream_info = self.streams[stream_id]
-        stream_url = stream_info.current_url or stream_info.original_url
-
-        # Prepare headers for range request to origin
-        headers = {
-            'User-Agent': stream_info.user_agent or 'Mozilla/5.0 (compatible)',
-            'Accept': '*/*',
-            'Range': f'bytes={start}-{end if end is not None else ""}'
-        }
-
-        logger.info(
-            f"Proxying range request to origin: {stream_url}, Range: bytes={start}-{end if end is not None else ''}")
-
-        try:
-            # Simple approach: make the range request and stream whatever we get back
-            async def proxy_range_generator():
-                bytes_served = 0
-                try:
-                    async with self.http_client.stream('GET', stream_url, headers=headers, follow_redirects=True) as response:
-                        logger.info(
-                            f"Origin range response: {response.status_code}")
-                        logger.info(
-                            f"Origin headers: Content-Length={response.headers.get('content-length')}, Content-Range={response.headers.get('content-range')}")
-
-                        # Stream whatever the origin server gives us
-                        async for chunk in response.aiter_bytes(chunk_size=32 * 1024):
-                            yield chunk
-                            bytes_served += len(chunk)
-
-                            if bytes_served % (5 * 1024 * 1024) == 0:  # Log every 5MB
-                                logger.info(
-                                    f"Range proxy streamed {bytes_served} bytes")
-
-                    logger.info(
-                        f"Range proxy completed: {bytes_served} bytes total")
-
-                    # Update client's last access time for successful completion
-                    if client_id in self.clients:
-                        self.clients[client_id].last_access = datetime.now()
-
-                except GeneratorExit:
-                    logger.info(
-                        f"Range proxy generator stopped by client disconnect: {bytes_served} bytes served")
-                    # For range requests, don't force cleanup - client might make more range requests
-                    # Let the normal timeout-based cleanup handle inactive clients
-                    return
-
-                except Exception as e:
-                    logger.error(f"Error in range proxy generator: {e}")
-                    # Only force cleanup on actual errors, not normal completion
-                    if client_id in self.clients:
-                        self.clients[client_id].last_access = datetime.now(
-                        ) - timedelta(minutes=10)  # Force cleanup on error
-                    return
-
-            # Make the actual request to get the real headers
-            async with self.http_client.stream('GET', stream_url, headers=headers, follow_redirects=True) as test_response:
-                # Get the actual response headers from the real request
-                content_type = test_response.headers.get(
-                    'content-type', 'video/mp4')
-                content_length = test_response.headers.get('content-length')
-                content_range = test_response.headers.get('content-range')
-
-                logger.info(
-                    f"Test response: {test_response.status_code}, Content-Type: {content_type}")
-                logger.info(
-                    f"Test headers: Content-Length={content_length}, Content-Range={content_range}")
-
-                # Build response headers based on what the origin server returned
-                response_headers = {
-                    "Content-Type": content_type,
-                    "Accept-Ranges": "bytes",
-                    "Cache-Control": "no-cache"
-                }
-
-                # Copy headers from origin if available
-                if content_length:
-                    response_headers["Content-Length"] = content_length
-
-                if content_range:
-                    response_headers["Content-Range"] = content_range
-
-                # If origin doesn't support range requests but we got data, simulate the range
-                if test_response.status_code == 200 and not content_range:
-                    # Calculate range headers manually
-                    total_size = content_length
-                    if total_size:
-                        if end is not None:
-                            range_length = str(end - start + 1)
-                            end_pos = end
-                        else:
-                            range_length = str(int(total_size) - start)
-                            end_pos = int(total_size) - 1
-
-                        response_headers["Content-Length"] = range_length
-                        response_headers["Content-Range"] = f"bytes {start}-{end_pos}/{total_size}"
-
-                # Determine status code
-                status_code = 206 if (
-                    test_response.status_code == 206 or content_range or test_response.status_code == 200) else test_response.status_code
-
-                logger.info(
-                    f"Range proxy response: {status_code}, headers: {response_headers}")
-
-                return StreamingResponse(
-                    proxy_range_generator(),
-                    status_code=status_code,
-                    headers=response_headers
-                )
-
-        except Exception as e:
-            logger.error(f"Error proxying range request for {stream_id}: {e}")
-            await self.remove_stream_consumer(stream_id, client_id)
-            raise HTTPException(
-                status_code=500, detail=f"Range proxy failed: {str(e)}")
-
-    async def proxy_hls_segment(self, stream_id: str, client_id: str, segment_url: str, range_header: Optional[str] = None) -> StreamingResponse:
-        """Proxy an individual HLS segment without creating a separate stream"""
-        logger.info(
-            f"Proxying HLS segment for stream {stream_id}, client {client_id}: {segment_url}")
-
-        try:
-            # Prepare headers for the segment request
-            headers = {}
-            if range_header:
-                headers['Range'] = range_header
-
-            # Fetch the segment directly
-            async def segment_generator():
-                bytes_served = 0
-                try:
-                    async with self.http_client.stream('GET', segment_url, headers=headers, follow_redirects=True) as response:
-                        logger.info(
-                            f"HLS segment response: {response.status_code}")
-
-                        # Stream the segment data
-                        async for chunk in response.aiter_bytes(chunk_size=32 * 1024):
-                            yield chunk
-                            bytes_served += len(chunk)
-
-                    logger.info(f"HLS segment completed: {bytes_served} bytes")
-
-                    # Update client's last access time and stats
-                    if client_id in self.clients:
-                        self.clients[client_id].last_access = datetime.now()
-                        self.clients[client_id].bytes_served += bytes_served
-                        self.clients[client_id].segments_served += 1
-
-                    # Update stream stats
-                    if stream_id in self.streams:
-                        self.streams[stream_id].total_bytes_served += bytes_served
-                        self.streams[stream_id].total_segments_served += 1
-                        self.streams[stream_id].last_access = datetime.now()
-
-                    # Update global stats
-                    self._stats.total_bytes_served += bytes_served
-                    self._stats.total_segments_served += 1
-
-                except Exception as e:
-                    logger.error(f"Error streaming HLS segment: {e}")
-                    raise
-
-            # Make a test request to get headers
-            async with self.http_client.stream('GET', segment_url, headers=headers, follow_redirects=True) as test_response:
-                content_type = test_response.headers.get(
-                    'content-type', 'video/MP2T')
-                content_length = test_response.headers.get('content-length')
-
-                response_headers = {
-                    "Content-Type": content_type,
-                    "Cache-Control": "no-cache"
-                }
-
-                if content_length:
-                    response_headers["Content-Length"] = content_length
-
-                status_code = test_response.status_code
-
-                return StreamingResponse(
-                    segment_generator(),
-                    status_code=status_code,
-                    headers=response_headers
-                )
-
-        except Exception as e:
-            logger.error(f"Error proxying HLS segment for {stream_id}: {e}")
-            raise HTTPException(
-                status_code=500, detail=f"HLS segment proxy failed: {str(e)}")
-
-    async def stream_unified_response(self, stream_id: str, client_id: str, is_hls_segment: bool = False, range_header: Optional[str] = None) -> StreamingResponse:
-        """Unified streaming response for both HLS segments and TS streams"""
-        logger.info(
-            f"Creating unified response: stream_id={stream_id}, client_id={client_id}, is_hls_segment={is_hls_segment}, range={range_header}")
-
-        if stream_id not in self.streams:
-            logger.error(f"Stream not found: {stream_id}")
-            raise HTTPException(status_code=404, detail="Stream not found")
-
-        stream_info = self.streams[stream_id]
-
-        # Handle range requests for VOD content
-        if range_header and not is_hls_segment:
-            logger.info(
-                f"Range request received for stream {stream_id}: {range_header}")
-            # Parse range header (e.g., "bytes=2153050439-" or "bytes=0-1023")
-            try:
-                range_match = range_header.replace('bytes=', '').strip()
-                if '-' in range_match:
-                    start_str, end_str = range_match.split('-', 1)
-                    start = int(start_str) if start_str else 0
-                    end = int(end_str) if end_str else None
-
-                    logger.info(
-                        f"Parsed range request: start={start}, end={end}")
-
-                    # Add client as consumer even for range requests to track them properly
-                    await self.add_stream_consumer(stream_id, client_id)
-
-                    # Return range response instead of full stream
-                    return await self._handle_range_request(stream_id, client_id, start, end)
-                else:
-                    logger.warning(
-                        f"Invalid range header format: {range_header}")
-            except Exception as e:
-                logger.error(f"Error parsing range header {range_header}: {e}")
-                # Fall through to normal streaming if range parsing fails
-
-        # Add this client as a consumer
-        consumer_added = await self.add_stream_consumer(stream_id, client_id)
-
-        # Wait for provider connection to start for both HLS and continuous streams
-        await asyncio.sleep(0.1)  # Give provider connection time to start
-
-        # Check if provider connection failed immediately
-        if hasattr(stream_info, 'origin_task') and stream_info.origin_task and stream_info.origin_task.done():
-            try:
-                # Check if the task completed with an exception
-                stream_info.origin_task.result()
-            except Exception as e:
-                logger.error(
-                    f"Provider connection failed for stream {stream_id}: {e}")
-                await self.remove_stream_consumer(stream_id, client_id)
-                raise HTTPException(
-                    status_code=503, detail="Provider connection failed")
-
-        # For continuous streams (non-HLS), wait for initial data to be available
-        if not is_hls_segment:
-            logger.info(
-                f"Waiting for continuous stream data to start for {stream_id}")
-            # Wait up to 5 seconds for the first chunk to arrive
-            wait_start = asyncio.get_event_loop().time()
-            max_wait = 5.0
-
-            while asyncio.get_event_loop().time() - wait_start < max_wait:
-                # Check if we have data in the buffer
-                if not stream_info.stream_buffer.empty():
-                    logger.info(
-                        f"Data available in buffer for stream {stream_id}")
-                    break
-
-                # Check if provider task completed successfully or failed
-                if hasattr(stream_info, 'origin_task') and stream_info.origin_task and stream_info.origin_task.done():
-                    try:
-                        stream_info.origin_task.result()
-                        logger.info(f"Provider task completed for {stream_id}")
-                        # Even if completed, check if we got any data
-                        if not stream_info.stream_buffer.empty():
-                            break
-                        else:
-                            logger.warning(
-                                f"Provider task completed but no data received for {stream_id}")
-                            await self.remove_stream_consumer(stream_id, client_id)
-                            raise HTTPException(
-                                status_code=503, detail="Provider completed but no data received")
-                    except Exception as e:
-                        logger.error(
-                            f"Provider connection failed during wait for stream {stream_id}: {e}")
-                        await self.remove_stream_consumer(stream_id, client_id)
-                        raise HTTPException(
-                            status_code=503, detail=f"Provider connection failed: {e}")
-
-                await asyncio.sleep(0.2)  # Check every 200ms
-
-            # Final check - if still no data available after waiting
-            if stream_info.stream_buffer.empty():
-                logger.warning(
-                    f"No data available after {max_wait}s wait for stream {stream_id}")
-                await self.remove_stream_consumer(stream_id, client_id)
-                raise HTTPException(
-                    status_code=503, detail="No data available from provider after waiting")
-
-            logger.info(
-                f"Stream {stream_id} ready to start - data available in buffer")
-
-        async def generate():
-            try:
-                if is_hls_segment:
-                    # For HLS segments, wait for the complete segment data
-                    segment_data = await self.get_complete_segment_data(stream_id, client_id)
-
-                    if segment_data and len(segment_data) > 0:
-                        logger.info(
-                            f"Yielding HLS segment data: {len(segment_data)} bytes")
-                        yield segment_data
+            except (httpx.TimeoutException, httpx.NetworkError, httpx.HTTPError) as e:
+                logger.warning(f"Stream error for client {client_id}: {type(e).__name__}: {e}")
+
+                # Try seamless failover
+                if stream_info.failover_urls:
+                    logger.info(f"Attempting seamless failover for client {client_id}")
+                    new_response = await self._seamless_failover(stream_id, e)
+                    
+                    if new_response:
+                        # Continue streaming from failover URL
+                        try:
+                            async for chunk in new_response.aiter_bytes(chunk_size=32768):
+                                yield chunk
+                                bytes_served += len(chunk)
+                                chunk_count += 1
+                            
+                            logger.info(f"Failover successful for client {client_id}")
+                        except Exception as failover_error:
+                            logger.error(f"Failover stream also failed: {failover_error}")
+                            await self._emit_event("STREAM_FAILED", stream_id, {
+                                "client_id": client_id,
+                                "error": str(failover_error),
+                                "error_type": "failover_failed"
+                            })
                     else:
-                        # No data available - provider may have failed
-                        logger.warning(
-                            f"No segment data available for stream {stream_id}, client {client_id}")
-                        yield b""
+                        await self._emit_event("STREAM_FAILED", stream_id, {
+                            "client_id": client_id,
+                            "error": str(e),
+                            "error_type": type(e).__name__
+                        })
                 else:
-                    # For continuous streams, keep streaming until client disconnects
-                    logger.info(f"Starting continuous stream for {stream_id}")
-                    yielded_data = False
-                    chunk_count = 0
-                    while stream_info.active_consumers > 0:
-                        chunk = await self.get_stream_data(stream_id, client_id, timeout=30.0)
-                        if chunk is None:
-                            logger.info(
-                                f"End of stream reached for {stream_id}")
-                            break
-                        yield chunk
-                        yielded_data = True
-                        chunk_count += 1
-                        if chunk_count % 50 == 0:
-                            logger.info(
-                                f"Streamed {chunk_count} chunks for {stream_id}")
-
-                    logger.info(
-                        f"Continuous stream ended for {stream_id}, yielded {chunk_count} chunks")
-                    # Ensure we yield something for continuous streams too
-                    if not yielded_data:
-                        logger.warning(
-                            f"No data yielded for continuous stream {stream_id}")
-                        yield b""
+                    await self._emit_event("STREAM_FAILED", stream_id, {
+                        "client_id": client_id,
+                        "error": str(e),
+                        "error_type": type(e).__name__,
+                        "no_failover": True
+                    })
 
             except Exception as e:
-                logger.error(
-                    f"Error in unified stream generator for client {client_id}: {e}")
-                yield b""
+                logger.error(f"Unexpected error for client {client_id}: {e}")
+                await self._emit_event("STREAM_FAILED", stream_id, {
+                    "client_id": client_id,
+                    "error": str(e),
+                    "error_type": "unexpected"
+                })
+
             finally:
-                # Remove this client as a consumer
-                await self.remove_stream_consumer(stream_id, client_id)
-                # Clean up client
+                # CLOSE provider connection immediately when done
+                if response:
+                    try:
+                        await response.aclose()
+                        logger.info(f"Provider connection closed for client {client_id}")
+                    except:
+                        pass
+
+                # Update stats
                 if client_id in self.clients:
-                    await self.cleanup_client(client_id)
-                logger.info(
-                    f"Unified stream consumer {client_id} disconnected from stream {stream_id}")
+                    self.clients[client_id].bytes_served += bytes_served
+                    self.clients[client_id].last_access = datetime.now()
+                
+                if stream_id in self.streams:
+                    self.streams[stream_id].total_bytes_served += bytes_served
+                    self.streams[stream_id].last_access = datetime.now()
+                
+                self._stats.total_bytes_served += bytes_served
+
+                # Cleanup client
+                await self.cleanup_client(client_id)
 
         # Determine content type
-        stream_url = stream_info.current_url or stream_info.original_url
-
-        if stream_url.endswith('.ts') or '/live/' in stream_url:
+        if current_url.endswith('.ts') or '/live/' in current_url:
             content_type = "video/mp2t"
-        elif stream_url.endswith('.m3u8'):
-            content_type = "application/vnd.apple.mpegurl"
-        elif stream_url.endswith('.mp4'):
+        elif current_url.endswith('.mp4'):
             content_type = "video/mp4"
+        elif current_url.endswith('.mkv'):
+            content_type = "video/x-matroska"
+        elif current_url.endswith('.webm'):
+            content_type = "video/webm"
         else:
             content_type = "application/octet-stream"
 
-        logger.info(
-            f"Starting stream response for {stream_id} with content-type: {content_type}")
-
-        # Build headers, ensuring no None values
         headers = {
             "Content-Type": content_type,
             "Cache-Control": "no-cache, no-store, must-revalidate",
             "Pragma": "no-cache",
             "Expires": "0",
-            "Accept-Ranges": "bytes"  # Enable range request support
+            "Accept-Ranges": "bytes"
         }
 
-        # Only add Transfer-Encoding if it's not an HLS segment
-        if not is_hls_segment:
-            headers["Transfer-Encoding"] = "chunked"
+        return StreamingResponse(generate(), media_type=content_type, headers=headers)
 
-        try:
-            response = StreamingResponse(
-                generate(),
-                media_type=content_type,
-                headers=headers
-            )
-            logger.info(
-                f"StreamingResponse created successfully for {stream_id}")
-            return response
-        except Exception as e:
-            logger.error(
-                f"Error creating StreamingResponse for {stream_id}: {e}")
-            raise
-
-    async def start_live_stream(self, stream_id: str) -> bool:
-        """Start the origin connection for a live stream"""
+    async def _seamless_failover(self, stream_id: str, error: Exception) -> Optional[httpx.Response]:
+        """
+        Attempt seamless failover to next URL.
+        Returns new response object if successful, None if all failovers exhausted.
+        """
         if stream_id not in self.streams:
-            return False
+            return None
 
         stream_info = self.streams[stream_id]
+        
+        if not stream_info.failover_urls:
+            logger.warning(f"No failover URLs available for stream {stream_id}")
+            return None
 
-        # Only start if it's a live stream and not already running
-        if not stream_info.is_live_stream or stream_info.origin_task:
-            return False
+        # Try next failover URL
+        next_index = (stream_info.current_failover_index + 1) % len(stream_info.failover_urls)
+        next_url = stream_info.failover_urls[next_index]
 
-        logger.info(f"Starting live stream origin connection for {stream_id}")
-
-        # Start the origin fetching task
-        stream_info.origin_task = asyncio.create_task(
-            self._fetch_live_stream(stream_id)
-        )
-
-        return True
-
-    async def _fetch_live_stream(self, stream_id: str):
-        """Fetch live stream from origin and distribute to clients"""
-        if stream_id not in self.streams:
-            return
-
-        stream_info = self.streams[stream_id]
-        current_url = stream_info.current_url or stream_info.original_url
+        logger.info(f"Attempting failover for stream {stream_id} to: {next_url}")
 
         try:
-            logger.info(f"Fetching live stream from: {current_url}")
-
-            # Prepare headers
             headers = {
                 'User-Agent': stream_info.user_agent,
-                'Referer': f"{urlparse(current_url).scheme}://{urlparse(current_url).netloc}/",
-                'Origin': f"{urlparse(current_url).scheme}://{urlparse(current_url).netloc}",
-                'Accept': '*/*',
-                'Connection': 'keep-alive'
+                'Referer': f"{urlparse(next_url).scheme}://{urlparse(next_url).netloc}/",
+                'Origin': f"{urlparse(next_url).scheme}://{urlparse(next_url).netloc}",
+                'Accept': '*/*'
             }
 
-            # Use appropriate client
-            is_live_stream = current_url.endswith(
-                '.ts') or '/live/' in current_url
-            client_to_use = self.live_stream_client if is_live_stream else self.http_client
+            client_to_use = self.live_stream_client if stream_info.is_live_continuous else self.http_client
+            
+            # Open new connection to failover URL
+            new_response = await client_to_use.stream('GET', next_url, headers=headers, follow_redirects=True).__aenter__()
+            new_response.raise_for_status()
 
-            async with client_to_use.stream('GET', current_url, headers=headers, follow_redirects=True) as response:
-                response.raise_for_status()
+            # Update stream info
+            old_url = stream_info.current_url
+            stream_info.current_url = next_url
+            stream_info.current_failover_index = next_index
+            stream_info.failover_attempts += 1
+            stream_info.last_failover_time = datetime.now()
 
-                logger.info(
-                    f"Connected to live stream: {response.status_code}, Content-Type: {response.headers.get('content-type')}")
+            logger.info(f"Seamless failover successful for stream {stream_id}")
 
-                chunk_count = 0
-                bytes_served = 0
+            await self._emit_event("FAILOVER_TRIGGERED", stream_id, {
+                "old_url": old_url,
+                "new_url": next_url,
+                "failover_index": next_index,
+                "attempt_number": stream_info.failover_attempts,
+                "reason": str(error),
+                "seamless": True
+            })
 
-                async for chunk in response.aiter_bytes(chunk_size=32768):
-                    if not stream_info.is_active or not stream_info.connected_clients:
-                        logger.info(
-                            f"Stopping live stream {stream_id} - no active clients")
-                        break
-
-                    bytes_served += len(chunk)
-                    chunk_count += 1
-
-                    if chunk_count == 1:
-                        logger.info(
-                            f"Live stream {stream_id} first chunk: {len(chunk)} bytes")
-                    elif chunk_count % 100 == 0:
-                        logger.debug(
-                            f"Live stream {stream_id} chunk {chunk_count}, total: {bytes_served} bytes, clients: {len(stream_info.connected_clients)}")
-
-                    # Distribute chunk to all connected clients
-                    disconnected_clients = []
-                    for client_id in list(stream_info.connected_clients):
-                        if client_id in self.clients:
-                            client_info = self.clients[client_id]
-                            try:
-                                # Try to put chunk in client queue (non-blocking)
-                                client_info.data_queue.put_nowait(chunk)
-                                client_info.bytes_served += len(chunk)
-                                client_info.last_access = datetime.now()
-                            except asyncio.QueueFull:
-                                # Client not consuming fast enough, disconnect them
-                                logger.warning(
-                                    f"Client {client_id} queue full, disconnecting")
-                                disconnected_clients.append(client_id)
-                        else:
-                            disconnected_clients.append(client_id)
-
-                    # Clean up disconnected clients
-                    for client_id in disconnected_clients:
-                        stream_info.connected_clients.discard(client_id)
-                        if client_id in self.clients:
-                            self.clients[client_id].is_connected = False
-
-                logger.info(
-                    f"Live stream {stream_id} completed: {chunk_count} chunks, {bytes_served} bytes")
+            return new_response
 
         except Exception as e:
-            logger.error(f"Error in live stream {stream_id}: {e}")
-            stream_info.error_count += 1
-        finally:
-            # Clean up
-            stream_info.origin_task = None
-            for client_id in list(stream_info.connected_clients):
-                if client_id in self.clients:
-                    # Signal end of stream
-                    try:
-                        self.clients[client_id].data_queue.put_nowait(None)
-                    except asyncio.QueueFull:
-                        pass
-            stream_info.connected_clients.clear()
-            logger.info(f"Live stream {stream_id} origin connection closed")
+            logger.error(f"Failover attempt failed for stream {stream_id}: {e}")
+            stream_info.failover_attempts += 1
+            
+            # Try next failover URL recursively if available
+            if stream_info.failover_attempts < len(stream_info.failover_urls) * stream_info.max_retries:
+                return await self._seamless_failover(stream_id, e)
+            
+            return None
+
+    # ============================================================================
+    # HLS SUPPORT (Keep existing shared approach - it works!)
+    # ============================================================================
 
     async def get_playlist_content(
         self,
@@ -1183,7 +571,7 @@ class StreamManager:
         client_id: str,
         base_proxy_url: str
     ) -> Optional[str]:
-        """Get and process playlist content for a stream"""
+        """Get and process playlist content for HLS streams"""
         if stream_id not in self.streams:
             return None
 
@@ -1191,23 +579,15 @@ class StreamManager:
         current_url = stream_info.current_url or stream_info.original_url
 
         try:
-            logger.info(f"Fetching playlist from: {current_url}")
-            # Use stream-specific user agent
+            logger.info(f"Fetching HLS playlist from: {current_url}")
             headers = {'User-Agent': stream_info.user_agent}
             response = await self.http_client.get(current_url, headers=headers)
             response.raise_for_status()
 
             content = response.text
-            logger.info(f"Received playlist content ({len(content)} chars)")
-
-            # Use the final URL after redirects for authentication
             final_url = str(response.url)
-            logger.info(f"Final playlist URL after redirects: {final_url}")
-
-            # Store the final URL in stream info for segment authentication
             stream_info.final_playlist_url = final_url
 
-            # Determine base URL for resolving relative URLs
             parsed_url = urlparse(final_url)
             base_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
             if parsed_url.path:
@@ -1219,13 +599,9 @@ class StreamManager:
             else:
                 base_url += '/'
 
-            # Process the playlist - use final URL for authentication headers
-            processor = M3U8Processor(
-                base_proxy_url, client_id, stream_info.user_agent, final_url)
-            processed_content = processor.process_playlist(
-                content, base_proxy_url, base_url)
+            processor = M3U8Processor(base_proxy_url, client_id, stream_info.user_agent, final_url)
+            processed_content = processor.process_playlist(content, base_proxy_url, base_url)
 
-            # Update stats
             stream_info.last_access = datetime.now()
             if client_id in self.clients:
                 self.clients[client_id].last_access = datetime.now()
@@ -1233,279 +609,94 @@ class StreamManager:
             return processed_content
 
         except Exception as e:
-            logger.error(
-                f"Error fetching playlist for stream {stream_id}: {e}")
-
-            # Try failover if available
-            if await self._try_failover(stream_id):
-                return await self.get_playlist_content(stream_id, client_id, base_proxy_url)
-
+            logger.error(f"Error fetching playlist for stream {stream_id}: {e}")
             stream_info.error_count += 1
             return None
 
-    async def proxy_segment(
+    async def proxy_hls_segment(
         self,
-        segment_url: str,
+        stream_id: str,
         client_id: str,
-        range_header: Optional[str] = None,
-        additional_headers: Optional[dict] = None
-    ) -> AsyncIterator[bytes]:
-        """Proxy a segment request directly"""
-        try:
-            logger.info(
-                f"Client {client_id} requesting segment: {segment_url}")
+        segment_url: str,
+        range_header: Optional[str] = None
+    ) -> StreamingResponse:
+        """Proxy individual HLS segment - direct pass-through"""
+        logger.info(f"Proxying HLS segment for stream {stream_id}, client {client_id}")
 
-            # Prepare headers with proper authentication
-            # Start with minimal headers - User-Agent will be set from stream info or additional headers
-            headers = {}
-
-            # Set default User-Agent as fallback
-            headers['User-Agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36'
-
-            # Add any additional headers passed from the API request (h_ query parameters take precedence over defaults)
-            if additional_headers:
-                headers.update(additional_headers)
-                logger.info(f"Added additional headers: {additional_headers}")
-
-            # Get headers from client's stream if available - stream user agent takes highest precedence
-            if client_id in self.clients:
-                client_info = self.clients[client_id]
-                if client_info.stream_id and client_info.stream_id in self.streams:
-                    stream_info = self.streams[client_info.stream_id]
-                    # Stream's user agent takes precedence over all other user agents
-                    headers['User-Agent'] = stream_info.user_agent
-
-                    # Add authentication headers based on final playlist URL (after redirects)
-                    from urllib.parse import urlparse
-                    # Use final playlist URL if available, otherwise fall back to original URL
-                    auth_url = stream_info.final_playlist_url or stream_info.original_url
-                    auth_parsed = urlparse(auth_url)
-                    segment_parsed = urlparse(segment_url)
-
-                    # Set Referer to the actual playlist domain for authentication
-                    headers['Referer'] = f"{auth_parsed.scheme}://{auth_parsed.netloc}/"
-                    headers['Origin'] = f"{auth_parsed.scheme}://{auth_parsed.netloc}"
-
-                    # Add Accept header for TS segments
-                    headers['Accept'] = '*/*'
-                    headers['Accept-Encoding'] = 'gzip, deflate, br'
-                    headers['Accept-Language'] = 'en-US,en;q=0.9'
-                    headers['Connection'] = 'keep-alive'
-
-                    # Log authentication headers being used
-                    logger.info(
-                        f"Using stream user agent: {stream_info.user_agent}")
-                    logger.info(f"Using authentication URL: {auth_url}")
-                    logger.info(
-                        f"Using authentication headers for segment request: Referer={headers['Referer']}, Origin={headers['Origin']}")
-
-            if range_header:
-                headers['Range'] = range_header
-                logger.info(f"Range request: {range_header}")
-
-            # Handle redirects manually for streaming
-            current_url = segment_url
-            max_redirects = 10
-            redirect_count = 0
+        async def segment_generator():
             bytes_served = 0
+            try:
+                headers = {}
+                if range_header:
+                    headers['Range'] = range_header
 
-            # Use appropriate HTTP client based on URL/stream type
-            # Live MPEG-TS streams (.ts URLs) need longer timeouts
-            is_live_stream = segment_url.endswith(
-                '.ts') or '/live/' in segment_url
-            client_to_use = self.live_stream_client if is_live_stream else self.http_client
+                # Get stream info for user agent
+                if stream_id in self.streams:
+                    headers['User-Agent'] = self.streams[stream_id].user_agent
 
-            if is_live_stream:
-                logger.debug("Using live stream client with extended timeouts")
+                async with self.http_client.stream('GET', segment_url, headers=headers, follow_redirects=True) as response:
+                    response.raise_for_status()
+                    
+                    async for chunk in response.aiter_bytes(chunk_size=32768):
+                        yield chunk
+                        bytes_served += len(chunk)
 
-            while redirect_count < max_redirects:
-                try:
-                    async with client_to_use.stream('GET', current_url, headers=headers, follow_redirects=False) as response:
-                        # Handle redirects manually
-                        if response.status_code in (301, 302, 303, 307, 308):
-                            location = response.headers.get('location')
-                            if not location:
-                                logger.error(
-                                    f"Redirect response without location header for {current_url}")
-                                response.raise_for_status()
-                                return
+                # Update stats
+                if client_id in self.clients:
+                    self.clients[client_id].bytes_served += bytes_served
+                    self.clients[client_id].segments_served += 1
+                    self.clients[client_id].last_access = datetime.now()
 
-                            # Handle relative redirects
-                            if location.startswith('/'):
-                                from urllib.parse import urlparse, urljoin
-                                parsed_url = urlparse(current_url)
-                                base_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
-                                current_url = urljoin(base_url, location)
-                            elif not location.startswith('http'):
-                                from urllib.parse import urljoin
-                                current_url = urljoin(current_url, location)
-                            else:
-                                current_url = location
+                if stream_id in self.streams:
+                    self.streams[stream_id].total_bytes_served += bytes_served
+                    self.streams[stream_id].total_segments_served += 1
+                    self.streams[stream_id].last_access = datetime.now()
 
-                            redirect_count += 1
-                            logger.info(
-                                f"Following redirect {redirect_count}/{max_redirects}: {segment_url} -> {current_url}")
-                            continue
+                self._stats.total_bytes_served += bytes_served
+                self._stats.total_segments_served += 1
 
-                        # Not a redirect, process the response
-                        logger.info(
-                            f"Streaming segment from final URL: {current_url} (after {redirect_count} redirects)")
-                        logger.info(
-                            f"Response status: {response.status_code}, Content-Type: {response.headers.get('content-type', 'unknown')}")
+            except Exception as e:
+                logger.error(f"Error streaming HLS segment: {e}")
+                raise
 
-                        response.raise_for_status()
+        return StreamingResponse(
+            segment_generator(),
+            media_type="video/MP2T",
+            headers={"Cache-Control": "no-cache"}
+        )
 
-                        # Log the content length if available
-                        content_length = response.headers.get('content-length')
-                        if content_length:
-                            logger.info(
-                                f"Expected content length: {content_length} bytes")
-                        else:
-                            logger.info(
-                                "Content length unknown (likely live stream)")
+    # ============================================================================
+    # HEALTH CHECKS AND CLEANUP
+    # ============================================================================
 
-                        # Use larger chunk size for MPEG-TS streams (188 bytes * 32 = 6016, rounded to 8KB)
-                        # This improves performance for continuous streams
-                        chunk_size = 32768  # 32KB chunks for better MPEG-TS performance
+    async def _periodic_health_check(self):
+        """Periodic health check for streams"""
+        while self._running:
+            try:
+                for stream_id, stream_info in list(self.streams.items()):
+                    if stream_info.client_count == 0:
+                        continue
 
-                        chunk_count = 0
-                        last_log_count = 0
-                        async for chunk in response.aiter_bytes(chunk_size=chunk_size):
-                            bytes_served += len(chunk)
-                            chunk_count += 1
-                            if chunk_count == 1:
-                                logger.info(
-                                    f"First chunk received: {len(chunk)} bytes (using {chunk_size} byte chunks)")
-                            elif chunk_count - last_log_count >= 50:  # Log every 50 chunks instead of 100
-                                logger.debug(
-                                    f"Streaming chunk {chunk_count}, total bytes: {bytes_served}")
-                                last_log_count = chunk_count
-                            yield chunk
+                    if (stream_info.last_health_check is None or
+                        (datetime.now() - stream_info.last_health_check).total_seconds() >= stream_info.health_check_interval):
+                        
+                        is_healthy = await self._health_check_stream(stream_id)
+                        
+                        if not is_healthy and stream_info.failover_urls:
+                            logger.warning(f"Stream {stream_id} failed health check, marking for failover")
+                            # For direct proxy, failover happens per-client during streaming
+                            # Just update the current_url so new connections use the failover
+                            await self._try_update_failover_url(stream_id)
 
-                        logger.info(
-                            f"Finished streaming {chunk_count} chunks, {bytes_served} total bytes")
-                        break  # Successfully streamed, exit the redirect loop
-
-                except Exception as e:
-                    logger.error(
-                        f"Error during redirect {redirect_count} for {current_url}: {e}")
-                    if redirect_count == 0:
-                        # If first request fails, re-raise the error
-                        raise
-                    else:
-                        # If a redirect fails, try to continue with what we have
-                        break
-
-            if redirect_count >= max_redirects:
-                logger.error(
-                    f"Too many redirects ({max_redirects}) for segment: {segment_url}")
-                raise Exception(
-                    f"Too many redirects for segment: {segment_url}")
-
-            # Update client stats
-            if client_id in self.clients:
-                client_info = self.clients[client_id]
-                client_info.bytes_served += bytes_served
-                client_info.segments_served += 1
-                client_info.last_access = datetime.now()
-
-                # Update stream stats
-                if client_info.stream_id and client_info.stream_id in self.streams:
-                    stream_info = self.streams[client_info.stream_id]
-                    stream_info.total_bytes_served += bytes_served
-                    stream_info.total_segments_served += 1
-                    stream_info.last_access = datetime.now()
-
-            # Update global stats
-            self._stats.total_bytes_served += bytes_served
-            self._stats.total_segments_served += 1
-
-        except Exception as e:
-            logger.error(f"Error proxying segment for client {client_id}: {e}")
-            raise
-
-    async def _try_failover(self, stream_id: str, reason: str = "connection_failed") -> bool:
-        """Try to failover to next available URL with exponential backoff"""
-        if stream_id not in self.streams:
-            return False
-
-        stream_info = self.streams[stream_id]
-
-        if not stream_info.failover_urls:
-            logger.warning(
-                f"No failover URLs available for stream {stream_id}")
-            return False
-
-        # Check if we've exceeded maximum retry attempts
-        if stream_info.failover_attempts >= len(stream_info.failover_urls) * stream_info.max_retries:
-            logger.error(
-                f"Maximum failover attempts exceeded for stream {stream_id}")
-            return False
-
-        # Calculate backoff delay
-        backoff_delay = min(30.0, stream_info.backoff_factor **
-                            stream_info.failover_attempts)
-
-        # If this is not the first attempt, apply backoff
-        if stream_info.last_failover_time:
-            time_since_last = (
-                datetime.now() - stream_info.last_failover_time).total_seconds()
-            if time_since_last < backoff_delay:
-                remaining_wait = backoff_delay - time_since_last
-                logger.info(
-                    f"Applying backoff for stream {stream_id}: waiting {remaining_wait:.1f}s")
-                await asyncio.sleep(remaining_wait)
-
-        # Try next failover URL
-        next_index = (stream_info.current_failover_index +
-                      1) % len(stream_info.failover_urls)
-        next_url = stream_info.failover_urls[next_index]
-
-        logger.info(
-            f"Attempting failover #{stream_info.failover_attempts + 1} for stream {stream_id} to: {next_url} (reason: {reason})")
-
-        try:
-            # Test the failover URL with stream's user agent and custom timeouts
-            headers = {'User-Agent': stream_info.user_agent}
-            timeout = httpx.Timeout(
-                connect=stream_info.connection_timeout, read=30.0, write=10.0, pool=10.0)
-            response = await self.http_client.head(next_url, headers=headers, timeout=timeout)
-            response.raise_for_status()
-
-            # Failover successful - reset counters and update stream
-            old_url = stream_info.current_url
-            stream_info.current_url = next_url
-            stream_info.current_failover_index = next_index
-            stream_info.failover_attempts += 1
-            stream_info.last_failover_time = datetime.now()
-
-            logger.info(f"Failover successful for stream {stream_id}")
-
-            # Emit failover event with enhanced data
-            await self._emit_event(
-                "FAILOVER_TRIGGERED",
-                stream_id,
-                {
-                    "old_url": old_url,
-                    "new_url": next_url,
-                    "failover_index": next_index,
-                    "attempt_number": stream_info.failover_attempts,
-                    "reason": reason,
-                    "backoff_applied": backoff_delay
-                }
-            )
-
-            return True
-
-        except Exception as e:
-            stream_info.failover_attempts += 1
-            stream_info.last_failover_time = datetime.now()
-            logger.error(
-                f"Failover attempt #{stream_info.failover_attempts} failed for stream {stream_id}: {e}")
-            return False
+                await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Error in periodic health check: {e}")
+                await asyncio.sleep(60)
 
     async def _health_check_stream(self, stream_id: str) -> bool:
-        """Perform health check on a stream URL"""
+        """Check if stream URL is healthy"""
         if stream_id not in self.streams:
             return False
 
@@ -1514,293 +705,34 @@ class StreamManager:
 
         try:
             headers = {'User-Agent': stream_info.user_agent}
-            timeout = httpx.Timeout(connect=10.0, read=30.0, write=10.0, pool=10.0)
-
-            # For HLS streams, check the playlist; for others, do a HEAD request
-            if current_url.endswith('.m3u8'):
-                response = await self.http_client.get(current_url, headers=headers, timeout=timeout)
+            if stream_info.is_hls:
+                response = await self.http_client.get(current_url, headers=headers, timeout=10.0)
             else:
-                response = await self.http_client.head(current_url, headers=headers, timeout=timeout)
-
+                response = await self.http_client.head(current_url, headers=headers, timeout=10.0)
+            
             response.raise_for_status()
             stream_info.last_health_check = datetime.now()
             return True
-
         except Exception as e:
             logger.warning(f"Health check failed for stream {stream_id}: {e}")
             return False
 
-    async def _periodic_health_check(self):
-        """Periodic health check for all active streams"""
-        while self._running:
-            try:
-                current_time = datetime.now()
+    async def _try_update_failover_url(self, stream_id: str) -> bool:
+        """Update to next failover URL for future connections"""
+        if stream_id not in self.streams:
+            return False
 
-                for stream_id, stream_info in list(self.streams.items()):
-                    # Only check streams with active consumers
-                    if stream_info.active_consumers == 0:
-                        continue
+        stream_info = self.streams[stream_id]
+        if not stream_info.failover_urls:
+            return False
 
-                    # Check if health check is due
-                    if (stream_info.last_health_check is None or
-                            (current_time - stream_info.last_health_check).total_seconds() >= stream_info.health_check_interval):
-
-                        logger.debug(
-                            f"Running health check for stream {stream_id}")
-
-                        # Perform health check
-                        is_healthy = await self._health_check_stream(stream_id)
-
-                        if not is_healthy and len(stream_info.failover_urls) > 0:
-                            logger.warning(
-                                f"Stream {stream_id} failed health check, attempting failover")
-                            success = await self._try_failover(stream_id, "health_check_failed")
-
-                            if success:
-                                logger.info(
-                                    f"Proactive failover successful for stream {stream_id}")
-                            else:
-                                logger.error(
-                                    f"Proactive failover failed for stream {stream_id}")
-
-                await asyncio.sleep(60)  # Check every minute
-
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error(f"Error in periodic health check: {e}")
-                await asyncio.sleep(60)
-
-    def _update_connection_pool_stats(self):
-        """Update connection pool statistics"""
-        try:
-            # Count active provider connections
-            active_connections = sum(1 for stream in self.streams.values()
-                                     if stream.origin_task and not stream.origin_task.done())
-
-            # Count connection reuse (multiple clients per stream)
-            shared_connections = sum(1 for stream in self.streams.values()
-                                     if stream.active_consumers > 1)
-
-            # Calculate connection efficiency
-            total_consumers = sum(
-                stream.active_consumers for stream in self.streams.values())
-            connection_efficiency = (
-                total_consumers / max(1, active_connections)) if active_connections > 0 else 0
-
-            self._stats.connection_pool_stats = {
-                "active_provider_connections": active_connections,
-                "total_streams": len(self.streams),
-                "shared_connections": shared_connections,
-                "total_consumers": total_consumers,
-                "connection_efficiency": round(connection_efficiency, 2),
-                "average_consumers_per_connection": round(total_consumers / max(1, active_connections), 2)
-            }
-
-        except Exception as e:
-            logger.error(f"Error updating connection pool stats: {e}")
-
-    def _update_failover_stats(self):
-        """Update failover statistics"""
-        try:
-            total_failovers = sum(
-                stream.failover_attempts for stream in self.streams.values())
-            streams_with_failover = sum(1 for stream in self.streams.values()
-                                        if len(stream.failover_urls) > 0)
-            failed_streams = sum(1 for stream in self.streams.values()
-                                 if stream.error_count > 0)
-
-            self._stats.failover_stats = {
-                "total_failover_attempts": total_failovers,
-                "streams_with_failover_urls": streams_with_failover,
-                "failed_streams": failed_streams,
-                "failover_success_rate": 0.0  # Will be calculated based on events
-            }
-
-        except Exception as e:
-            logger.error(f"Error updating failover stats: {e}")
-
-    def _update_performance_metrics(self):
-        """Update performance metrics"""
-        try:
-            current_time = datetime.now()
-            uptime_seconds = (
-                current_time - self._stats.uptime_start).total_seconds()
-
-            # Calculate throughput metrics
-            bytes_per_second = self._stats.total_bytes_served / \
-                max(1, uptime_seconds)
-            segments_per_second = self._stats.total_segments_served / \
-                max(1, uptime_seconds)
-
-            # Calculate average stream duration
-            total_stream_duration = sum((current_time - stream.created_at).total_seconds()
-                                        for stream in self.streams.values())
-            avg_stream_duration = total_stream_duration / \
-                max(1, len(self.streams))
-
-            self._stats.performance_metrics = {
-                "uptime_seconds": int(uptime_seconds),
-                "bytes_per_second": round(bytes_per_second, 2),
-                "segments_per_second": round(segments_per_second, 2),
-                "average_stream_duration_seconds": round(avg_stream_duration, 2),
-                "memory_usage_mb": 0  # Can be enhanced with psutil if needed
-            }
-
-        except Exception as e:
-            logger.error(f"Error updating performance metrics: {e}")
-
-    def _update_error_stats(self):
-        """Update error statistics"""
-        try:
-            total_errors = sum(
-                stream.error_count for stream in self.streams.values())
-            error_rate = total_errors / max(1, len(self.streams))
-
-            # Categorize streams by health
-            healthy_streams = sum(1 for stream in self.streams.values()
-                                  if stream.error_count == 0 and stream.is_active)
-            problematic_streams = sum(1 for stream in self.streams.values()
-                                      if stream.error_count > 0)
-
-            self._stats.error_stats = {
-                "total_errors": total_errors,
-                "error_rate": round(error_rate, 2),
-                "healthy_streams": healthy_streams,
-                "problematic_streams": problematic_streams,
-                "error_distribution": {}  # Can be enhanced to track error types
-            }
-
-        except Exception as e:
-            logger.error(f"Error updating error stats: {e}")
-
-    async def _monitoring_update_task(self):
-        """Periodic task to update monitoring statistics"""
-        while self._running:
-            try:
-                self._update_connection_pool_stats()
-                self._update_failover_stats()
-                self._update_performance_metrics()
-                self._update_error_stats()
-
-                # Check for connection pool health issues every few cycles
-                if not hasattr(self, '_health_check_counter'):
-                    self._health_check_counter = 0
-                self._health_check_counter += 1
-
-                # Every 2 minutes (4 * 30s)
-                if self._health_check_counter >= 4:
-                    await self._check_connection_pool_health()
-                    self._health_check_counter = 0
-
-                # Log important metrics periodically
-                if hasattr(self, '_last_metrics_log'):
-                    time_since_log = (
-                        datetime.now() - self._last_metrics_log).total_seconds()
-                    if time_since_log >= 300:  # Log every 5 minutes
-                        self._log_key_metrics()
-                        self._last_metrics_log = datetime.now()
-                else:
-                    self._last_metrics_log = datetime.now()
-
-                await asyncio.sleep(30)  # Update every 30 seconds
-
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error(f"Error in monitoring update task: {e}")
-                await asyncio.sleep(30)
-
-    def _log_key_metrics(self):
-        """Log key performance metrics"""
-        try:
-            pool_stats = self._stats.connection_pool_stats
-            perf_stats = self._stats.performance_metrics
-
-            logger.info(f"Stream Manager Metrics: "
-                        f"Connections: {pool_stats.get('active_provider_connections', 0)}, "
-                        f"Streams: {pool_stats.get('total_streams', 0)}, "
-                        f"Efficiency: {pool_stats.get('connection_efficiency', 0)}x, "
-                        f"Throughput: {perf_stats.get('bytes_per_second', 0):.1f} B/s, "
-                        f"Errors: {self._stats.error_stats.get('total_errors', 0)}")
-
-        except Exception as e:
-            logger.error(f"Error logging key metrics: {e}")
-
-    async def _check_connection_pool_health(self):
-        """Check for connection pool issues and alert if needed"""
-        try:
-            pool_stats = self._stats.connection_pool_stats
-            error_stats = self._stats.error_stats
-
-            # Alert if connection efficiency is too low (too many connections for few consumers)
-            efficiency = pool_stats.get('connection_efficiency', 0)
-            if efficiency < 0.5 and pool_stats.get('active_provider_connections', 0) > 5:
-                await self._emit_event("CONNECTION_POOL_ALERT", "system", {
-                    "alert_type": "low_efficiency",
-                    "efficiency": efficiency,
-                    "active_connections": pool_stats.get('active_provider_connections', 0),
-                    "message": f"Low connection efficiency: {efficiency:.2f} consumers per connection"
-                })
-                logger.warning(
-                    f"Connection pool efficiency is low: {efficiency:.2f}")
-
-            # Alert if error rate is too high
-            error_rate = error_stats.get('error_rate', 0)
-            # More than 30% error rate
-            if error_rate > 0.3 and len(self.streams) > 5:
-                await self._emit_event("CONNECTION_POOL_ALERT", "system", {
-                    "alert_type": "high_error_rate",
-                    "error_rate": error_rate,
-                    "total_streams": len(self.streams),
-                    "message": f"High error rate detected: {error_rate:.2f} errors per stream"
-                })
-                logger.warning(f"High error rate detected: {error_rate:.2f}")
-
-            # Alert if too many connections without consumers (potential leaks)
-            active_connections = pool_stats.get(
-                'active_provider_connections', 0)
-            total_consumers = pool_stats.get('total_consumers', 0)
-            if active_connections > 10 and total_consumers == 0:
-                await self._emit_event("CONNECTION_POOL_ALERT", "system", {
-                    "alert_type": "potential_connection_leak",
-                    "active_connections": active_connections,
-                    "total_consumers": total_consumers,
-                    "message": f"Detected {active_connections} active connections with no consumers"
-                })
-                logger.error(
-                    f"Potential connection leak: {active_connections} connections, 0 consumers")
-
-        except Exception as e:
-            logger.error(f"Error checking connection pool health: {e}")
-
-    async def cleanup_client(self, client_id: str):
-        """Clean up a client"""
-        if client_id in self.clients:
-            client_info = self.clients[client_id]
-
-            # Emit client disconnected event
-            await self._emit_event(
-                "CLIENT_DISCONNECTED",
-                client_info.stream_id or "unknown",
-                {
-                    "client_id": client_id,
-                    "bytes_served": client_info.bytes_served,
-                    "segments_served": client_info.segments_served
-                }
-            )
-
-            # Remove from stream
-            if client_info.stream_id and client_info.stream_id in self.stream_clients:
-                self.stream_clients[client_info.stream_id].discard(client_id)
-                if client_info.stream_id in self.streams:
-                    self.streams[client_info.stream_id].client_count = len(
-                        self.stream_clients[client_info.stream_id]
-                    )
-
-            del self.clients[client_id]
-            self._stats.active_clients -= 1
-            logger.info(f"Cleaned up client: {client_id}")
+        next_index = (stream_info.current_failover_index + 1) % len(stream_info.failover_urls)
+        old_url = stream_info.current_url
+        stream_info.current_url = stream_info.failover_urls[next_index]
+        stream_info.current_failover_index = next_index
+        
+        logger.info(f"Updated failover URL for stream {stream_id}: {old_url} -> {stream_info.current_url}")
+        return True
 
     async def _periodic_cleanup(self):
         """Periodic cleanup of inactive clients and streams"""
@@ -1808,7 +740,7 @@ class StreamManager:
             try:
                 await self._cleanup_inactive_clients()
                 await self._cleanup_inactive_streams()
-                await asyncio.sleep(30)  # Run every 30 seconds
+                await asyncio.sleep(30)
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -1833,13 +765,8 @@ class StreamManager:
         inactive_streams = []
 
         for stream_id, stream_info in self.streams.items():
-            # Check if stream has any active clients
-            has_active_clients = stream_id in self.stream_clients and len(
-                self.stream_clients[stream_id]) > 0
-
-            # Check if stream is old and unused
-            is_old = (current_time -
-                      stream_info.last_access).seconds > self.stream_timeout
+            has_active_clients = stream_id in self.stream_clients and len(self.stream_clients[stream_id]) > 0
+            is_old = (current_time - stream_info.last_access).seconds > self.stream_timeout
 
             if not has_active_clients and is_old:
                 inactive_streams.append(stream_id)
@@ -1852,161 +779,10 @@ class StreamManager:
                 self._stats.active_streams -= 1
                 logger.info(f"Cleaned up inactive stream: {stream_id}")
 
-    async def stream_to_client(self, stream_id: str, client_id: str):
-        """Stream data from client queue for live streams"""
-        if stream_id not in self.streams or client_id not in self.clients:
-            logger.error(f"Stream {stream_id} or client {client_id} not found")
-            raise HTTPException(
-                status_code=404, detail="Stream or client not found")
-
-        stream_info = self.streams[stream_id]
-        client_info = self.clients[client_id]
-
-        # For live streams, use queue-based streaming
-        if stream_info.is_live_stream:
-            async def generate():
-                try:
-                    while client_info.is_connected and stream_info.is_active:
-                        try:
-                            # Wait for data with timeout using asyncio.Queue's get method
-                            chunk = await asyncio.wait_for(
-                                client_info.data_queue.get(),
-                                timeout=30.0
-                            )
-
-                            # None signals end of stream
-                            if chunk is None:
-                                logger.info(
-                                    f"End of stream signal for client {client_id}")
-                                break
-
-                            yield chunk
-
-                        except asyncio.TimeoutError:
-                            logger.debug(
-                                f"Timeout waiting for data for client {client_id}")
-                            # Check if stream is still active
-                            if not stream_info.is_active:
-                                break
-
-                        except Exception as e:
-                            logger.error(
-                                f"Error streaming to client {client_id}: {e}")
-                            break
-
-                except Exception as e:
-                    logger.error(
-                        f"Error in stream generator for client {client_id}: {e}")
-                finally:
-                    # Mark client as disconnected
-                    client_info.is_connected = False
-                    stream_info.connected_clients.discard(client_id)
-                    logger.info(
-                        f"Client {client_id} disconnected from stream {stream_id}")
-
-                    # For live streams, clean up client immediately instead of waiting for periodic cleanup
-                    if stream_info.is_live_stream:
-                        try:
-                            await self.cleanup_client(client_id)
-                        except Exception as e:
-                            logger.error(
-                                f"Error during immediate client cleanup: {e}")
-
-            return StreamingResponse(
-                generate(),
-                media_type="video/mp2t",
-                headers={
-                    "Content-Type": "video/mp2t",
-                    "Cache-Control": "no-cache, no-store, must-revalidate",
-                    "Pragma": "no-cache",
-                    "Expires": "0",
-                    "Transfer-Encoding": "chunked"
-                }
-            )
-        else:
-            # For non-live streams, fall back to direct proxying
-            return await self.proxy_direct_stream(stream_id, client_id)
-
-    async def proxy_direct_stream(self, stream_id: str, client_id: str = None):
-        """Direct proxy for non-live streams"""
-        if stream_id not in self.streams:
-            logger.error(f"Stream {stream_id} not found")
-            raise HTTPException(status_code=404, detail="Stream not found")
-
-        stream_info = self.streams[stream_id]
-        current_url = stream_info.current_url or stream_info.original_url
-
-        try:
-            # Prepare headers
-            headers = {
-                'User-Agent': stream_info.user_agent,
-                'Referer': f"{urlparse(current_url).scheme}://{urlparse(current_url).netloc}/",
-                'Origin': f"{urlparse(current_url).scheme}://{urlparse(current_url).netloc}",
-                'Accept': '*/*',
-                'Connection': 'keep-alive'
-            }
-
-            # Use appropriate client
-            client_to_use = self.http_client
-
-            async def generate():
-                async with client_to_use.stream('GET', current_url, headers=headers, follow_redirects=True) as response:
-                    response.raise_for_status()
-
-                    logger.info(
-                        f"Connected to stream: {response.status_code}, Content-Type: {response.headers.get('content-type')}")
-
-                    chunk_count = 0
-                    bytes_served = 0
-
-                    async for chunk in response.aiter_bytes(chunk_size=32768):
-                        bytes_served += len(chunk)
-                        chunk_count += 1
-
-                        if chunk_count == 1:
-                            logger.info(
-                                f"Stream {stream_id} first chunk: {len(chunk)} bytes")
-                        elif chunk_count % 100 == 0:
-                            logger.debug(
-                                f"Stream {stream_id} chunk {chunk_count}, total: {bytes_served} bytes")
-
-                        # Update stats
-                        stream_info.total_bytes_served += len(chunk)
-                        stream_info.last_access = datetime.now()
-
-                        if client_id and client_id in self.clients:
-                            self.clients[client_id].bytes_served += len(chunk)
-                            self.clients[client_id].last_access = datetime.now()
-
-                        yield chunk
-
-                    logger.info(
-                        f"Stream {stream_id} completed: {chunk_count} chunks, {bytes_served} bytes")
-
-            return StreamingResponse(
-                generate(),
-                media_type="video/mp2t",
-                headers={
-                    "Content-Type": "video/mp2t",
-                    "Cache-Control": "no-cache, no-store, must-revalidate",
-                    "Pragma": "no-cache",
-                    "Expires": "0",
-                    "Transfer-Encoding": "chunked"
-                }
-            )
-
-        except Exception as e:
-            logger.error(f"Error proxying direct stream {current_url}: {e}")
-            stream_info.error_count += 1
-            raise HTTPException(status_code=500, detail=str(e))
-
     def get_stats(self) -> Dict:
         """Get comprehensive stats"""
-        # Calculate active streams (streams with active clients)
         active_stream_count = sum(1 for stream in self.streams.values()
                                   if stream.client_count > 0 and stream.is_active)
-
-        # Calculate active clients (clients that accessed content recently)
         active_client_count = sum(1 for client in self.clients.values()
                                   if (datetime.now() - client.last_access).seconds < self.client_timeout)
 
@@ -2032,6 +808,7 @@ class StreamManager:
                     "error_count": stream.error_count,
                     "is_active": stream.is_active,
                     "has_failover": len(stream.failover_urls) > 0,
+                    "stream_type": "HLS" if stream.is_hls else ("VOD" if stream.is_vod else "Live Continuous"),
                     "created_at": stream.created_at.isoformat(),
                     "last_access": stream.last_access.isoformat()
                 }

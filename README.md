@@ -1,17 +1,10 @@
-# m3u-proxy v2.0
+# m3u-proxy
 
 A high-performance HTTP proxy server for IPTV content with **true live proxying**, per-client connection management, and seamless failover support. Built with FastAPI and optimized for efficiency.
 
-## What's New in v2.0
-
-✨ **True Live Proxy Architecture** - Each client gets independent provider connections  
-⚡ **Seamless Failover** - <100ms transparent failover between URLs  
-🚀 **Performance Optimized** - uvloop support, connection pooling, 98% memory reduction  
-🎯 **Zero Transcoding** - Pure byte-for-byte HTTP proxy, no stream alteration  
-
 ## Features
 
-### Core Streaming (v2.0 Architecture)
+### Core Streaming
 - 🚀 **Pure HTTP Proxy**: Zero transcoding, direct byte-for-byte streaming
 - 🎯 **Per-Client Connections**: Each client gets independent provider connection
 - ⚡ **Truly Ephemeral**: Provider connections open only when client consuming
@@ -22,18 +15,16 @@ A high-performance HTTP proxy server for IPTV content with **true live proxying*
 
 ### Performance & Reliability
 - ⚡ **uvloop Integration**: 2-4x faster async I/O operations
-- � **Connection Pooling**: Optimized HTTP clients with keepalive
-- � **Low Memory**: 98% reduction vs shared buffer approach (640KB vs 32MB for 10 clients)
 - 🔄 **Seamless Failover**: <100ms transparent URL switching per client
 - 🎯 **Immediate Cleanup**: Connections close instantly when client stops
 
 ### Management & Monitoring
 - 👥 **Client Tracking**: Individual client sessions and bandwidth monitoring
 - 📊 **Real-time Statistics**: Live metrics on streams, clients, and data usage
-- � **Stream Type Detection**: Automatic HLS/VOD/Live detection
+- 🔎 **Stream Type Detection**: Automatic HLS/VOD/Live detection
 - 🧹 **Automatic Cleanup**: Inactive streams and clients auto-removed
-- � **Event System**: Real-time events and webhook notifications
-- � **Health Checks**: Built-in health endpoints for monitoring
+- 📣 **Event System**: Real-time events and webhook notifications
+- 🩺 **Health Checks**: Built-in health endpoints for monitoring
 
 ## Quick Start
 
@@ -200,7 +191,7 @@ python main.py
 python main.py --port 8002 --debug --reload
 ```
 
-## Architecture (v2.0)
+## Architecture
 
 ### Core Design Philosophy
 
@@ -283,7 +274,7 @@ StreamInfo(
 - Add analytics to existing streaming infrastructure
 - Implement custom authentication and access control
 
-## Performance (v2.0 Improvements)
+## Performance
 
 ### Architecture Wins
 - **98% Memory Reduction**: 640KB vs 32MB for 10 simultaneous clients
@@ -426,25 +417,6 @@ python demo_events.py
 ├── main.py                # Server entry point (uvloop support)
 └── README.md              # This file
 ```
-
-## Version 2.0 Migration Notes
-
-### What Changed
-- **Architecture**: Moved from shared buffer to per-client direct proxy
-- **Memory**: 98% reduction in memory usage for multiple clients
-- **Failover**: Now seamless (<100ms) and per-client instead of global
-- **Performance**: Added uvloop support for 2-4x faster async I/O
-- **Code**: Simplified codebase, removed complex buffer management
-
-### Migration from v1.x
-No action needed! v2.0 is fully backward compatible with the same API endpoints and behavior. The improvements are internal architecture changes.
-
-### Key Benefits
-- ✅ True byte-for-byte proxy (no buffering artifacts)
-- ✅ Each client independent (failover doesn't affect others)
-- ✅ Provider connections open only when needed
-- ✅ Immediate cleanup on disconnect
-- ✅ Lower memory, faster performance
 
 ### Contributing
 

@@ -149,18 +149,24 @@ async def root():
 async def resolve_stream_id(
     stream_id: str,
     url: Optional[str] = Query(
-        None, description="Stream URL (for direct access, overrides stream_id in path)")
+        None, description="Stream URL (for direct access, overrides stream_id in path)"),
+    parent: Optional[str] = Query(
+        None, description="Parent stream ID (for variant playlists)")
 ) -> str:
     """
     Dependency to get a stream_id. If a URL is provided in the query,
     it will be used to create/retrieve a stream, overriding the path stream_id.
     Also validates that the stream exists.
+    
+    If parent is provided, the created stream will be marked as a variant of the parent.
     """
     if url:
         try:
             decoded_url = unquote(url)
             validate_url(decoded_url)
-            return await stream_manager.get_or_create_stream(decoded_url)
+            # If parent is provided, this is a variant stream
+            parent_id = parent if parent else None
+            return await stream_manager.get_or_create_stream(decoded_url, parent_stream_id=parent_id)
         except ValueError as e:
             raise HTTPException(
                 status_code=400, detail=f"Invalid URL provided: {e}")

@@ -65,6 +65,9 @@ class StreamInfo:
     is_hls: bool = False
     is_vod: bool = False
     is_live_continuous: bool = False
+    # HLS variant tracking - for variant playlists that are part of a master playlist
+    parent_stream_id: Optional[str] = None
+    is_variant_stream: bool = False
 
 
 @dataclass
@@ -81,11 +84,12 @@ class ProxyStats:
 
 
 class M3U8Processor:
-    def __init__(self, base_url: str, client_id: str, user_agent: Optional[str] = None, original_url: Optional[str] = None):
+    def __init__(self, base_url: str, client_id: str, user_agent: Optional[str] = None, original_url: Optional[str] = None, parent_stream_id: Optional[str] = None):
         self.base_url = base_url
         self.client_id = client_id
         self.user_agent = user_agent or settings.DEFAULT_USER_AGENT
         self.original_url = original_url or base_url
+        self.parent_stream_id = parent_stream_id
 
     def process_playlist(self, content: str, base_proxy_url: str, original_base_url: Optional[str] = None) -> str:
         """Process M3U8 content and rewrite segment URLs using the m3u8 library."""
@@ -116,7 +120,9 @@ class M3U8Processor:
         """Rewrites a URL to point to the proxy, encoding the original URL."""
         encoded_url = quote(original_url, safe='')
         if original_url.endswith('.m3u8'):
-            return f"{base_proxy_url}/playlist.m3u8?url={encoded_url}&client_id={self.client_id}"
+            # For variant playlists, include parent stream ID
+            parent_param = f"&parent={self.parent_stream_id}" if self.parent_stream_id else ""
+            return f"{base_proxy_url}/playlist.m3u8?url={encoded_url}&client_id={self.client_id}{parent_param}"
         else:
             return f"{base_proxy_url}/segment.ts?url={encoded_url}&client_id={self.client_id}"
 
@@ -222,9 +228,17 @@ class StreamManager:
         self,
         stream_url: str,
         failover_urls: Optional[List[str]] = None,
-        user_agent: Optional[str] = None
+        user_agent: Optional[str] = None,
+        parent_stream_id: Optional[str] = None
     ) -> str:
-        """Get or create a stream and return its ID"""
+        """Get or create a stream and return its ID
+        
+        Args:
+            stream_url: The URL of the stream
+            failover_urls: Optional list of failover URLs
+            user_agent: Optional user agent string
+            parent_stream_id: Optional parent stream ID for variant playlists
+        """
         import hashlib
         stream_id = hashlib.md5(stream_url.encode()).hexdigest()
 
@@ -235,6 +249,11 @@ class StreamManager:
 
             # Detect stream type
             is_hls, is_vod, is_live_continuous = self._detect_stream_type(stream_url)
+            
+            # If this is a variant stream, inherit user agent from parent
+            is_variant = parent_stream_id is not None
+            if is_variant and parent_stream_id in self.streams:
+                user_agent = self.streams[parent_stream_id].user_agent
 
             self.streams[stream_id] = StreamInfo(
                 stream_id=stream_id,
@@ -246,14 +265,20 @@ class StreamManager:
                 user_agent=user_agent,
                 is_hls=is_hls,
                 is_vod=is_vod,
-                is_live_continuous=is_live_continuous
+                is_live_continuous=is_live_continuous,
+                parent_stream_id=parent_stream_id,
+                is_variant_stream=is_variant
             )
             self.stream_clients[stream_id] = set()
-            self._stats.total_streams += 1
-            self._stats.active_streams += 1
+            
+            # Only count non-variant streams in stats
+            if not is_variant:
+                self._stats.total_streams += 1
+                self._stats.active_streams += 1
             
             stream_type = "HLS" if is_hls else ("VOD" if is_vod else "Live Continuous")
-            logger.info(f"Created new stream: {stream_id} ({stream_type}) with user agent: {user_agent}")
+            variant_info = f" (variant of {parent_stream_id})" if is_variant else ""
+            logger.info(f"Created new stream: {stream_id} ({stream_type}){variant_info} with user agent: {user_agent}")
 
         self.streams[stream_id].last_access = datetime.now()
         return stream_id
@@ -265,8 +290,19 @@ class StreamManager:
         user_agent: Optional[str] = None,
         ip_address: Optional[str] = None
     ) -> ClientInfo:
-        """Register a client for a stream"""
+        """Register a client for a stream
+        
+        If the stream is a variant, the client is registered with the parent stream instead.
+        """
         now = datetime.now()
+        
+        # If this is a variant stream, register client with the parent instead
+        effective_stream_id = stream_id
+        if stream_id in self.streams:
+            stream = self.streams[stream_id]
+            if stream.is_variant_stream and stream.parent_stream_id:
+                effective_stream_id = stream.parent_stream_id
+                logger.debug(f"Redirecting client registration from variant {stream_id} to parent {effective_stream_id}")
 
         if client_id not in self.clients:
             self.clients[client_id] = ClientInfo(
@@ -275,27 +311,27 @@ class StreamManager:
                 last_access=now,
                 user_agent=user_agent,
                 ip_address=ip_address,
-                stream_id=stream_id
+                stream_id=effective_stream_id
             )
             self._stats.total_clients += 1
             self._stats.active_clients += 1
             logger.info(f"Registered new client: {client_id}")
 
-        if stream_id in self.stream_clients:
-            self.stream_clients[stream_id].add(client_id)
-            self.streams[stream_id].client_count = len(self.stream_clients[stream_id])
-            self.streams[stream_id].connected_clients.add(client_id)
+        if effective_stream_id in self.stream_clients:
+            self.stream_clients[effective_stream_id].add(client_id)
+            self.streams[effective_stream_id].client_count = len(self.stream_clients[effective_stream_id])
+            self.streams[effective_stream_id].connected_clients.add(client_id)
 
         client_info = self.clients[client_id]
         client_info.last_access = now
-        client_info.stream_id = stream_id
+        client_info.stream_id = effective_stream_id
         client_info.is_connected = True
 
-        await self._emit_event("CLIENT_CONNECTED", stream_id, {
+        await self._emit_event("CLIENT_CONNECTED", effective_stream_id, {
             "client_id": client_id,
             "user_agent": user_agent,
             "ip_address": ip_address,
-            "stream_client_count": len(self.stream_clients[stream_id]) if stream_id in self.stream_clients else 0
+            "stream_client_count": len(self.stream_clients[effective_stream_id]) if effective_stream_id in self.stream_clients else 0
         })
 
         return client_info
@@ -599,7 +635,9 @@ class StreamManager:
             else:
                 base_url += '/'
 
-            processor = M3U8Processor(base_proxy_url, client_id, stream_info.user_agent, final_url)
+            # Pass stream_id as parent for variant playlists, unless this is already a variant
+            parent_id = stream_id if not stream_info.is_variant_stream else stream_info.parent_stream_id
+            processor = M3U8Processor(base_proxy_url, client_id, stream_info.user_agent, final_url, parent_stream_id=parent_id)
             processed_content = processor.process_playlist(content, base_proxy_url, base_url)
 
             stream_info.last_access = datetime.now()
@@ -780,15 +818,53 @@ class StreamManager:
                 logger.info(f"Cleaned up inactive stream: {stream_id}")
 
     def get_stats(self) -> Dict:
-        """Get comprehensive stats"""
-        active_stream_count = sum(1 for stream in self.streams.values()
+        """Get comprehensive stats - aggregates variant stream stats into parent streams"""
+        # Only count non-variant streams
+        non_variant_streams = [s for s in self.streams.values() if not s.is_variant_stream]
+        
+        # Build a map of aggregated stats for parent streams
+        stream_stats_map = {}
+        for stream in self.streams.values():
+            # If this is a variant, aggregate its stats into the parent
+            if stream.is_variant_stream and stream.parent_stream_id:
+                parent_id = stream.parent_stream_id
+                if parent_id not in stream_stats_map:
+                    # Initialize with parent stream data if it exists
+                    if parent_id in self.streams:
+                        parent = self.streams[parent_id]
+                        stream_stats_map[parent_id] = {
+                            "bytes": parent.total_bytes_served,
+                            "segments": parent.total_segments_served,
+                            "errors": parent.error_count,
+                            "clients": parent.client_count
+                        }
+                    else:
+                        stream_stats_map[parent_id] = {"bytes": 0, "segments": 0, "errors": 0, "clients": 0}
+                
+                # Add variant's stats to parent
+                stream_stats_map[parent_id]["bytes"] += stream.total_bytes_served
+                stream_stats_map[parent_id]["segments"] += stream.total_segments_served
+                stream_stats_map[parent_id]["errors"] += stream.error_count
+                # Don't double-count clients - they're tracked at parent level
+            elif not stream.is_variant_stream:
+                # Non-variant stream - use its own stats
+                stream_id = stream.stream_id
+                if stream_id not in stream_stats_map:
+                    stream_stats_map[stream_id] = {
+                        "bytes": stream.total_bytes_served,
+                        "segments": stream.total_segments_served,
+                        "errors": stream.error_count,
+                        "clients": stream.client_count
+                    }
+        
+        active_stream_count = sum(1 for stream in non_variant_streams
                                   if stream.client_count > 0 and stream.is_active)
         active_client_count = sum(1 for client in self.clients.values()
                                   if (datetime.now() - client.last_access).seconds < self.client_timeout)
 
         return {
             "proxy_stats": {
-                "total_streams": len(self.streams),
+                "total_streams": len(non_variant_streams),
                 "active_streams": active_stream_count,
                 "total_clients": len(self.clients),
                 "active_clients": active_client_count,
@@ -802,17 +878,17 @@ class StreamManager:
                     "original_url": stream.original_url,
                     "current_url": stream.current_url,
                     "user_agent": stream.user_agent,
-                    "client_count": stream.client_count,
-                    "total_bytes_served": stream.total_bytes_served,
-                    "total_segments_served": stream.total_segments_served,
-                    "error_count": stream.error_count,
+                    "client_count": stream_stats_map.get(stream.stream_id, {}).get("clients", stream.client_count),
+                    "total_bytes_served": stream_stats_map.get(stream.stream_id, {}).get("bytes", stream.total_bytes_served),
+                    "total_segments_served": stream_stats_map.get(stream.stream_id, {}).get("segments", stream.total_segments_served),
+                    "error_count": stream_stats_map.get(stream.stream_id, {}).get("errors", stream.error_count),
                     "is_active": stream.is_active,
                     "has_failover": len(stream.failover_urls) > 0,
                     "stream_type": "HLS" if stream.is_hls else ("VOD" if stream.is_vod else "Live Continuous"),
                     "created_at": stream.created_at.isoformat(),
                     "last_access": stream.last_access.isoformat()
                 }
-                for stream in self.streams.values()
+                for stream in non_variant_streams
             ],
             "clients": [
                 {

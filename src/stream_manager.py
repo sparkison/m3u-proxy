@@ -68,6 +68,8 @@ class StreamInfo:
     # HLS variant tracking - for variant playlists that are part of a master playlist
     parent_stream_id: Optional[str] = None
     is_variant_stream: bool = False
+    # Custom metadata - arbitrary key/value pairs for external identification
+    metadata: Dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -229,7 +231,8 @@ class StreamManager:
         stream_url: str,
         failover_urls: Optional[List[str]] = None,
         user_agent: Optional[str] = None,
-        parent_stream_id: Optional[str] = None
+        parent_stream_id: Optional[str] = None,
+        metadata: Optional[Dict[str, str]] = None
     ) -> str:
         """Get or create a stream and return its ID
         
@@ -238,6 +241,7 @@ class StreamManager:
             failover_urls: Optional list of failover URLs
             user_agent: Optional user agent string
             parent_stream_id: Optional parent stream ID for variant playlists
+            metadata: Optional custom key/value pairs for external identification
         """
         import hashlib
         stream_id = hashlib.md5(stream_url.encode()).hexdigest()
@@ -267,7 +271,8 @@ class StreamManager:
                 is_vod=is_vod,
                 is_live_continuous=is_live_continuous,
                 parent_stream_id=parent_stream_id,
-                is_variant_stream=is_variant
+                is_variant_stream=is_variant,
+                metadata=metadata or {}
             )
             self.stream_clients[stream_id] = set()
             
@@ -886,7 +891,8 @@ class StreamManager:
                     "has_failover": len(stream.failover_urls) > 0,
                     "stream_type": "HLS" if stream.is_hls else ("VOD" if stream.is_vod else "Live Continuous"),
                     "created_at": stream.created_at.isoformat(),
-                    "last_access": stream.last_access.isoformat()
+                    "last_access": stream.last_access.isoformat(),
+                    "metadata": stream.metadata
                 }
                 for stream in non_variant_streams
             ],

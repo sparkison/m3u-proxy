@@ -82,6 +82,7 @@ class StreamCreateRequest(BaseModel):
     url: str
     failover_urls: Optional[List[str]] = None
     user_agent: Optional[str] = None
+    metadata: Optional[dict] = None
 
     @field_validator('url')
     @classmethod
@@ -93,6 +94,22 @@ class StreamCreateRequest(BaseModel):
     def validate_failover_urls(cls, v):
         if v is not None:
             return [validate_url(url) for url in v]
+        return v
+    
+    @field_validator('metadata')
+    @classmethod
+    def validate_metadata(cls, v):
+        if v is not None:
+            # Ensure all keys and values are strings
+            if not isinstance(v, dict):
+                raise ValueError("metadata must be a dictionary")
+            for key, value in v.items():
+                if not isinstance(key, str):
+                    raise ValueError(f"metadata key must be string, got {type(key)}")
+                if not isinstance(value, (str, int, float, bool)):
+                    raise ValueError(f"metadata value for '{key}' must be string, int, float, or bool")
+            # Convert all values to strings for consistency
+            return {str(k): str(v) for k, v in v.items()}
         return v
 
 
@@ -183,12 +200,13 @@ async def resolve_stream_id(
 
 @app.post("/streams")
 async def create_stream(request: StreamCreateRequest):
-    """Create a new stream with optional failover URLs and custom user agent"""
+    """Create a new stream with optional failover URLs, custom user agent, and metadata"""
     try:
         stream_id = await stream_manager.get_or_create_stream(
             request.url,
             request.failover_urls,
-            request.user_agent
+            request.user_agent,
+            metadata=request.metadata
         )
 
         # Emit stream started event
@@ -212,7 +230,7 @@ async def create_stream(request: StreamCreateRequest):
             stream_endpoint = f"/hls/{stream_id}/playlist.m3u8"
             stream_type = "hls"
 
-        return {
+        response = {
             "stream_id": stream_id,
             "primary_url": request.url,
             "failover_urls": request.failover_urls or [],
@@ -224,6 +242,12 @@ async def create_stream(request: StreamCreateRequest):
             "direct_url": f"/stream/{stream_id}" if stream_type == "direct" else stream_endpoint,
             "message": f"Stream created successfully ({stream_type})"
         }
+        
+        # Include metadata in response if provided
+        if request.metadata:
+            response["metadata"] = request.metadata
+        
+        return response
     except Exception as e:
         logger.error(f"Error creating stream: {e}")
         raise HTTPException(status_code=500, detail=str(e))

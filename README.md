@@ -25,6 +25,7 @@ A high-performance HTTP proxy server for IPTV content with **true live proxying*
 - 🧹 **Automatic Cleanup**: Inactive streams and clients auto-removed
 - 📣 **Event System**: Real-time events and webhook notifications
 - 🩺 **Health Checks**: Built-in health endpoints for monitoring
+- 🏷️ **Custom Metadata**: Attach arbitrary key/value pairs to streams for identification
 
 ## Quick Start
 

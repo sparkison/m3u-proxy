@@ -396,6 +396,7 @@ class StreamManager:
             chunk_count = 0
             response = None
             stream_context = None
+            last_stats_update = 0  # Track bytes at last stats update
             
             try:
                 # Emit stream started event
@@ -445,12 +446,21 @@ class StreamManager:
                     bytes_served += len(chunk)
                     chunk_count += 1
 
-                    # Update last_access periodically to prevent premature cleanup
-                    if chunk_count % 10 == 0:  # Every 10 chunks (~320KB)
+                    # Update stats periodically (every 10 chunks = ~320KB)
+                    if chunk_count % 10 == 0:
+                        # Calculate delta since last update
+                        bytes_delta = bytes_served - last_stats_update
+                        
                         if client_id in self.clients:
                             self.clients[client_id].last_access = datetime.now()
+                            self.clients[client_id].bytes_served += bytes_delta
                         if stream_id in self.streams:
                             self.streams[stream_id].last_access = datetime.now()
+                            self.streams[stream_id].total_bytes_served += bytes_delta
+                        self._stats.total_bytes_served += bytes_delta
+                        
+                        # Update last stats checkpoint
+                        last_stats_update = bytes_served
 
                     # Update stats (lightweight) - log more frequently to debug
                     if chunk_count == 1:
@@ -575,16 +585,18 @@ class StreamManager:
                     except Exception as close_error:
                         logger.warning(f"Error closing response: {close_error}")
 
-                # Update stats
-                if client_id in self.clients:
-                    self.clients[client_id].bytes_served += bytes_served
-                    self.clients[client_id].last_access = datetime.now()
-                
-                if stream_id in self.streams:
-                    self.streams[stream_id].total_bytes_served += bytes_served
-                    self.streams[stream_id].last_access = datetime.now()
-                
-                self._stats.total_bytes_served += bytes_served
+                # Update final stats (add any remaining bytes not yet counted)
+                bytes_remaining = bytes_served - last_stats_update
+                if bytes_remaining > 0:
+                    if client_id in self.clients:
+                        self.clients[client_id].bytes_served += bytes_remaining
+                        self.clients[client_id].last_access = datetime.now()
+                    
+                    if stream_id in self.streams:
+                        self.streams[stream_id].total_bytes_served += bytes_remaining
+                        self.streams[stream_id].last_access = datetime.now()
+                    
+                    self._stats.total_bytes_served += bytes_remaining
 
                 # Cleanup client
                 await self.cleanup_client(client_id)

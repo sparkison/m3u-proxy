@@ -1,5 +1,6 @@
 from fastapi import FastAPI, HTTPException, Query, Response, Request, Depends
 from fastapi.responses import StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
 import logging
 import uuid
 import hashlib
@@ -117,6 +118,16 @@ app = FastAPI(
     title="m3u-proxy",
     version="2.0.0",
     description="Advanced IPTV streaming proxy with client management, stats, and failover support"
+)
+
+# Configure CORS to allow all origins for streaming compatibility
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allow all origins for maximum compatibility
+    allow_credentials=True,
+    allow_methods=["*"],  # Allow all methods (GET, POST, HEAD, OPTIONS, etc.)
+    allow_headers=["*"],  # Allow all headers
+    expose_headers=["*"],  # Expose all headers to the client
 )
 
 # Global stream manager and event manager
@@ -314,6 +325,11 @@ async def get_hls_playlist(
         # Add client ID to response headers for tracking
         response.headers["X-Client-ID"] = client_id
         response.headers["X-Stream-ID"] = stream_id
+        # Add CORS headers
+        response.headers["Access-Control-Allow-Origin"] = "*"
+        response.headers["Access-Control-Allow-Methods"] = "GET, HEAD, OPTIONS"
+        response.headers["Access-Control-Allow-Headers"] = "*"
+        response.headers["Access-Control-Expose-Headers"] = "*"
         return response
 
     except HTTPException:
@@ -525,7 +541,11 @@ async def head_direct_stream(
                     "Accept-Ranges": "bytes",
                     "Cache-Control": "no-cache, no-store, must-revalidate",
                     "Pragma": "no-cache",
-                    "Expires": "0"
+                    "Expires": "0",
+                    "Access-Control-Allow-Origin": "*",
+                    "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+                    "Access-Control-Allow-Headers": "*",
+                    "Access-Control-Expose-Headers": "*"
                 }
 
                 # Determine status code
@@ -561,6 +581,10 @@ async def head_direct_stream(
                     "Content-Type": content_type,
                     "Accept-Ranges": "bytes",
                     "Cache-Control": "no-cache, no-store, must-revalidate",
+                    "Access-Control-Allow-Origin": "*",
+                    "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+                    "Access-Control-Allow-Headers": "*",
+                    "Access-Control-Expose-Headers": "*"
                 }
             )
 

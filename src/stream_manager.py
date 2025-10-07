@@ -395,6 +395,7 @@ class StreamManager:
             bytes_served = 0
             chunk_count = 0
             response = None
+            stream_context = None
             
             try:
                 # Emit stream started event
@@ -413,30 +414,51 @@ class StreamManager:
                     'Connection': 'keep-alive'
                 }
 
-                if range_header:
+                # IMPORTANT: Do NOT send Range headers for live continuous streams
+                # Live IPTV streams (.ts) are infinite and don't support range requests
+                # Range requests can cause providers to immediately close the connection
+                if range_header and not stream_info.is_live_continuous:
                     headers['Range'] = range_header
+                    logger.info(f"Including Range header for VOD stream: {range_header}")
+                elif range_header and stream_info.is_live_continuous:
+                    logger.info(f"Ignoring Range header for live stream (not supported)")
 
                 # Select appropriate HTTP client
                 client_to_use = self.live_stream_client if stream_info.is_live_continuous else self.http_client
 
                 # OPEN provider connection - happens ONLY when client starts consuming
                 logger.info(f"Opening provider connection for {stream_id} to {current_url}")
-                response = await client_to_use.stream('GET', current_url, headers=headers, follow_redirects=True).__aenter__()
+                
+                # Get the stream context manager
+                stream_context = client_to_use.stream('GET', current_url, headers=headers, follow_redirects=True)
+                # Enter the context to get the response object
+                response = await stream_context.__aenter__()
+                
+                # Now we can call methods on the actual response object
                 response.raise_for_status()
 
                 logger.info(f"Provider connected: {response.status_code}, Content-Type: {response.headers.get('content-type')}")
-
+                
                 # Direct byte-for-byte proxy - NO buffering, NO transcoding
                 async for chunk in response.aiter_bytes(chunk_size=32768):
                     yield chunk
                     bytes_served += len(chunk)
                     chunk_count += 1
 
-                    # Update stats (lightweight)
+                    # Update last_access periodically to prevent premature cleanup
+                    if chunk_count % 10 == 0:  # Every 10 chunks (~320KB)
+                        if client_id in self.clients:
+                            self.clients[client_id].last_access = datetime.now()
+                        if stream_id in self.streams:
+                            self.streams[stream_id].last_access = datetime.now()
+
+                    # Update stats (lightweight) - log more frequently to debug
                     if chunk_count == 1:
                         logger.info(f"First chunk delivered to client {client_id}: {len(chunk)} bytes")
+                    elif chunk_count <= 10:
+                        logger.info(f"Chunk {chunk_count} delivered to client {client_id}: {len(chunk)} bytes")
                     elif chunk_count % 100 == 0:
-                        logger.debug(f"Client {client_id}: {chunk_count} chunks, {bytes_served} bytes")
+                        logger.info(f"Client {client_id}: {chunk_count} chunks, {bytes_served:,} bytes served")
 
                 logger.info(f"Stream completed for client {client_id}: {chunk_count} chunks, {bytes_served} bytes")
 
@@ -446,6 +468,32 @@ class StreamManager:
                     "bytes_served": bytes_served,
                     "chunks_served": chunk_count
                 })
+
+            except httpx.ReadError as e:
+                # ReadError often means client disconnected or provider closed connection
+                # This is especially common with Range requests on live streams
+                # MUST be caught before NetworkError since ReadError is a subclass
+                error_str = str(e) if str(e) else "<empty ReadError>"
+                logger.info(f"ReadError for client {client_id}: {error_str} (bytes_served: {bytes_served}, chunk_count: {chunk_count})")
+                
+                if bytes_served == 0:
+                    # No data was sent - provider likely rejected the request
+                    logger.warning(f"Provider closed connection immediately for {client_id} - possibly due to Range header on live stream")
+                    await self._emit_event("STREAM_FAILED", stream_id, {
+                        "client_id": client_id,
+                        "error": "Provider closed connection immediately (may not support Range requests)",
+                        "error_type": "ReadError",
+                        "bytes_served": 0
+                    })
+                else:
+                    # Some data was sent - likely client disconnection during streaming
+                    logger.info(f"Client {client_id} likely disconnected during streaming")
+                    await self._emit_event("CLIENT_DISCONNECTED", stream_id, {
+                        "client_id": client_id,
+                        "bytes_served": bytes_served,
+                        "chunks_served": chunk_count,
+                        "reason": "read_error_during_stream"
+                    })
 
             except (httpx.TimeoutException, httpx.NetworkError, httpx.HTTPError) as e:
                 logger.warning(f"Stream error for client {client_id}: {type(e).__name__}: {e}")
@@ -485,22 +533,47 @@ class StreamManager:
                         "no_failover": True
                     })
 
-            except Exception as e:
-                logger.error(f"Unexpected error for client {client_id}: {e}")
-                await self._emit_event("STREAM_FAILED", stream_id, {
+            except (ConnectionResetError, ConnectionError, BrokenPipeError) as e:
+                # Client disconnected - this is normal, not an error
+                logger.info(f"Client {client_id} disconnected: {type(e).__name__}")
+                await self._emit_event("CLIENT_DISCONNECTED", stream_id, {
                     "client_id": client_id,
-                    "error": str(e),
-                    "error_type": "unexpected"
+                    "bytes_served": bytes_served,
+                    "chunks_served": chunk_count,
+                    "reason": "client_disconnected"
                 })
 
+            except Exception as e:
+                # Log with more detail for debugging
+                error_str = str(e) if str(e) else f"<empty {type(e).__name__}>"
+                logger.warning(f"Stream error for client {client_id}: {type(e).__name__}: {error_str}")
+                logger.warning(f"Exception details - bytes_served: {bytes_served}, chunks: {chunk_count}")
+                
+                # Check if this looks like a client disconnection (empty error message often indicates this)
+                if not str(e) and bytes_served > 0:
+                    logger.info(f"Likely client disconnection for {client_id} (empty error message, data was streaming)")
+                    await self._emit_event("CLIENT_DISCONNECTED", stream_id, {
+                        "client_id": client_id,
+                        "bytes_served": bytes_served,
+                        "chunks_served": chunk_count,
+                        "reason": "possible_client_disconnection"
+                    })
+                else:
+                    await self._emit_event("STREAM_FAILED", stream_id, {
+                        "client_id": client_id,
+                        "error": error_str,
+                        "error_type": type(e).__name__,
+                        "bytes_served": bytes_served
+                    })
+
             finally:
-                # CLOSE provider connection immediately when done
-                if response:
+                # Manually exit the context manager
+                if stream_context is not None:
                     try:
-                        await response.aclose()
+                        await stream_context.__aexit__(None, None, None)
                         logger.info(f"Provider connection closed for client {client_id}")
-                    except:
-                        pass
+                    except Exception as close_error:
+                        logger.warning(f"Error closing response: {close_error}")
 
                 # Update stats
                 if client_id in self.clients:
@@ -533,8 +606,17 @@ class StreamManager:
             "Cache-Control": "no-cache, no-store, must-revalidate",
             "Pragma": "no-cache",
             "Expires": "0",
-            "Accept-Ranges": "bytes"
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+            "Access-Control-Allow-Headers": "*",
+            "Access-Control-Expose-Headers": "*"
         }
+
+        # For live streams, explicitly state we don't support range requests
+        if stream_info.is_live_continuous:
+            headers["Accept-Ranges"] = "none"
+        else:
+            headers["Accept-Ranges"] = "bytes"
 
         return StreamingResponse(generate(), media_type=content_type, headers=headers)
 
@@ -705,7 +787,13 @@ class StreamManager:
         return StreamingResponse(
             segment_generator(),
             media_type="video/MP2T",
-            headers={"Cache-Control": "no-cache"}
+            headers={
+                "Cache-Control": "no-cache",
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+                "Access-Control-Allow-Headers": "*",
+                "Access-Control-Expose-Headers": "*"
+            }
         )
 
     # ============================================================================

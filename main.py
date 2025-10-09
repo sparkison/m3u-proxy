@@ -36,7 +36,7 @@ def main():
 
     logger = logging.getLogger(__name__)
     logger.info("="*60)
-    logger.info(f"Starting m3u-proxy v0.2.2 on {settings.HOST}:{settings.PORT}")
+    logger.info(f"Starting m3u-proxy v0.2.3 on {settings.HOST}:{settings.PORT}")
     logger.info("="*60)
     logger.info(f"Log level set to: {settings.LOG_LEVEL}")
     if use_uvloop:

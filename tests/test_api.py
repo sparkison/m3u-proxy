@@ -223,12 +223,12 @@ class TestAPI:
             yield b"stream_data_chunk_1"
             yield b"stream_data_chunk_2"
 
-        # Mock the stream_unified_response method used by the endpoint
+        # Mock the stream_continuous_direct method used by the endpoint
         mock_response = StreamingResponse(
             mock_stream_generator(), media_type="video/mp4")
-        mock_stream_manager.stream_unified_response = AsyncMock(
+        mock_stream_manager.stream_continuous_direct = AsyncMock(
             return_value=mock_response)
-        mock_stream_manager.register_client = AsyncMock(return_value=Mock())
+        mock_stream_manager.register_client = AsyncMock(return_value=None)
         mock_stream_manager.clients = {}
 
         response = client.get("/stream/test_stream_123")

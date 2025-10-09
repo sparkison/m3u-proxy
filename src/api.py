@@ -1,6 +1,7 @@
 from fastapi import FastAPI, HTTPException, Query, Response, Request, Depends
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
+from contextlib import asynccontextmanager
 import logging
 import uuid
 import hashlib
@@ -114,10 +115,45 @@ class StreamCreateRequest(BaseModel):
         return v
 
 
+# Global stream manager and event manager
+stream_manager = StreamManager()
+event_manager = EventManager()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Lifespan context manager for startup and shutdown events"""
+    # Startup
+    logger.info("m3u-proxy Enhanced starting up...")
+    await event_manager.start()
+
+    # Connect event manager to stream manager
+    stream_manager.set_event_manager(event_manager)
+
+    await stream_manager.start()
+
+    # Set up custom event handlers
+    def log_event_handler(event: StreamEvent):
+        """Simple event handler that logs all events"""
+        logger.info(
+            f"Event: {event.event_type} for stream {event.stream_id} at {event.timestamp}")
+
+    # Add the handler to the event manager
+    event_manager.add_handler(log_event_handler)
+
+    yield
+
+    # Shutdown
+    logger.info("m3u-proxy Enhanced shutting down...")
+    await stream_manager.stop()
+    await event_manager.stop()
+
+
 app = FastAPI(
     title="m3u-proxy",
-    version="2.0.0",
-    description="Advanced IPTV streaming proxy with client management, stats, and failover support"
+    version="0.2.2",
+    description="Advanced IPTV streaming proxy with client management, stats, and failover support",
+    lifespan=lifespan
 )
 
 # Configure CORS to allow all origins for streaming compatibility
@@ -129,28 +165,6 @@ app.add_middleware(
     allow_headers=["*"],  # Allow all headers
     expose_headers=["*"],  # Expose all headers to the client
 )
-
-# Global stream manager and event manager
-stream_manager = StreamManager()
-event_manager = EventManager()
-
-
-@app.on_event("startup")
-async def startup_event():
-    logger.info("m3u-proxy Enhanced starting up...")
-    await event_manager.start()
-
-    # Connect event manager to stream manager
-    stream_manager.set_event_manager(event_manager)
-
-    await stream_manager.start()
-
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    logger.info("m3u-proxy Enhanced shutting down...")
-    await stream_manager.stop()
-    await event_manager.stop()
 
 
 def get_client_info(request: Request):
@@ -168,7 +182,7 @@ async def root():
     return {
         "status": "running",
         "message": "m3u-proxy Enhanced is running",
-        "version": "2.0.0",
+        "version": "0.2.2",
         "uptime": proxy_stats["uptime_seconds"],
         "stats": proxy_stats
     }
@@ -801,7 +815,7 @@ async def health_check():
         proxy_stats = stats["proxy_stats"]
         return {
             "status": "healthy",
-            "version": "2.0.0",
+            "version": "0.2.2",
             "uptime_seconds": proxy_stats["uptime_seconds"],
             "active_streams": proxy_stats["active_streams"],
             "active_clients": proxy_stats["active_clients"],
@@ -904,16 +918,4 @@ async def test_webhook(webhook_url: str = Query(..., description="Webhook URL to
         raise HTTPException(status_code=500, detail=str(e))
 
 # Event Handler Examples
-
-
-@app.on_event("startup")
-async def setup_event_handlers():
-    """Set up custom event handlers"""
-
-    def log_event_handler(event: StreamEvent):
-        """Simple event handler that logs all events"""
-        logger.info(
-            f"Event: {event.event_type} for stream {event.stream_id} at {event.timestamp}")
-
-    # Add the handler to the event manager
-    event_manager.add_handler(log_event_handler)
+# Custom event handlers are now set up in the lifespan context manager above

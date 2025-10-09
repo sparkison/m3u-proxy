@@ -1,6 +1,7 @@
-fastapi>=0.104.0
+fastapi>=0.118.0
 uvicorn[standard]>=0.24.0
 httpx>=0.25.0,<0.28.0
+starlette>=0.40.0
 pydantic-settings>=2.0.0
 python-dotenv>=1.0.0
 m3u8>=3.0.0

@@ -103,18 +103,6 @@ python m3u_client.py create "https://your-stream.m3u8" --user-agent "MyApp/1.0"
 python m3u_client.py create "http://server.com/movie.mkv" --failover "http://backup.com/movie.mkv"
 ```
 
-### 4. Access Your Stream
-
-For **HLS streams** (.m3u8):
-```
-http://localhost:8085/hls/{stream_id}/playlist.m3u8
-```
-
-For **Direct streams** (.ts, .mp4, .mkv, etc.):
-```
-http://localhost:8085/stream/{stream_id}
-```
-
 ## API Documentation
 
 ### Stream Management
@@ -289,48 +277,6 @@ StreamInfo(
     last_access: datetime
 )
 ```
-
-## Use Cases
-
-### Development & Testing
-- Test HLS streams without complex server setup
-- Debug playlist issues with real-time URL rewriting
-- Monitor client behavior and stream performance
-
-### Production Streaming
-- Serve HLS content with failover protection
-- Track viewer statistics and engagement
-- Load balance across multiple stream sources
-
-### Content Delivery
-- Proxy remote HLS streams for local delivery
-- Add analytics to existing streaming infrastructure
-- Implement custom authentication and access control
-
-## Performance
-
-### Architecture Wins
-- **True Ephemeral**: Provider connections exist only when actively serving
-- **Zero Buffer Bloat**: No shared buffers, no pre-buffering delays
-- **Immediate Cleanup**: Connections close instantly on client disconnect
-
-### Benchmarks (Single Process)
-- **Throughput**: 100+ concurrent clients per process
-- **Latency**: <10ms proxy overhead + <100ms failover
-- **Memory**: ~50MB base + minimal per-client overhead (~64KB)
-- **CPU**: I/O bound with uvloop optimization (2-4x faster)
-
-### Connection Pooling
-- 20 keepalive connections to providers
-- 100 max connections (auto-scales)
-- 30s keepalive expiry for optimal reuse
-- Automatic connection recycling
-
-### Scaling
-- Horizontal scaling with multiple processes/containers
-- Load balancer friendly with health checks
-- No shared state requirements (fully stateless per instance)
-- Docker/Kubernetes ready
 
 ## Troubleshooting
 

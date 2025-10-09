@@ -151,7 +151,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="m3u-proxy",
-    version="0.2.2",
+    version="0.2.3",
     description="Advanced IPTV streaming proxy with client management, stats, and failover support",
     lifespan=lifespan
 )
@@ -182,7 +182,7 @@ async def root():
     return {
         "status": "running",
         "message": "m3u-proxy Enhanced is running",
-        "version": "0.2.2",
+        "version": "0.2.3",
         "uptime": proxy_stats["uptime_seconds"],
         "stats": proxy_stats
     }
@@ -815,7 +815,7 @@ async def health_check():
         proxy_stats = stats["proxy_stats"]
         return {
             "status": "healthy",
-            "version": "0.2.2",
+            "version": "0.2.3",
             "uptime_seconds": proxy_stats["uptime_seconds"],
             "active_streams": proxy_stats["active_streams"],
             "active_clients": proxy_stats["active_clients"],

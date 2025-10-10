@@ -17,6 +17,9 @@ class Settings(BaseSettings):
     LOG_LEVEL: str = "error"
     APP_DEBUG: bool = False
     RELOAD: bool = False
+    DOCS_URL: str = "/docs"
+    REDOC_URL: str = "/redoc"
+    OPENAPI_URL: str = "/openapi.json"
 
     # Stream Configuration
     CLIENT_TIMEOUT: int = 30

@@ -1,6 +1,9 @@
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from typing import Optional
 
+# Application version
+VERSION = "0.2.4"
+
 
 class Settings(BaseSettings):
     """
@@ -11,8 +14,8 @@ class Settings(BaseSettings):
     # Server Configuration
     HOST: str = "0.0.0.0"
     PORT: int = 8085
-    LOG_LEVEL: str = "INFO"
-    DEBUG: bool = False
+    LOG_LEVEL: str = "error"
+    APP_DEBUG: bool = False
     RELOAD: bool = False
 
     # Stream Configuration
@@ -38,14 +41,15 @@ class Settings(BaseSettings):
 
     # Optional Redis Configuration for distributed systems (not yet implemented)
     REDIS_HOST: Optional[str] = None
-    REDIS_PORT: int = 6379
+    REDIS_SERVER_PORT: int = 6379
 
     # Model configuration
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
         case_sensitive=False,
-        env_prefix=""  # No prefix, read directly from .env
+        env_prefix="",  # No prefix, read directly from .env
+        extra="ignore"  # Ignore extra environment variables from container
     )
 
 

@@ -14,7 +14,7 @@ import asyncio
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
 
 # Import config after setting up the path
-from config import settings
+from config import settings, VERSION
 
 
 def main():
@@ -36,7 +36,7 @@ def main():
 
     logger = logging.getLogger(__name__)
     logger.info("="*60)
-    logger.info(f"Starting m3u-proxy v0.2.3 on {settings.HOST}:{settings.PORT}")
+    logger.info(f"Starting m3u-proxy v{VERSION} on {settings.HOST}:{settings.PORT}")
     logger.info("="*60)
     logger.info(f"Log level set to: {settings.LOG_LEVEL}")
     if use_uvloop:
@@ -44,9 +44,9 @@ def main():
     else:
         logger.info("✓ Using standard asyncio (install uvloop for better performance)")
     logger.info("✓ Direct proxy architecture (per-client connections)")
-    logger.info("✓ Connection pooling enabled")
+    logger.info("✓ Connection pooling enabled (HLS streams only)")
     logger.info("✓ Seamless failover support")
-    if settings.DEBUG:
+    if settings.APP_DEBUG:
         logger.warning("⚠ Debug mode is enabled. Do not use in production.")
     if settings.RELOAD:
         logger.info("✓ Auto-reload is enabled.")

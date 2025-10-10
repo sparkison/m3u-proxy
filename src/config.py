@@ -22,6 +22,7 @@ class Settings(BaseSettings):
     OPENAPI_URL: str = "/openapi.json"
 
     # Stream Configuration
+    ROOT_PATH: str = ""
     CLIENT_TIMEOUT: int = 30
     STREAM_TIMEOUT: int = 300
     CLEANUP_INTERVAL: int = 60

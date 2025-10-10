@@ -13,7 +13,7 @@ from datetime import datetime
 from stream_manager import StreamManager
 from events import EventManager
 from models import StreamEvent, EventType, WebhookConfig
-from config import VERSION
+from config import settings, VERSION
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -154,7 +154,12 @@ app = FastAPI(
     title="m3u-proxy",
     version=VERSION,
     description="Advanced IPTV streaming proxy with client management, stats, and failover support",
-    lifespan=lifespan
+    lifespan=lifespan,
+    docs_url=settings.DOCS_URL if hasattr(settings, 'DOCS_URL') else "/docs",
+    redoc_url=settings.REDOC_URL if hasattr(
+        settings, 'REDOC_URL') else "/redoc",
+    openapi_url=settings.OPENAPI_URL if hasattr(
+        settings, 'OPENAPI_URL') else "/openapi.json"
 )
 
 # Configure CORS to allow all origins for streaming compatibility

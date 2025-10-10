@@ -45,7 +45,8 @@ class Settings(BaseSettings):
         env_file=".env",
         env_file_encoding="utf-8",
         case_sensitive=False,
-        env_prefix=""  # No prefix, read directly from .env
+        env_prefix="",  # No prefix, read directly from .env
+        extra="ignore"  # Ignore extra environment variables from container
     )
 
 

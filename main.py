@@ -44,7 +44,7 @@ def main():
     else:
         logger.info("✓ Using standard asyncio (install uvloop for better performance)")
     logger.info("✓ Direct proxy architecture (per-client connections)")
-    logger.info("✓ Connection pooling enabled")
+    logger.info("✓ Connection pooling enabled (HLS streams only)")
     logger.info("✓ Seamless failover support")
     if settings.DEBUG:
         logger.warning("⚠ Debug mode is enabled. Do not use in production.")

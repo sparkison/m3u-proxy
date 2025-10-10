@@ -98,7 +98,7 @@ class StreamCreateRequest(BaseModel):
         if v is not None:
             return [validate_url(url) for url in v]
         return v
-    
+
     @field_validator('metadata')
     @classmethod
     def validate_metadata(cls, v):
@@ -108,9 +108,11 @@ class StreamCreateRequest(BaseModel):
                 raise ValueError("metadata must be a dictionary")
             for key, value in v.items():
                 if not isinstance(key, str):
-                    raise ValueError(f"metadata key must be string, got {type(key)}")
+                    raise ValueError(
+                        f"metadata key must be string, got {type(key)}")
                 if not isinstance(value, (str, int, float, bool)):
-                    raise ValueError(f"metadata value for '{key}' must be string, int, float, or bool")
+                    raise ValueError(
+                        f"metadata value for '{key}' must be string, int, float, or bool")
             # Convert all values to strings for consistency
             return {str(k): str(v) for k, v in v.items()}
         return v
@@ -155,11 +157,12 @@ app = FastAPI(
     version=VERSION,
     description="Advanced IPTV streaming proxy with client management, stats, and failover support",
     lifespan=lifespan,
+    root_path=settings.ROOT_PATH if hasattr(settings, 'ROOT_PATH') else "",
     docs_url=settings.DOCS_URL if hasattr(settings, 'DOCS_URL') else "/docs",
     redoc_url=settings.REDOC_URL if hasattr(
         settings, 'REDOC_URL') else "/redoc",
     openapi_url=settings.OPENAPI_URL if hasattr(
-        settings, 'OPENAPI_URL') else "/openapi.json"
+        settings, 'OPENAPI_URL') else "/openapi.json",
 )
 
 # Configure CORS to allow all origins for streaming compatibility
@@ -205,7 +208,7 @@ async def resolve_stream_id(
     Dependency to get a stream_id. If a URL is provided in the query,
     it will be used to create/retrieve a stream, overriding the path stream_id.
     Also validates that the stream exists.
-    
+
     If parent is provided, the created stream will be marked as a variant of the parent.
     """
     if url:
@@ -273,11 +276,11 @@ async def create_stream(request: StreamCreateRequest):
             "direct_url": f"/stream/{stream_id}" if stream_type == "direct" else stream_endpoint,
             "message": f"Stream created successfully ({stream_type})"
         }
-        
+
         # Include metadata in response if provided
         if request.metadata:
             response["metadata"] = request.metadata
-        
+
         return response
     except Exception as e:
         logger.error(f"Error creating stream: {e}")

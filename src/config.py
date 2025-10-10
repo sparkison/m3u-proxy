@@ -1,6 +1,9 @@
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from typing import Optional
 
+# Application version
+VERSION = "0.2.4"
+
 
 class Settings(BaseSettings):
     """
@@ -11,8 +14,8 @@ class Settings(BaseSettings):
     # Server Configuration
     HOST: str = "0.0.0.0"
     PORT: int = 8085
-    LOG_LEVEL: str = "INFO"
-    DEBUG: bool = False
+    LOG_LEVEL: str = "error"
+    APP_DEBUG: bool = False
     RELOAD: bool = False
 
     # Stream Configuration

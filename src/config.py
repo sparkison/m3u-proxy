@@ -38,7 +38,7 @@ class Settings(BaseSettings):
 
     # Optional Redis Configuration for distributed systems (not yet implemented)
     REDIS_HOST: Optional[str] = None
-    REDIS_PORT: int = 6379
+    REDIS_SERVER_PORT: int = 6379
 
     # Model configuration
     model_config = SettingsConfigDict(

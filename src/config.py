@@ -21,7 +21,7 @@ class Settings(BaseSettings):
     REDOC_URL: str = "/redoc"
     OPENAPI_URL: str = "/openapi.json"
 
-    # Stream Configuration
+    # Route Configuration
     ROOT_PATH: str = ""
     CLIENT_TIMEOUT: int = 30
     STREAM_TIMEOUT: int = 300
@@ -46,6 +46,9 @@ class Settings(BaseSettings):
     # Optional Redis Configuration for distributed systems (not yet implemented)
     REDIS_HOST: Optional[str] = None
     REDIS_SERVER_PORT: int = 6379
+
+    # API Authentication
+    API_TOKEN: Optional[str] = None
 
     # Model configuration
     model_config = SettingsConfigDict(

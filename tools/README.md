@@ -48,6 +48,26 @@ python tools/demo_events.py
 - Demonstrates event emission
 - Example of custom event handlers
 
+### `auth_example.py`
+Example script demonstrating API token authentication usage.
+
+**Usage:**
+```bash
+# Without authentication
+python tools/auth_example.py
+
+# With authentication
+export API_TOKEN="your_secret_token"
+python tools/auth_example.py
+```
+
+**Features:**
+- Shows how to use API token authentication
+- Demonstrates all authenticated endpoints
+- Examples of creating, listing, and deleting streams
+- Health checks and statistics with auth
+- Shows that stream playback URLs don't require auth
+
 ### `run_tests.py`
 Enhanced test runner with additional options beyond basic pytest.
 

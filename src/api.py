@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Query, Response, Request, Depends
+from fastapi import FastAPI, HTTPException, Query, Response, Request, Depends, Header
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
@@ -184,7 +184,36 @@ def get_client_info(request: Request):
     }
 
 
-@app.get("/")
+async def verify_token(x_api_token: Optional[str] = Header(None, alias="X-API-Token")):
+    """
+    Verify API token if API_TOKEN is configured.
+    Token can be provided via X-API-Token header.
+    If API_TOKEN is not set in environment, authentication is disabled.
+    """
+    # If no API token is configured, skip authentication
+    if not settings.API_TOKEN:
+        return True
+    
+    # If API token is configured, require it in the header
+    if not x_api_token:
+        raise HTTPException(
+            status_code=401,
+            detail="API token required. Provide token via X-API-Token header.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    
+    # Verify the token matches
+    if x_api_token != settings.API_TOKEN:
+        raise HTTPException(
+            status_code=403,
+            detail="Invalid API token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    
+    return True
+
+
+@app.get("/", dependencies=[Depends(verify_token)])
 async def root():
     stats = stream_manager.get_stats()
     proxy_stats = stats["proxy_stats"]
@@ -232,7 +261,7 @@ async def resolve_stream_id(
     return stream_id
 
 
-@app.post("/streams")
+@app.post("/streams", dependencies=[Depends(verify_token)])
 async def create_stream(request: StreamCreateRequest):
     """Create a new stream with optional failover URLs, custom user agent, and metadata"""
     try:
@@ -618,7 +647,7 @@ async def head_direct_stream(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.delete("/hls/{stream_id}/clients/{client_id}")
+@app.delete("/hls/{stream_id}/clients/{client_id}", dependencies=[Depends(verify_token)])
 async def disconnect_client(stream_id: str, client_id: str):
     """Disconnect a specific client"""
     try:
@@ -629,7 +658,7 @@ async def disconnect_client(stream_id: str, client_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/stats")
+@app.get("/stats", dependencies=[Depends(verify_token)])
 async def get_stats():
     """Get comprehensive proxy statistics"""
     try:
@@ -644,7 +673,7 @@ async def get_stats():
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/stats/detailed")
+@app.get("/stats/detailed", dependencies=[Depends(verify_token)])
 async def get_detailed_stats():
     """Get detailed statistics including performance and monitoring metrics"""
     try:
@@ -663,7 +692,7 @@ async def get_detailed_stats():
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/stats/performance")
+@app.get("/stats/performance", dependencies=[Depends(verify_token)])
 async def get_performance_stats():
     """Get performance-specific statistics"""
     try:
@@ -681,7 +710,7 @@ async def get_performance_stats():
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/stats/streams")
+@app.get("/stats/streams", dependencies=[Depends(verify_token)])
 async def get_stream_stats():
     """Get stream-specific statistics"""
     try:
@@ -695,7 +724,7 @@ async def get_stream_stats():
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/stats/clients")
+@app.get("/stats/clients", dependencies=[Depends(verify_token)])
 async def get_client_stats():
     """Get client-specific statistics"""
     try:
@@ -709,13 +738,13 @@ async def get_client_stats():
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/clients")
+@app.get("/clients", dependencies=[Depends(verify_token)])
 async def list_clients():
     """List all active clients (alias for /stats/clients)"""
     return await get_client_stats()
 
 
-@app.get("/streams")
+@app.get("/streams", dependencies=[Depends(verify_token)])
 async def list_streams():
     """List all active streams"""
     try:
@@ -729,7 +758,7 @@ async def list_streams():
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/streams/{stream_id}")
+@app.get("/streams/{stream_id}", dependencies=[Depends(verify_token)])
 async def get_stream_info(stream_id: str):
     """Get information about a specific stream"""
     try:
@@ -759,7 +788,7 @@ async def get_stream_info(stream_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.delete("/streams/{stream_id}")
+@app.delete("/streams/{stream_id}", dependencies=[Depends(verify_token)])
 async def delete_stream(stream_id: str):
     """Delete a stream and disconnect all its clients"""
     try:
@@ -788,7 +817,7 @@ async def delete_stream(stream_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/streams/{stream_id}/failover")
+@app.post("/streams/{stream_id}/failover", dependencies=[Depends(verify_token)])
 async def trigger_failover(stream_id: str):
     """Manually trigger failover for a stream"""
     try:
@@ -816,7 +845,7 @@ async def trigger_failover(stream_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/health")
+@app.get("/health", dependencies=[Depends(verify_token)])
 async def health_check():
     """Health check endpoint with detailed status"""
     try:
@@ -840,7 +869,7 @@ async def health_check():
 
 
 # Webhook Management Endpoints
-@app.post("/webhooks")
+@app.post("/webhooks", dependencies=[Depends(verify_token)])
 async def add_webhook(webhook: WebhookConfig):
     """Add a new webhook configuration"""
     try:
@@ -855,7 +884,7 @@ async def add_webhook(webhook: WebhookConfig):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/webhooks")
+@app.get("/webhooks", dependencies=[Depends(verify_token)])
 async def list_webhooks():
     """List all configured webhooks"""
     try:
@@ -874,7 +903,7 @@ async def list_webhooks():
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.delete("/webhooks")
+@app.delete("/webhooks", dependencies=[Depends(verify_token)])
 async def remove_webhook(webhook_url: str = Query(..., description="Webhook URL to remove")):
     """Remove a webhook configuration"""
     try:
@@ -890,7 +919,7 @@ async def remove_webhook(webhook_url: str = Query(..., description="Webhook URL 
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/webhooks/test")
+@app.post("/webhooks/test", dependencies=[Depends(verify_token)])
 async def test_webhook(webhook_url: str = Query(..., description="Webhook URL to test")):
     """Send a test event to a webhook"""
     try:

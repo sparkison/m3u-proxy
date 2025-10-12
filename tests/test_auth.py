@@ -68,6 +68,29 @@ class TestAuthentication:
         assert response.status_code != 401
         assert response.status_code != 403
     
+    def test_protected_endpoint_with_query_param_token(self, client_with_auth):
+        """Protected endpoints should work with token in query parameter"""
+        response = client_with_auth.get("/health?api_token=test_token_123")
+        # Should get a successful response (200) or error unrelated to auth
+        assert response.status_code != 401
+        assert response.status_code != 403
+    
+    def test_protected_endpoint_with_invalid_query_param_token(self, client_with_auth):
+        """Protected endpoints should return 403 with invalid query token"""
+        response = client_with_auth.get("/health?api_token=wrong_token")
+        assert response.status_code == 403
+        assert "Invalid API token" in response.json()["detail"]
+    
+    def test_header_takes_precedence_over_query_param(self, client_with_auth):
+        """Header token should be used if both header and query param are provided"""
+        # Correct token in header, wrong in query - should succeed
+        response = client_with_auth.get(
+            "/health?api_token=wrong_token",
+            headers={"X-API-Token": "test_token_123"}
+        )
+        assert response.status_code != 401
+        assert response.status_code != 403
+    
     def test_all_protected_endpoints_require_token(self, client_with_auth):
         """All management endpoints should require authentication"""
         protected_endpoints = [

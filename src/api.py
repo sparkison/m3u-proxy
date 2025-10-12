@@ -184,26 +184,35 @@ def get_client_info(request: Request):
     }
 
 
-async def verify_token(x_api_token: Optional[str] = Header(None, alias="X-API-Token")):
+async def verify_token(
+    x_api_token: Optional[str] = Header(None, alias="X-API-Token"),
+    api_token: Optional[str] = Query(None, description="API token (alternative to X-API-Token header)")
+):
     """
     Verify API token if API_TOKEN is configured.
-    Token can be provided via X-API-Token header.
+    Token can be provided via:
+    - X-API-Token header (recommended)
+    - api_token query parameter (for browser access or when headers are difficult)
+    
     If API_TOKEN is not set in environment, authentication is disabled.
     """
     # If no API token is configured, skip authentication
     if not settings.API_TOKEN:
         return True
     
-    # If API token is configured, require it in the header
-    if not x_api_token:
+    # Check for token in either header or query parameter
+    provided_token = x_api_token or api_token
+    
+    # If API token is configured, require it in the header or query
+    if not provided_token:
         raise HTTPException(
             status_code=401,
-            detail="API token required. Provide token via X-API-Token header.",
+            detail="API token required. Provide token via X-API-Token header or api_token query parameter.",
             headers={"WWW-Authenticate": "Bearer"},
         )
     
     # Verify the token matches
-    if x_api_token != settings.API_TOKEN:
+    if provided_token != settings.API_TOKEN:
         raise HTTPException(
             status_code=403,
             detail="Invalid API token",

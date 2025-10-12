@@ -26,11 +26,19 @@ API_TOKEN = os.getenv("API_TOKEN")
 
 
 def get_headers() -> dict:
-    """Get headers with API token if configured"""
+    """Get headers with API token if configured (header method)"""
     headers = {"Content-Type": "application/json"}
     if API_TOKEN:
         headers["X-API-Token"] = API_TOKEN
     return headers
+
+
+def get_url_with_token(url: str) -> str:
+    """Get URL with api_token query parameter if configured"""
+    if API_TOKEN:
+        separator = "&" if "?" in url else "?"
+        return f"{url}{separator}api_token={API_TOKEN}"
+    return url
 
 
 def create_stream(url: str, failover_urls: Optional[list] = None) -> dict:
@@ -164,6 +172,29 @@ def check_health() -> dict:
     return data
 
 
+def check_health_with_query_param() -> dict:
+    """Check proxy health using query parameter method (useful for browser)"""
+    print("\n🏥 Checking proxy health (using query parameter)...")
+    
+    url = get_url_with_token(f"{BASE_URL}/health")
+    print(f"   URL: {url}")
+    
+    response = requests.get(url)
+    
+    if response.status_code == 401:
+        print("❌ Authentication required!")
+        return None
+    elif response.status_code == 403:
+        print("❌ Invalid API token!")
+        return None
+    
+    data = response.json()
+    print(f"✅ Status: {data.get('status', 'unknown')}")
+    print(f"   Version: {data.get('version', 'unknown')}")
+    
+    return data
+
+
 def main():
     """Main example flow"""
     print("=" * 60)
@@ -177,11 +208,18 @@ def main():
     else:
         print(f"\n🔑 Using API token: {API_TOKEN[:8]}...{API_TOKEN[-4:]}")
     
-    # Check health
+    # Check health using header method
     health = check_health()
     if not health:
         print("\n❌ Cannot connect to proxy or authentication failed. Exiting.")
         return
+    
+    # Also demonstrate query parameter method
+    if API_TOKEN:
+        print("\n" + "=" * 60)
+        print("Demonstrating Query Parameter Authentication")
+        print("=" * 60)
+        check_health_with_query_param()
     
     # Get current stats
     get_stats()

@@ -228,11 +228,19 @@ Example with authentication:
 # Set your API token
 export API_TOKEN="my_secret_token"
 
-# Create a stream with authentication
+# Method 1: Using header (recommended for API calls)
 curl -X POST "http://localhost:8085/streams" \
   -H "Content-Type: application/json" \
   -H "X-API-Token: my_secret_token" \
   -d '{"url": "https://your-stream.m3u8"}'
+
+# Method 2: Using query parameter (useful for browser access)
+curl -X POST "http://localhost:8085/streams?api_token=my_secret_token" \
+  -H "Content-Type: application/json" \
+  -d '{"url": "https://your-stream.m3u8"}'
+
+# Browser access example
+# Visit: http://localhost:8085/stats?api_token=my_secret_token
 
 # Without token - will get 401 error
 curl -X POST "http://localhost:8085/streams" \

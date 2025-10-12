@@ -195,12 +195,60 @@ python m3u_client.py delete <stream_id>
 M3U_PROXY_HOST=0.0.0.0
 M3U_PROXY_PORT=8085
 
+# API Authentication (optional)
+# Set API_TOKEN to require authentication for management endpoints
+# Leave unset or empty to disable authentication
+API_TOKEN=your_secret_token_here
+
 # Client timeout (seconds)
 CLIENT_TIMEOUT=300
 
 # Cleanup interval (seconds)
 CLEANUP_INTERVAL=60
 ```
+
+### API Authentication
+
+When `API_TOKEN` is set in the environment, all management endpoints require authentication via the `X-API-Token` header. This includes:
+
+- `/` - Root endpoint
+- `/streams` - Create, list, get, delete streams
+- `/stats/*` - All statistics endpoints
+- `/clients` - Client management
+- `/health` - Health check endpoint
+- `/webhooks` - Webhook management
+- `/streams/{stream_id}/failover` - Failover control
+- `/hls/{stream_id}/clients/{client_id}` - Client disconnect
+
+**Stream endpoints (the actual streaming URLs) do NOT require authentication** since they are accessed by media players that identify streams via `stream_id`.
+
+Example with authentication:
+
+```bash
+# Set your API token
+export API_TOKEN="my_secret_token"
+
+# Method 1: Using header (recommended for API calls)
+curl -X POST "http://localhost:8085/streams" \
+  -H "Content-Type: application/json" \
+  -H "X-API-Token: my_secret_token" \
+  -d '{"url": "https://your-stream.m3u8"}'
+
+# Method 2: Using query parameter (useful for browser access)
+curl -X POST "http://localhost:8085/streams?api_token=my_secret_token" \
+  -H "Content-Type: application/json" \
+  -d '{"url": "https://your-stream.m3u8"}'
+
+# Browser access example
+# Visit: http://localhost:8085/stats?api_token=my_secret_token
+
+# Without token - will get 401 error
+curl -X POST "http://localhost:8085/streams" \
+  -H "Content-Type: application/json" \
+  -d '{"url": "https://your-stream.m3u8"}'
+```
+
+To disable authentication, simply leave `API_TOKEN` unset or set it to an empty string.
 
 ### Server Startup Options
 

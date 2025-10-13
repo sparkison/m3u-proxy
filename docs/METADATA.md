@@ -140,7 +140,61 @@ Identify which external source provided the stream:
 
 ### Filtering Streams by Metadata
 
-You can retrieve all streams and filter by metadata in your application:
+#### Server-Side Filtering (Recommended)
+
+**Endpoint:** `GET /streams/by-metadata`
+
+The most efficient way to filter streams is using the server-side filtering endpoint:
+
+**Parameters:**
+- `field` (required): The metadata field to filter by
+- `value` (required): The value to match
+- `active_only` (optional, default: true): Only return streams with active clients
+
+**Example Requests:**
+
+```bash
+# Get all streams with local_id = "stream_123"
+curl "http://localhost:8085/streams/by-metadata?field=local_id&value=stream_123"
+
+# Get all sports streams (active only)
+curl "http://localhost:8085/streams/by-metadata?field=category&value=sports&active_only=true"
+
+# Get all streams from a specific provider (including inactive)
+curl "http://localhost:8085/streams/by-metadata?field=provider&value=provider_a&active_only=false"
+```
+
+**Response Format:**
+```json
+{
+  "filter": {
+    "field": "category",
+    "value": "sports"
+  },
+  "active_only": true,
+  "matching_streams": [
+    {
+      "stream_id": "a1b2c3d4e5f6...",
+      "client_count": 2,
+      "metadata": {
+        "local_id": "espn_hd",
+        "category": "sports",
+        "channel_name": "ESPN HD"
+      },
+      "last_access": "2025-10-05T14:35:00.000000",
+      "is_active": true,
+      "url": "https://example.com/espn.m3u8",
+      "stream_type": "HLS"
+    }
+  ],
+  "total_matching": 1,
+  "total_clients": 2
+}
+```
+
+#### Client-Side Filtering (Alternative)
+
+You can also retrieve all streams and filter by metadata in your application:
 
 ```python
 import requests
@@ -166,6 +220,40 @@ channel_201 = next(
     (s for s in streams if s.get("metadata", {}).get("channel_number") == "201"),
     None
 )
+```
+
+#### Python Examples Using Server-Side Filtering
+
+```python
+import requests
+
+def get_streams_by_metadata(field, value, active_only=True, base_url="http://localhost:8085"):
+    """Get streams filtered by metadata field/value"""
+    response = requests.get(
+        f"{base_url}/streams/by-metadata",
+        params={
+            "field": field,
+            "value": value,
+            "active_only": active_only
+        }
+    )
+    
+    if response.status_code == 200:
+        return response.json()
+    else:
+        raise Exception(f"Failed to get streams: {response.text}")
+
+# Usage examples
+# Get specific channel by local ID
+hbo_data = get_streams_by_metadata("local_id", "hbo_hd")
+hbo_streams = hbo_data["matching_streams"]
+
+# Get all active sports streams
+sports_data = get_streams_by_metadata("category", "sports", active_only=True)
+print(f"Found {sports_data['total_matching']} sports streams with {sports_data['total_clients']} total clients")
+
+# Get all streams from a provider (including inactive)
+provider_data = get_streams_by_metadata("provider", "provider_a", active_only=False)
 ```
 
 ## Metadata Specification
@@ -260,25 +348,56 @@ class IPTVProxy:
             raise Exception(f"Failed to add channel: {response.text}")
     
     def get_channel_by_local_id(self, channel_id):
-        """Get channel info by your local ID"""
-        response = requests.get(f"{self.proxy_url}/streams")
-        streams = response.json()["streams"]
+        """Get channel info by your local ID using server-side filtering"""
+        response = requests.get(
+            f"{self.proxy_url}/streams/by-metadata",
+            params={
+                "field": "local_id",
+                "value": channel_id,
+                "active_only": False
+            }
+        )
         
-        for stream in streams:
-            if stream.get("metadata", {}).get("local_id") == channel_id:
-                return stream
+        if response.status_code == 200:
+            data = response.json()
+            streams = data.get("matching_streams", [])
+            return streams[0] if streams else None
         
         return None
     
-    def get_channels_by_category(self, category):
-        """Get all channels in a category"""
-        response = requests.get(f"{self.proxy_url}/streams")
-        streams = response.json()["streams"]
+    def get_channels_by_category(self, category, active_only=True):
+        """Get all channels in a category using server-side filtering"""
+        response = requests.get(
+            f"{self.proxy_url}/streams/by-metadata",
+            params={
+                "field": "category", 
+                "value": category,
+                "active_only": active_only
+            }
+        )
         
-        return [
-            s for s in streams 
-            if s.get("metadata", {}).get("category") == category
-        ]
+        if response.status_code == 200:
+            data = response.json()
+            return data.get("matching_streams", [])
+        
+        return []
+    
+    def get_active_client_count_by_category(self, category):
+        """Get total active clients for a category"""
+        response = requests.get(
+            f"{self.proxy_url}/streams/by-metadata",
+            params={
+                "field": "category",
+                "value": category,
+                "active_only": True
+            }
+        )
+        
+        if response.status_code == 200:
+            data = response.json()
+            return data.get("total_clients", 0)
+        
+        return 0
 
 # Usage
 proxy = IPTVProxy("http://localhost:8085")
@@ -312,29 +431,46 @@ curl -X POST "http://localhost:8085/streams" \
   }'
 ```
 
+### Server-side filtering by metadata:
+```bash
+# Get specific stream by local_id
+curl "http://localhost:8085/streams/by-metadata?field=local_id&value=hbo_hd"
+
+# Get all sports streams (active only)
+curl "http://localhost:8085/streams/by-metadata?field=category&value=sports&active_only=true"
+
+# Get all streams by provider (including inactive)
+curl "http://localhost:8085/streams/by-metadata?field=provider&value=provider_a&active_only=false"
+
+# Get total client count for a category
+curl -s "http://localhost:8085/streams/by-metadata?field=category&value=sports" | jq '.total_clients'
+```
+
 ### Get all streams with metadata:
 ```bash
 curl "http://localhost:8085/streams" | jq '.streams[] | {stream_id, metadata}'
 ```
 
-### Filter by metadata using jq:
+### Client-side filtering using jq:
 ```bash
-# Get stream with specific local_id
+# Get stream with specific local_id (client-side filtering)
 curl -s "http://localhost:8085/streams" | \
   jq '.streams[] | select(.metadata.local_id == "hbo_hd")'
 
-# Get all sports channels
+# Get all sports channels (client-side filtering)
 curl -s "http://localhost:8085/streams" | \
   jq '.streams[] | select(.metadata.category == "sports")'
 ```
 
 ## Best Practices
 
-1. **Use Consistent Keys:** Define a standard set of metadata keys across your application
-2. **Include Identifiers:** Always include a unique identifier like `local_id`
-3. **Keep It Simple:** Store only what you need; avoid large nested structures
-4. **Document Your Schema:** Maintain documentation of your metadata structure
-5. **Version Your Metadata:** Consider including a `metadata_version` field for future changes
+1. **Use Server-Side Filtering:** Use the `/streams/by-metadata` endpoint instead of client-side filtering for better performance
+2. **Use Consistent Keys:** Define a standard set of metadata keys across your application
+3. **Include Identifiers:** Always include a unique identifier like `local_id`
+4. **Keep It Simple:** Store only what you need; avoid large nested structures
+5. **Document Your Schema:** Maintain documentation of your metadata structure
+6. **Version Your Metadata:** Consider including a `metadata_version` field for future changes
+7. **Filter Efficiently:** Use `active_only=true` when you only need streams with connected clients
 
 ## Migration Guide
 

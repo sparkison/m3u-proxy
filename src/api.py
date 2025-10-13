@@ -186,23 +186,24 @@ def get_client_info(request: Request):
 
 async def verify_token(
     x_api_token: Optional[str] = Header(None, alias="X-API-Token"),
-    api_token: Optional[str] = Query(None, description="API token (alternative to X-API-Token header)")
+    api_token: Optional[str] = Query(
+        None, description="API token (alternative to X-API-Token header)")
 ):
     """
     Verify API token if API_TOKEN is configured.
     Token can be provided via:
     - X-API-Token header (recommended)
     - api_token query parameter (for browser access or when headers are difficult)
-    
+
     If API_TOKEN is not set in environment, authentication is disabled.
     """
     # If no API token is configured, skip authentication
     if not settings.API_TOKEN:
         return True
-    
+
     # Check for token in either header or query parameter
     provided_token = x_api_token or api_token
-    
+
     # If API token is configured, require it in the header or query
     if not provided_token:
         raise HTTPException(
@@ -210,7 +211,7 @@ async def verify_token(
             detail="API token required. Provide token via X-API-Token header or api_token query parameter.",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    
+
     # Verify the token matches
     if provided_token != settings.API_TOKEN:
         raise HTTPException(
@@ -218,7 +219,7 @@ async def verify_token(
             detail="Invalid API token",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    
+
     return True
 
 
@@ -767,6 +768,60 @@ async def list_streams():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/streams/by-metadata", dependencies=[Depends(verify_token)])
+async def get_streams_by_metadata(
+    field: str = Query(..., description="Metadata field to filter by"),
+    value: str = Query(..., description="Value to match"),
+    active_only: bool = Query(
+        True, description="Only return streams with active clients")
+):
+    """Get active streams filtered by any metadata field with real-time status"""
+    matching_streams = []
+
+    for stream_id, stream_info in stream_manager.streams.items():
+        # Skip variant streams - they don't have independent client counts
+        if stream_info.is_variant_stream:
+            continue
+
+        # Check metadata field match
+        if stream_info.metadata.get(field) != value:
+            continue
+
+        # Count only ACTIVE clients, not all clients in the set
+        active_client_count = 0
+        if stream_id in stream_manager.stream_clients:
+            for client_id in stream_manager.stream_clients[stream_id]:
+                if (client_id in stream_manager.clients and
+                        stream_manager.clients[client_id].is_connected):
+                    active_client_count += 1
+
+        # Check if stream has active clients (if requested)
+        if active_only and active_client_count == 0:
+            continue
+
+        # Check if stream is still considered active
+        if not stream_info.is_active:
+            continue
+
+        matching_streams.append({
+            'stream_id': stream_id,
+            'client_count': active_client_count,  # Use active count, not total count
+            'metadata': stream_info.metadata,
+            'last_access': stream_info.last_access.isoformat(),
+            'is_active': stream_info.is_active,
+            'url': stream_info.current_url or stream_info.original_url,
+            'stream_type': 'HLS' if stream_info.is_hls else ('VOD' if stream_info.is_vod else 'Live Continuous')
+        })
+
+    return {
+        'filter': {'field': field, 'value': value},
+        'active_only': active_only,
+        'matching_streams': matching_streams,
+        'total_matching': len(matching_streams),
+        'total_clients': sum(stream['client_count'] for stream in matching_streams)
+    }
+
+
 @app.get("/streams/{stream_id}", dependencies=[Depends(verify_token)])
 async def get_stream_info(stream_id: str):
     """Get information about a specific stream"""
@@ -781,14 +836,25 @@ async def get_stream_info(stream_id: str):
         if not stream_stats:
             raise HTTPException(status_code=404, detail="Stream not found")
 
-        # Get clients for this stream
-        stream_clients = [c for c in stats["clients"]
-                          if c["stream_id"] == stream_id]
+        # Get only ACTIVE clients for this stream
+        active_stream_clients = []
+        if stream_id in stream_manager.stream_clients:
+            for client_id in stream_manager.stream_clients[stream_id]:
+                if (client_id in stream_manager.clients and
+                        stream_manager.clients[client_id].is_connected):
+                    # Find the client in stats
+                    client_stats = next(
+                        (c for c in stats["clients"]
+                         if c["client_id"] == client_id),
+                        None
+                    )
+                    if client_stats:
+                        active_stream_clients.append(client_stats)
 
         return {
             "stream": stream_stats,
-            "clients": stream_clients,
-            "client_count": len(stream_clients)
+            "clients": active_stream_clients,
+            "client_count": len(active_stream_clients)
         }
     except HTTPException:
         raise
@@ -876,8 +942,9 @@ async def health_check():
             "error": str(e)
         }, 500
 
-
 # Webhook Management Endpoints
+
+
 @app.post("/webhooks", dependencies=[Depends(verify_token)])
 async def add_webhook(webhook: WebhookConfig):
     """Add a new webhook configuration"""

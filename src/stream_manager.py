@@ -908,7 +908,15 @@ class StreamManager:
         inactive_streams = []
 
         for stream_id, stream_info in self.streams.items():
-            has_active_clients = stream_id in self.stream_clients and len(self.stream_clients[stream_id]) > 0
+            # Count only ACTIVE clients for this stream
+            active_client_count = 0
+            if stream_id in self.stream_clients:
+                for client_id in self.stream_clients[stream_id]:
+                    if (client_id in self.clients and 
+                        self.clients[client_id].is_connected):
+                        active_client_count += 1
+
+            has_active_clients = active_client_count > 0
             is_old = (current_time - stream_info.last_access).seconds > self.stream_timeout
 
             if not has_active_clients and is_old:
@@ -937,11 +945,19 @@ class StreamManager:
                     # Initialize with parent stream data if it exists
                     if parent_id in self.streams:
                         parent = self.streams[parent_id]
+                        # Count only ACTIVE clients for parent stream
+                        active_parent_clients = 0
+                        if parent_id in self.stream_clients:
+                            for client_id in self.stream_clients[parent_id]:
+                                if (client_id in self.clients and 
+                                    self.clients[client_id].is_connected):
+                                    active_parent_clients += 1
+                        
                         stream_stats_map[parent_id] = {
                             "bytes": parent.total_bytes_served,
                             "segments": parent.total_segments_served,
                             "errors": parent.error_count,
-                            "clients": parent.client_count
+                            "clients": active_parent_clients
                         }
                     else:
                         stream_stats_map[parent_id] = {"bytes": 0, "segments": 0, "errors": 0, "clients": 0}
@@ -952,20 +968,31 @@ class StreamManager:
                 stream_stats_map[parent_id]["errors"] += stream.error_count
                 # Don't double-count clients - they're tracked at parent level
             elif not stream.is_variant_stream:
-                # Non-variant stream - use its own stats
+                # Non-variant stream - use its own stats with active client count
                 stream_id = stream.stream_id
                 if stream_id not in stream_stats_map:
+                    # Count only ACTIVE clients for this stream
+                    active_stream_clients = 0
+                    if stream_id in self.stream_clients:
+                        for client_id in self.stream_clients[stream_id]:
+                            if (client_id in self.clients and 
+                                self.clients[client_id].is_connected):
+                                active_stream_clients += 1
+                    
                     stream_stats_map[stream_id] = {
                         "bytes": stream.total_bytes_served,
                         "segments": stream.total_segments_served,
                         "errors": stream.error_count,
-                        "clients": stream.client_count
+                        "clients": active_stream_clients
                     }
         
+        # Count active streams (streams with at least one active client)
         active_stream_count = sum(1 for stream in non_variant_streams
-                                  if stream.client_count > 0 and stream.is_active)
+                                  if stream_stats_map.get(stream.stream_id, {}).get("clients", 0) > 0 and stream.is_active)
+        
+        # Count only connected clients
         active_client_count = sum(1 for client in self.clients.values()
-                                  if (datetime.now() - client.last_access).seconds < self.client_timeout)
+                                  if client.is_connected)
 
         return {
             "proxy_stats": {
@@ -983,7 +1010,7 @@ class StreamManager:
                     "original_url": stream.original_url,
                     "current_url": stream.current_url,
                     "user_agent": stream.user_agent,
-                    "client_count": stream_stats_map.get(stream.stream_id, {}).get("clients", stream.client_count),
+                    "client_count": stream_stats_map.get(stream.stream_id, {}).get("clients", 0),
                     "total_bytes_served": stream_stats_map.get(stream.stream_id, {}).get("bytes", stream.total_bytes_served),
                     "total_segments_served": stream_stats_map.get(stream.stream_id, {}).get("segments", stream.total_segments_served),
                     "error_count": stream_stats_map.get(stream.stream_id, {}).get("errors", stream.error_count),
@@ -1005,8 +1032,10 @@ class StreamManager:
                     "bytes_served": client.bytes_served,
                     "segments_served": client.segments_served,
                     "created_at": client.created_at.isoformat(),
-                    "last_access": client.last_access.isoformat()
+                    "last_access": client.last_access.isoformat(),
+                    "is_connected": client.is_connected
                 }
                 for client in self.clients.values()
+                if client.is_connected  # Only include connected clients
             ]
         }

@@ -1,6 +1,6 @@
 # m3u-proxy Architecture Guide
 
-## Core Architecture (v2.0)
+## Core Architecture
 
 ### 🚀 **True Live Proxy Design**
 
@@ -23,7 +23,7 @@ Client C → Provider (independent connection)
 ```
 
 #### 2. **HLS Streams (.m3u8)**
-- **Keeps existing architecture** (it works perfectly!)
+- Stream connections are shared (multiple clients, 1 stream connection)
 - On-demand segment fetching
 - Efficient playlist processing
 - Shared HTTP client with connection pooling
@@ -50,8 +50,7 @@ Client C → Provider (independent connection)
    )
    ```
 
-3. **Reduced Memory Overhead** - No more 1000-chunk buffers per stream
-4. **Efficient Stats Tracking** - Lightweight per-client metrics
+3. **Efficient Stats Tracking** - Lightweight per-client metrics
 
 ### 🔄 **Seamless Failover**
 
@@ -73,7 +72,7 @@ except Error:
         yield chunk  # Client doesn't notice the switch
 ```
 
-### 📊 **Enhanced Monitoring**
+### 📊 **Monitoring**
 
 - Stream type detection (HLS, VOD, Live Continuous)
 - Per-client bandwidth tracking
@@ -91,30 +90,7 @@ The `StreamManager` class in `src/stream_manager.py` implements the per-client d
 from stream_manager import StreamManager
 ```
 
-### API Compatibility
-
-All API endpoints maintain backward compatibility. The architecture changes are internal optimizations that don't affect the external API surface.
-
-**No breaking changes!**
-
-## Performance Comparison
-
-### Memory Usage
-- **Current (v2.0):** Minimal buffering, ~64KB per active client
-- **Previous (v1.x):** ~1000 chunks × 32KB per stream = ~32MB per active stream
-- **Improvement:** 98% memory reduction for 10 simultaneous clients
-
-### Connection Efficiency
-- **Current (v2.0):** N clients → N provider connections (truly ephemeral)
-- **Previous (v1.x):** 1 provider connection → shared buffer → N clients (broken for continuous)
-- **HLS Streams:** Both versions optimal (segment-based works with either approach)
-
-### Failover Time
-- **Current (v2.0):** <100ms (seamless connection handoff)
-- **Previous (v1.x):** 2+ seconds (restart entire connection + buffer wait)
-- **Improvement:** 20x faster, per-client instead of global
-
-## Testing the Improvements
+## Testing
 
 ### Test 1: Multiple Clients on Continuous Stream
 
@@ -235,72 +211,6 @@ STREAM_TIMEOUT=300
 - ✅ Works for all stream types
 
 **Verdict:** Option B is superior for continuous streams.
-
-### Memory Concerns?
-
-**Q:** Won't N connections use more memory than 1 shared connection?
-
-**A:** Actually, no:
-- V1: 1 provider connection + 32MB buffer + coordination overhead
-- V2: N provider connections with minimal buffering (64KB each)
-- Modern HTTP clients reuse TCP connections (connection pooling)
-- Kernel handles TCP buffering efficiently
-- No Python-level buffering overhead
-
-**For 10 clients:**
-- V1: 32MB buffer + coordination = ~35MB
-- V2: 10 × 64KB = 640KB
-
-**V2 uses LESS memory!**
-
-### Bandwidth Concerns?
-
-**Q:** Won't N connections use N× bandwidth?
-
-**A:** That's how it's supposed to work!
-- Each client is watching the stream = N× bandwidth is expected
-- V1's shared connection was an attempt to optimize, but it was broken
-- True live proxy means: proxy what the client requests, when they request it
-- Provider expects N connections for N viewers
-
-## Backward Compatibility
-
-V2 is **100% backward compatible**:
-- All existing API endpoints work identically
-- Existing client code requires no changes
-- Falls back to V1 if V2 not available
-- Same configuration, same behavior (but fixed)
-
-## Summary
-
-### What V2 Fixes
-
-1. ✅ **True live proxy** - Provider connections are truly ephemeral
-2. ✅ **Correct multi-client support** - Each client gets independent stream
-3. ✅ **VOD support** - Range requests work correctly
-4. ✅ **Seamless failover** - Per-client, no interruption
-5. ✅ **Lower memory** - No large buffers
-6. ✅ **Better performance** - uvloop, connection pooling
-
-### What V2 Keeps
-
-1. ✅ **HLS support** - Already working perfectly
-2. ✅ **Event system** - All events still fire
-3. ✅ **Client tracking** - Statistics still tracked
-4. ✅ **User agent support** - Per-stream UA still works
-5. ✅ **API compatibility** - No breaking changes
-
-### Bottom Line
-
-**V2 makes m3u-proxy a true live proxy** as originally specified:
-- ✅ Streams consumed by app and fed to clients
-- ✅ Provider connections ephemeral, only open when being consumed
-- ✅ Multiple clients supported correctly
-- ✅ Immediate cleanup when no clients
-- ✅ Seamless failover
-- ✅ No transcoding, pure byte proxy
-- ✅ User IP protection
-- ✅ Multiple format support
 
 ---
 

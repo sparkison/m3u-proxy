@@ -23,12 +23,17 @@ COPY src/ ./src/
 COPY main.py .
 COPY .env.example .env
 
+# Copy Docker scripts
+COPY docker/ ./docker/
+
 # Create directories
 RUN mkdir -p /tmp/m3u-proxy-streams
+
+# Make scripts executable
+RUN chmod +x /app/docker/entrypoint.sh /app/docker/check-hwaccel.sh
 
 # Environment variables
 ENV PYTHONPATH=/app
 
 # Override the default entrypoint and run the application
-ENTRYPOINT []
-CMD ["python3", "main.py"]
+ENTRYPOINT ["/app/docker/entrypoint.sh"]

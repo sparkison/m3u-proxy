@@ -43,9 +43,20 @@ class Settings(BaseSettings):
     TEMP_DIR: str = "/tmp/m3u-proxy-streams"
     LOG_FILE: str = "m3u-proxy.log"
 
-    # Optional Redis Configuration for distributed systems (not yet implemented)
-    REDIS_HOST: Optional[str] = None
+    # Redis Configuration for pooling and multi-worker coordination
+    REDIS_HOST: str = "localhost"
     REDIS_SERVER_PORT: int = 6379
+    REDIS_DB: int = 0
+    REDIS_ENABLED: bool = False
+    ENABLE_TRANSCODING_POOLING: bool = True
+    MAX_CLIENTS_PER_SHARED_STREAM: int = 10
+    SHARED_STREAM_TIMEOUT: int = 300  # 5 minutes
+    
+    # Worker configuration
+    WORKER_ID: Optional[str] = None
+    HEARTBEAT_INTERVAL: int = 30  # seconds
+    CLEANUP_INTERVAL: int = 60    # seconds
+    STREAM_SHARING_STRATEGY: str = "url_profile"  # url_profile, url_only, disabled
 
     # API Authentication
     API_TOKEN: Optional[str] = None

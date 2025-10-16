@@ -11,7 +11,7 @@ import logging
 import subprocess
 import signal
 import os
-from typing import Dict, Optional, AsyncIterator, List, Set
+from typing import Dict, Optional, AsyncIterator, List, Set, Any
 from urllib.parse import urljoin, urlparse, quote, unquote
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field
@@ -138,12 +138,36 @@ class M3U8Processor:
 
 
 class StreamManager:
-    def __init__(self):
+    def __init__(self, redis_url: Optional[str] = None, enable_pooling: bool = True):
         self.streams: Dict[str, StreamInfo] = {}
         self.clients: Dict[str, ClientInfo] = {}
         self.stream_clients: Dict[str, Set[str]] = {}
         self.client_timeout = settings.CLIENT_TIMEOUT
         self.stream_timeout = settings.STREAM_TIMEOUT
+        
+        # Pooling configuration
+        self.enable_pooling = enable_pooling
+        self.pooled_manager: Optional[Any] = None  # Will be PooledStreamManager if available
+        
+        # Redis configuration
+        if redis_url and enable_pooling:
+            try:
+                from pooled_stream_manager import PooledStreamManager
+                self.pooled_manager = PooledStreamManager(redis_url=redis_url)
+                logger.info("Redis pooling enabled")
+            except ImportError:
+                logger.warning("Redis pooling requested but pooled_stream_manager not available")
+            except Exception as e:
+                logger.warning(f"Failed to initialize Redis pooling: {e}")
+        elif enable_pooling:
+            logger.info("Pooling enabled in single-worker mode (no Redis)")
+            try:
+                from pooled_stream_manager import PooledStreamManager
+                self.pooled_manager = PooledStreamManager(enable_sharing=False)
+            except ImportError:
+                logger.warning("pooled_stream_manager not available")
+        else:
+            logger.info("Connection pooling disabled")
         
         # Optimized HTTP clients with connection pooling
         self.http_client = httpx.AsyncClient(
@@ -200,13 +224,25 @@ class StreamManager:
     async def start(self):
         """Start the stream manager"""
         self._running = True
+        
+        # Start pooled manager if available
+        if self.pooled_manager:
+            await self.pooled_manager.start()
+            
         self._cleanup_task = asyncio.create_task(self._periodic_cleanup())
         self._health_check_task = asyncio.create_task(self._periodic_health_check())
-        logger.info("Stream manager started with optimized connection pooling and direct proxy architecture")
+        
+        mode = "with Redis pooling" if (self.pooled_manager and self.pooled_manager.enable_sharing) else "single-worker"
+        logger.info(f"Stream manager started {mode} and optimized connection pooling")
 
     async def stop(self):
         """Stop the stream manager"""
         self._running = False
+        
+        # Stop pooled manager
+        if self.pooled_manager:
+            await self.pooled_manager.stop()
+            
         if self._cleanup_task:
             self._cleanup_task.cancel()
         if self._health_check_task:

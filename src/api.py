@@ -15,6 +15,7 @@ from events import EventManager
 from models import StreamEvent, EventType, WebhookConfig
 from config import settings, VERSION
 from transcoding import get_profile_manager, TranscodingProfileManager
+from redis_config import get_redis_config, should_use_pooling
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -169,8 +170,12 @@ class TranscodeCreateRequest(BaseModel):
         return v
 
 
-# Global stream manager and event manager  
-stream_manager = StreamManager()
+# Global stream manager and event manager
+redis_config = get_redis_config()
+redis_url = redis_config.get('redis_url') if should_use_pooling() else None
+enable_pooling = should_use_pooling()
+
+stream_manager = StreamManager(redis_url=redis_url, enable_pooling=enable_pooling)
 event_manager = EventManager()
 
 

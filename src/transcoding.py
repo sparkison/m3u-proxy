@@ -1,8 +1,8 @@
 """
 Transcoding Profile System
 
-This module provides transcoding profiles similar to Dispatcharr but simplified
-for m3u-proxy with template-based parameter substitution and hardware acceleration.
+This module provides transcoding profiles similar for m3u-proxy
+with template-based parameter substitution and hardware acceleration.
 """
 
 import re

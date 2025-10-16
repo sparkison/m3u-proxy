@@ -8,6 +8,9 @@ import m3u8
 import asyncio
 import httpx
 import logging
+import subprocess
+import signal
+import os
 from typing import Dict, Optional, AsyncIterator, List, Set
 from urllib.parse import urljoin, urlparse, quote, unquote
 from datetime import datetime, timedelta
@@ -70,6 +73,11 @@ class StreamInfo:
     is_variant_stream: bool = False
     # Custom metadata - arbitrary key/value pairs for external identification
     metadata: Dict[str, str] = field(default_factory=dict)
+    # Transcoding configuration
+    is_transcoded: bool = False
+    transcode_profile: Optional[str] = None
+    transcode_ffmpeg_args: List[str] = field(default_factory=list)
+    transcode_process: Optional[asyncio.subprocess.Process] = None
 
 
 @dataclass
@@ -232,7 +240,10 @@ class StreamManager:
         failover_urls: Optional[List[str]] = None,
         user_agent: Optional[str] = None,
         parent_stream_id: Optional[str] = None,
-        metadata: Optional[Dict[str, str]] = None
+        metadata: Optional[Dict[str, str]] = None,
+        is_transcoded: bool = False,
+        transcode_profile: Optional[str] = None,
+        transcode_ffmpeg_args: Optional[List[str]] = None
     ) -> str:
         """Get or create a stream and return its ID
         
@@ -242,6 +253,9 @@ class StreamManager:
             user_agent: Optional user agent string
             parent_stream_id: Optional parent stream ID for variant playlists
             metadata: Optional custom key/value pairs for external identification
+            is_transcoded: Whether this stream should be transcoded
+            transcode_profile: Name of the transcoding profile to use
+            transcode_ffmpeg_args: FFmpeg arguments for transcoding
         """
         import hashlib
         stream_id = hashlib.md5(stream_url.encode()).hexdigest()
@@ -272,7 +286,10 @@ class StreamManager:
                 is_live_continuous=is_live_continuous,
                 parent_stream_id=parent_stream_id,
                 is_variant_stream=is_variant,
-                metadata=metadata or {}
+                metadata=metadata or {},
+                is_transcoded=is_transcoded,
+                transcode_profile=transcode_profile,
+                transcode_ffmpeg_args=transcode_ffmpeg_args or []
             )
             self.stream_clients[stream_id] = set()
             
@@ -631,6 +648,228 @@ class StreamManager:
             headers["Accept-Ranges"] = "bytes"
 
         return StreamingResponse(generate(), media_type=content_type, headers=headers)
+
+    async def stream_transcoded(
+        self,
+        stream_id: str,
+        client_id: str,
+        range_header: Optional[str] = None
+    ) -> StreamingResponse:
+        """
+        Real-time transcoding stream using FFmpeg.
+        Fetches the original stream and transcodes it on-the-fly using the configured profile.
+        """
+        if stream_id not in self.streams:
+            raise HTTPException(status_code=404, detail="Stream not found")
+
+        stream_info = self.streams[stream_id]
+        
+        if not stream_info.is_transcoded:
+            raise HTTPException(status_code=400, detail="Stream is not configured for transcoding")
+            
+        if not stream_info.transcode_ffmpeg_args:
+            raise HTTPException(status_code=500, detail="No transcoding configuration available")
+
+        current_url = stream_info.current_url or stream_info.original_url
+
+        # Register this client
+        if client_id not in self.clients:
+            await self.register_client(client_id, stream_id)
+
+        logger.info(f"Starting transcoded stream for client {client_id}, stream {stream_id}, profile: {stream_info.transcode_profile}")
+
+        async def generate():
+            """Generator that transcodes the stream using FFmpeg and yields the output"""
+            bytes_served = 0
+            chunk_count = 0
+            ffmpeg_process = None
+            
+            try:
+                # Emit stream started event
+                await self._emit_event("STREAM_STARTED", stream_id, {
+                    "url": current_url,
+                    "client_id": client_id,
+                    "mode": "transcoded",
+                    "profile": stream_info.transcode_profile,
+                    "ffmpeg_args": stream_info.transcode_ffmpeg_args
+                })
+
+                # Build FFmpeg command
+                ffmpeg_cmd = ["ffmpeg"]
+                
+                # Add input arguments and URL
+                cmd_args = stream_info.transcode_ffmpeg_args.copy()
+                
+                # Replace template variables in the FFmpeg args for streaming
+                streaming_variables = {
+                    "input_url": current_url,
+                    "output_args": "-",  # Just stdout, format will be handled separately
+                    "format": "mpegts"   # Force MPEGTS format for streaming
+                }
+                
+                # Re-render the profile with streaming-specific variables
+                from transcoding import get_profile_manager
+                profile_manager = get_profile_manager()
+                profile = None
+                if stream_info.transcode_profile:
+                    profile = profile_manager.get_profile(stream_info.transcode_profile)
+                if profile:
+                    cmd_args = profile.render(streaming_variables)
+                else:
+                    # Fallback to original args if profile not found
+                    cmd_args = stream_info.transcode_ffmpeg_args.copy()
+                    for i, arg in enumerate(cmd_args):
+                        for var, value in streaming_variables.items():
+                            placeholder = f"{{{var}}}"
+                            if placeholder in arg:
+                                cmd_args[i] = arg.replace(placeholder, value)
+                
+                ffmpeg_cmd.extend(cmd_args)
+
+                logger.info(f"Starting FFmpeg transcoding: {' '.join(ffmpeg_cmd)}")
+                
+                # Start FFmpeg process with stderr capture for debugging
+                ffmpeg_process = await asyncio.create_subprocess_exec(
+                    *ffmpeg_cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    stdin=asyncio.subprocess.DEVNULL
+                )
+                
+                # Start a task to read stderr for debugging
+                async def log_ffmpeg_stderr():
+                    if ffmpeg_process.stderr:
+                        while True:
+                            try:
+                                line = await ffmpeg_process.stderr.readline()
+                                if not line:
+                                    break
+                                line_str = line.decode('utf-8', errors='ignore').strip()
+                                if line_str:
+                                    logger.info(f"FFmpeg stderr: {line_str}")
+                            except Exception as e:
+                                logger.error(f"Error reading FFmpeg stderr: {e}")
+                                break
+                
+                # Start stderr logging task
+                stderr_task = asyncio.create_task(log_ffmpeg_stderr())
+                
+                # Store the process in stream info for cleanup
+                stream_info.transcode_process = ffmpeg_process
+
+                logger.info(f"FFmpeg process started with PID: {ffmpeg_process.pid}")
+                
+                # Ensure stdout is available
+                if not ffmpeg_process.stdout:
+                    raise Exception("FFmpeg process stdout is not available")
+                
+                # Read and yield transcoded data
+                while True:
+                    try:
+                        # Read chunk from FFmpeg stdout
+                        chunk = await asyncio.wait_for(
+                            ffmpeg_process.stdout.read(32768), 
+                            timeout=30.0
+                        )
+                        
+                        if not chunk:
+                            # FFmpeg finished or stopped outputting
+                            break
+                            
+                        yield chunk
+                        bytes_served += len(chunk)
+                        chunk_count += 1
+
+                        # Update stats periodically
+                        if chunk_count % 10 == 0:
+                            if client_id in self.clients:
+                                self.clients[client_id].last_access = datetime.now()
+                                self.clients[client_id].bytes_served += len(chunk)
+                            if stream_id in self.streams:
+                                self.streams[stream_id].last_access = datetime.now()
+                                self.streams[stream_id].total_bytes_served += len(chunk)
+                            self._stats.total_bytes_served += len(chunk)
+
+                        # Log progress
+                        if chunk_count == 1:
+                            logger.info(f"First transcoded chunk delivered to client {client_id}: {len(chunk)} bytes")
+                        elif chunk_count % 100 == 0:
+                            logger.info(f"Transcoding progress - Client {client_id}: {chunk_count} chunks, {bytes_served:,} bytes")
+
+                    except asyncio.TimeoutError:
+                        # Check if FFmpeg process is still alive
+                        if ffmpeg_process.returncode is not None:
+                            logger.error(f"FFmpeg process died unexpectedly (exit code: {ffmpeg_process.returncode})")
+                            break
+                        else:
+                            logger.warning(f"FFmpeg output timeout for client {client_id}, continuing...")
+                            continue
+
+                logger.info(f"Transcoding completed for client {client_id}: {chunk_count} chunks, {bytes_served} bytes")
+
+                # Emit stream stopped event
+                await self._emit_event("STREAM_STOPPED", stream_id, {
+                    "client_id": client_id,
+                    "bytes_served": bytes_served,
+                    "chunks_served": chunk_count,
+                    "mode": "transcoded"
+                })
+
+            except Exception as e:
+                logger.error(f"Error during transcoding for client {client_id}: {e}")
+                
+                # Emit failure event
+                await self._emit_event("STREAM_FAILED", stream_id, {
+                    "client_id": client_id,
+                    "error": str(e),
+                    "error_type": type(e).__name__,
+                    "bytes_served": bytes_served,
+                    "mode": "transcoded"
+                })
+                
+                raise HTTPException(status_code=500, detail=f"Transcoding error: {str(e)}")
+                
+            finally:
+                # Clean up stderr logging task
+                try:
+                    stderr_task.cancel()
+                except NameError:
+                    pass  # stderr_task wasn't created
+                    
+                # Clean up FFmpeg process
+                if ffmpeg_process:
+                    try:
+                        if ffmpeg_process.returncode is None:  # Process is still running
+                            logger.info(f"Terminating FFmpeg process {ffmpeg_process.pid}")
+                            ffmpeg_process.terminate()
+                            try:
+                                await asyncio.wait_for(ffmpeg_process.wait(), timeout=5.0)
+                            except asyncio.TimeoutError:
+                                logger.warning(f"FFmpeg process {ffmpeg_process.pid} didn't terminate gracefully, killing it")
+                                ffmpeg_process.kill()
+                                await ffmpeg_process.wait()
+                        
+                        # Clear the process from stream info
+                        if stream_info.transcode_process == ffmpeg_process:
+                            stream_info.transcode_process = None
+                            
+                    except Exception as cleanup_error:
+                        logger.error(f"Error cleaning up FFmpeg process: {cleanup_error}")
+
+        # Set appropriate headers for transcoded stream
+        headers = {
+            "Content-Type": "video/mp2t",  # MPEG-TS format
+            "Cache-Control": "no-cache, no-store, must-revalidate", 
+            "Pragma": "no-cache",
+            "Expires": "0",
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+            "Access-Control-Allow-Headers": "*",
+            "Access-Control-Expose-Headers": "*",
+            "Accept-Ranges": "none"  # Transcoded streams don't support ranges
+        }
+
+        return StreamingResponse(generate(), media_type="video/mp2t", headers=headers)
 
     async def _seamless_failover(self, stream_id: str, error: Exception) -> Optional[httpx.Response]:
         """

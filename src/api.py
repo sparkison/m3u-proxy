@@ -6,7 +6,7 @@ import logging
 import uuid
 import hashlib
 from urllib.parse import unquote, urlparse
-from typing import Optional, List
+from typing import Optional, List, Dict
 from pydantic import BaseModel, field_validator, ValidationError
 from datetime import datetime
 
@@ -14,6 +14,7 @@ from stream_manager import StreamManager
 from events import EventManager
 from models import StreamEvent, EventType, WebhookConfig
 from config import settings, VERSION
+from transcoding import get_profile_manager, TranscodingProfileManager
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -118,7 +119,57 @@ class StreamCreateRequest(BaseModel):
         return v
 
 
-# Global stream manager and event manager
+class TranscodeCreateRequest(BaseModel):
+    url: str
+    failover_urls: Optional[List[str]] = None
+    user_agent: Optional[str] = None
+    metadata: Optional[dict] = None
+    profile: Optional[str] = None  # Profile name or custom template
+    profile_variables: Optional[Dict[str, str]] = None
+    output_format: Optional[str] = None  # mp4, mkv, ts, etc.
+
+    @field_validator('url')
+    @classmethod  
+    def validate_primary_url(cls, v):
+        return validate_url(v)
+
+    @field_validator('failover_urls')
+    @classmethod
+    def validate_failover_urls(cls, v):
+        if v is not None:
+            return [validate_url(url) for url in v]
+        return v
+
+    @field_validator('metadata')
+    @classmethod
+    def validate_metadata(cls, v):
+        if v is not None:
+            # Ensure all keys and values are strings
+            if not isinstance(v, dict):
+                raise ValueError("metadata must be a dictionary")
+            for key, value in v.items():
+                if not isinstance(key, str):
+                    raise ValueError(
+                        f"metadata key must be string, got {type(key)}")
+                if not isinstance(value, (str, int, float, bool)):
+                    raise ValueError(
+                        f"metadata value for '{key}' must be string, int, float, or bool")
+            # Convert all values to strings for consistency
+            return {str(k): str(v) for k, v in v.items()}
+        return v
+
+    @field_validator('profile_variables')
+    @classmethod
+    def validate_profile_variables(cls, v):
+        if v is not None:
+            if not isinstance(v, dict):
+                raise ValueError("profile_variables must be a dictionary")
+            # Ensure all keys and values are strings
+            return {str(k): str(val) for k, val in v.items()}
+        return v
+
+
+# Global stream manager and event manager  
 stream_manager = StreamManager()
 event_manager = EventManager()
 
@@ -323,6 +374,125 @@ async def create_stream(request: StreamCreateRequest):
         return response
     except Exception as e:
         logger.error(f"Error creating stream: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/transcode", dependencies=[Depends(verify_token)])
+async def create_transcode_stream(request: TranscodeCreateRequest):
+    """Create a new transcoded stream with optional failover URLs and custom profile"""
+    try:
+        profile_manager = get_profile_manager()
+        
+        # Validate profile if provided
+        profile_name = request.profile or "default"
+        profile = profile_manager.get_profile(profile_name)
+        if not profile:
+            raise HTTPException(status_code=400, detail=f"Profile '{profile_name}' not found")
+        
+        # Generate FFmpeg args from profile and variables
+        ffmpeg_args = profile.render(request.profile_variables or {})
+        
+        # Prepare comprehensive metadata including transcoding info
+        transcoding_metadata = {
+            "transcoding": "true",
+            "profile": profile_name,
+            "profile_variables": str(request.profile_variables or {}),
+            "ffmpeg_args": " ".join(ffmpeg_args)
+        }
+        if request.metadata:
+            transcoding_metadata.update(request.metadata)
+        
+        # Create the stream with transcoding parameters and complete metadata
+        stream_id = await stream_manager.get_or_create_stream(
+            request.url,
+            request.failover_urls,
+            request.user_agent,
+            metadata=transcoding_metadata,
+            is_transcoded=True,
+            transcode_profile=profile_name,
+            transcode_ffmpeg_args=ffmpeg_args
+        )
+        
+        # Emit stream started event with transcoding info
+        event = StreamEvent(
+            event_type=EventType.STREAM_STARTED,
+            stream_id=stream_id,
+            data={
+                "primary_url": request.url,
+                "failover_urls": request.failover_urls or [],
+                "user_agent": request.user_agent,
+                "stream_type": "transcoded",
+                "profile": profile_name,
+                "profile_variables": request.profile_variables or {},
+                "ffmpeg_args": ffmpeg_args
+            }
+        )
+        await event_manager.emit_event(event)
+
+        # For transcoded streams, we serve them as direct MPEGTS streams
+        stream_endpoint = f"/stream/{stream_id}"
+        
+        response = {
+            "stream_id": stream_id,
+            "primary_url": request.url,
+            "failover_urls": request.failover_urls or [],
+            "user_agent": request.user_agent or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36",
+            "stream_type": "transcoded",
+            "stream_endpoint": stream_endpoint,
+            "direct_url": stream_endpoint,
+            "format": "mpegts",
+            "profile": profile.name,
+            "profile_variables": request.profile_variables or {},
+            "ffmpeg_args": ffmpeg_args,
+            "message": "Transcoded stream created successfully (direct MPEGTS pipe)"
+        }
+
+        # Include metadata in response if provided
+        if request.metadata:
+            response["metadata"] = request.metadata
+
+        return response
+    except HTTPException:
+        raise  # Re-raise HTTP exceptions as-is
+    except Exception as e:
+        logger.error(f"Error creating transcoded stream: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/transcode/profiles", dependencies=[Depends(verify_token)])
+async def list_transcode_profiles():
+    """List available transcoding profiles"""
+    try:
+        profile_manager = get_profile_manager()
+        profiles_dict = profile_manager.list_profiles()
+        
+        # Get individual profile objects for more details
+        profile_details = []
+        for name in profiles_dict.keys():
+            profile = profile_manager.get_profile(name)
+            if profile:
+                profile_details.append({
+                    "name": profile.name,
+                    "description": profile.description or profile.name,
+                    "parameters": profile.parameters
+                })
+        
+        # Check hardware acceleration availability
+        from hwaccel import HardwareAccelDetector, is_hwaccel_available
+        hw_detector = HardwareAccelDetector()
+        hw_available = is_hwaccel_available()
+        hw_type = hw_detector.config.type if hw_detector.config else None
+        
+        return {
+            "profiles": profile_details,
+            "hardware_acceleration": {
+                "available": hw_available,
+                "type": hw_type
+            },
+            "default_variables": profile_manager.get_default_variables()
+        }
+    except Exception as e:
+        logger.error(f"Error listing transcoding profiles: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -544,13 +714,22 @@ async def get_direct_stream(
         if range_header:
             logger.info(f"Range request: {range_header}")
 
-        # Use direct proxy for continuous streams
-        # This provides true byte-for-byte proxying with per-client connections
-        return await stream_manager.stream_continuous_direct(
-            stream_id,
-            client_id,
-            range_header=range_header
-        )
+        # Check if this is a transcoded stream
+        if stream_info.is_transcoded:
+            logger.info(f"Using transcoded stream for {stream_id} with profile: {stream_info.transcode_profile}")
+            return await stream_manager.stream_transcoded(
+                stream_id,
+                client_id,
+                range_header=range_header
+            )
+        else:
+            # Use direct proxy for continuous streams
+            # This provides true byte-for-byte proxying with per-client connections
+            return await stream_manager.stream_continuous_direct(
+                stream_id,
+                client_id,
+                range_header=range_header
+            )
 
     except HTTPException:
         raise

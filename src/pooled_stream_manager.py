@@ -123,6 +123,15 @@ class SharedTranscodingProcess:
             if self.status != "failed":
                 logger.warning(f"FFmpeg process for stream {self.stream_id} has exited with code {self.process.returncode}.")
                 self.status = "failed"
+                return False
+        
+        # Also check if process exists but is not responding
+        if self.process is None and self.status == "running":
+            logger.warning(f"FFmpeg process for stream {self.stream_id} is None but status is running")
+            self.status = "failed"
+            return False
+            
+        return self.status == "running" and self.process is not None
         
     async def cleanup(self):
         """Clean up the FFmpeg process"""
@@ -348,9 +357,20 @@ class PooledStreamManager:
         # First check if we have it locally
         if stream_key in self.shared_processes:
             process = self.shared_processes[stream_key]
-            process.add_client(client_id)
-            self.client_streams[client_id] = stream_key
-            return stream_key, process
+            
+            # Check if the process is still healthy before reusing it
+            process.health_check()
+            
+            # If process has failed or exited, clean it up and create a new one
+            if process.status == "failed" or (process.process and process.process.returncode is not None):
+                logger.warning(f"Existing process for stream {stream_key} is unhealthy, recreating...")
+                await self._cleanup_local_process(stream_key)
+                # Process will be recreated below
+            else:
+                # Process is healthy, reuse it
+                process.add_client(client_id)
+                self.client_streams[client_id] = stream_key
+                return stream_key, process
             
         # If sharing enabled, check Redis for existing streams
         if self.enable_sharing and self.redis_client:

@@ -11,6 +11,7 @@ import logging
 import subprocess
 import signal
 import os
+import time
 from typing import Dict, Optional, AsyncIterator, List, Set, Any
 from urllib.parse import urljoin, urlparse, quote, unquote
 from datetime import datetime, timedelta
@@ -727,6 +728,15 @@ class StreamManager:
                 if not shared_process or not shared_process.process or not shared_process.process.stdout:
                     raise HTTPException(status_code=500, detail="Failed to get a valid transcoding process")
 
+                # Verify the process is actually running
+                if shared_process.process.returncode is not None:
+                    raise HTTPException(
+                        status_code=500, 
+                        detail=f"Transcoding process has exited with code {shared_process.process.returncode}"
+                    )
+
+                logger.info(f"Streaming from FFmpeg process PID {shared_process.process.pid} for client {client_id}")
+
                 # Stream data from the shared process stdout
                 stdout = shared_process.process.stdout
                 while True:
@@ -741,6 +751,18 @@ class StreamManager:
                         self.pooled_manager.update_client_activity(client_id)
                     self.clients[client_id].last_access = datetime.now()
                     self.clients[client_id].bytes_served += len(chunk)
+                    
+                    # Update shared process stats
+                    shared_process.total_bytes_served += len(chunk)
+                    shared_process.last_access = time.time()
+                    
+                    # Update stream-level stats (for bandwidth tracking)
+                    if stream_id in self.streams:
+                        self.streams[stream_id].total_bytes_served += len(chunk)
+                        self.streams[stream_id].last_access = datetime.now()
+                    
+                    # Update global stats
+                    self._stats.total_bytes_served += len(chunk)
 
             except Exception as e:
                 logger.error(f"Error during pooled transcoding for client {client_id}: {e}")

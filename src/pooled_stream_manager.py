@@ -31,7 +31,7 @@ class SharedTranscodingProcess:
         self.profile = profile
         self.ffmpeg_args = ffmpeg_args
         self.process: Optional[asyncio.subprocess.Process] = None
-        self.clients: Set[str] = set()
+        self.clients: Dict[str, float] = {}  # client_id -> last_access_time
         self.created_at = time.time()
         self.last_access = time.time()
         self.total_bytes_served = 0
@@ -93,21 +93,36 @@ class SharedTranscodingProcess:
             
     def add_client(self, client_id: str):
         """Add a client to this shared process"""
-        self.clients.add(client_id)
+        self.clients[client_id] = time.time()
         self.last_access = time.time()
         logger.info(f"Client {client_id} joined shared stream {self.stream_id} ({len(self.clients)} total)")
-        
+
     def remove_client(self, client_id: str):
         """Remove a client from this shared process"""
-        self.clients.discard(client_id)
-        self.last_access = time.time()
-        logger.info(f"Client {client_id} left shared stream {self.stream_id} ({len(self.clients)} remaining)")
+        if client_id in self.clients:
+            del self.clients[client_id]
+            self.last_access = time.time()
+            logger.info(f"Client {client_id} left shared stream {self.stream_id} ({len(self.clients)} remaining)")
+
+    def prune_stale_clients(self, timeout: int):
+        """Remove clients that have been inactive for a while"""
+        stale_clients = [
+            cid for cid, last_seen in self.clients.items()
+            if time.time() - last_seen > timeout
+        ]
+        for client_id in stale_clients:
+            self.remove_client(client_id)
         
     def should_cleanup(self, timeout: int = 300) -> bool:
         """Check if this process should be cleaned up (no clients for timeout seconds)"""
-        if len(self.clients) == 0:
-            return time.time() - self.last_access > timeout
-        return False
+        return not self.clients and (time.time() - self.last_access > timeout)
+
+    def health_check(self):
+        """Check the health of the FFmpeg process."""
+        if self.process and self.process.returncode is not None:
+            if self.status != "failed":
+                logger.warning(f"FFmpeg process for stream {self.stream_id} has exited with code {self.process.returncode}.")
+                self.status = "failed"
         
     async def cleanup(self):
         """Clean up the FFmpeg process"""
@@ -211,8 +226,13 @@ class PooledStreamManager:
             try:
                 await asyncio.sleep(self.heartbeat_interval)
                 if self.redis_client:
+                    now = time.time()
+                    # Update heartbeat score
+                    await self.redis_client.zadd("worker_heartbeats", {self.worker_id: now})
+
+                    # Update worker data
                     worker_data = {
-                        "last_seen": time.time(),
+                        "last_seen": now,
                         "streams": list(self.shared_processes.keys()),
                         "worker_id": self.worker_id
                     }
@@ -242,7 +262,9 @@ class PooledStreamManager:
         to_cleanup = []
         
         for stream_id, process in self.shared_processes.items():
-            if process.should_cleanup(self.stream_timeout):
+            process.health_check()
+            process.prune_stale_clients(self.client_timeout)
+            if process.should_cleanup(self.stream_timeout) or process.status == "failed":
                 to_cleanup.append(stream_id)
                 
         for stream_id in to_cleanup:
@@ -252,13 +274,14 @@ class PooledStreamManager:
     async def _cleanup_local_process(self, stream_id: str):
         """Clean up a specific local process"""
         if stream_id in self.shared_processes:
-            process = self.shared_processes[stream_id]
+            process = self.shared_processes.pop(stream_id)
             await process.cleanup()
-            del self.shared_processes[stream_id]
             
             # Update Redis
             if self.redis_client:
-                await self.redis_client.delete(f"stream:{stream_id}")
+                redis_key = f"stream:{stream_id}"
+                await self.redis_client.delete(redis_key)
+                await self.redis_client.srem(f"worker:{self.worker_id}:streams", redis_key)
                 
     async def _cleanup_stale_redis_streams(self):
         """Clean up stale streams from Redis (dead workers)"""
@@ -266,51 +289,43 @@ class PooledStreamManager:
             return
             
         try:
-            # Get all workers
-            workers = await self.redis_client.hgetall("workers") or {}
-            current_time = time.time()
-            stale_workers = set()
-            
-            for worker_id, worker_data_str in workers.items():
-                try:
-                    worker_data = json.loads(worker_data_str)
-                    last_seen = worker_data.get("last_seen", 0)
-                    if current_time - last_seen > self.heartbeat_interval * 3:
-                        stale_workers.add(worker_id)
-                except json.JSONDecodeError:
-                    stale_workers.add(worker_id)
-                    
+            # Find stale workers
+            stale_threshold = time.time() - (self.heartbeat_interval * 3)
+            stale_workers = await self.redis_client.zrangebyscore("worker_heartbeats", -1, stale_threshold)
+
+            if not stale_workers:
+                return
+
             # Clean up streams from stale workers
-            if stale_workers:
-                pattern = "stream:*"
-                async for key in self.redis_client.scan_iter(match=pattern):
-                    stream_data = await self.redis_client.hgetall(key) or {}
-                    owner = stream_data.get("owner")
-                    
-                    if owner in stale_workers:
-                        await self.redis_client.delete(key)
-                        logger.info(f"Cleaned up stale Redis stream {key}")
-                        
-                # Remove stale workers
-                for worker_id in stale_workers:
-                    await self.redis_client.hdel("workers", worker_id)
-                    
+            for worker_id in stale_workers:
+                worker_streams_key = f"worker:{worker_id}:streams"
+                stream_keys = await self.redis_client.smembers(worker_streams_key)
+                if stream_keys:
+                    await self.redis_client.delete(*stream_keys)
+                    logger.info(f"Cleaned up {len(stream_keys)} streams for stale worker {worker_id}")
+                await self.redis_client.delete(worker_streams_key)
+
+            # Remove stale workers from heartbeats and data
+            await self.redis_client.zremrangebyscore("worker_heartbeats", -1, stale_threshold)
+            await self.redis_client.hdel("workers", *stale_workers)
+            logger.info(f"Removed stale workers: {stale_workers}")
+
         except Exception as e:
             logger.error(f"Error cleaning up stale Redis streams: {e}")
             
     async def _cleanup_worker_streams(self):
-        """Clean up streams owned by this worker"""
+        """Clean up streams owned by this worker from Redis"""
         if not self.redis_client:
             return
             
         try:
-            pattern = "stream:*"
-            async for key in self.redis_client.scan_iter(match=pattern):
-                stream_data = await self.redis_client.hgetall(key) or {}
-                if stream_data.get("owner") == self.worker_id:
-                    await self.redis_client.delete(key)
+            worker_streams_key = f"worker:{self.worker_id}:streams"
+            stream_keys = await self.redis_client.smembers(worker_streams_key)
+            if stream_keys:
+                await self.redis_client.delete(*stream_keys)
+            await self.redis_client.delete(worker_streams_key)
         except Exception as e:
-            logger.error(f"Error cleaning up worker streams: {e}")
+            logger.error(f"Error cleaning up worker streams from Redis: {e}")
             
     def _generate_stream_key(self, url: str, profile: str, profile_variables: Dict = None) -> str:
         """Generate a consistent key for stream sharing"""
@@ -343,9 +358,10 @@ class PooledStreamManager:
             stream_data = await self.redis_client.hgetall(redis_key) or {}
             
             if stream_data and await self._is_redis_stream_healthy(stream_data):
-                # Stream exists and is healthy, but not in our worker
-                # We could implement cross-worker streaming here, but for now create local copy
-                logger.info(f"Found healthy stream {stream_key} on another worker, creating local copy")
+                owner = stream_data.get("owner")
+                if owner != self.worker_id:
+                    logger.info(f"Stream {stream_key} is managed by another worker ({owner}). This worker will not create a local copy.")
+                    raise ConnectionAbortedError(f"Stream is on another worker {owner}")
         
         # Create new local process
         process = SharedTranscodingProcess(stream_key, url, profile, ffmpeg_args)
@@ -357,6 +373,7 @@ class PooledStreamManager:
             
             # Register in Redis
             if self.redis_client:
+                redis_key = f"stream:{stream_key}"
                 stream_data = {
                     "url": url,
                     "profile": profile,
@@ -366,7 +383,8 @@ class PooledStreamManager:
                     "status": "running",
                     "ffmpeg_pid": process.process.pid if process.process else 0
                 }
-                await self.redis_client.hset(f"stream:{stream_key}", mapping=stream_data)
+                await self.redis_client.hset(redis_key, mapping=stream_data)
+                await self.redis_client.sadd(f"worker:{self.worker_id}:streams", redis_key)
                 
             logger.info(f"Created new shared stream {stream_key} for {len(process.clients)} clients")
             return stream_key, process
@@ -394,20 +412,23 @@ class PooledStreamManager:
             
     async def remove_client_from_stream(self, client_id: str):
         """Remove a client from its stream"""
-        
         if client_id not in self.client_streams:
             return
             
-        stream_key = self.client_streams[client_id]
-        del self.client_streams[client_id]
+        stream_key = self.client_streams.pop(client_id, None)
         
-        if stream_key in self.shared_processes:
+        if stream_key and stream_key in self.shared_processes:
             process = self.shared_processes[stream_key]
             process.remove_client(client_id)
-            
-            # If no clients remain, schedule cleanup
-            if len(process.clients) == 0:
-                process.last_access = time.time()
+
+    def update_client_activity(self, client_id: str):
+        """Update the last access time for a client."""
+        if client_id in self.client_streams:
+            stream_key = self.client_streams[client_id]
+            if stream_key in self.shared_processes:
+                process = self.shared_processes[stream_key]
+                if client_id in process.clients:
+                    process.clients[client_id] = time.time()
                 
     async def stream_shared_process(self, client_id: str) -> Optional[asyncio.subprocess.Process]:
         """Get the FFmpeg process for a client's stream"""

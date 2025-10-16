@@ -100,7 +100,7 @@ async def test_shared_transcoding_process_creation():
     assert process.stream_id == "test-stream-123"
     assert process.url == "http://example.com/test.m3u8"
     assert process.profile == "720p"
-    assert process.clients == set()
+    assert process.clients == {}
 
 
 def test_redis_pooling_architecture():

@@ -1,43 +1,47 @@
 """
 Tests for API token authentication
 """
-import pytest
 import sys
 import os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
+
+import pytest
 from unittest.mock import patch
 from fastapi.testclient import TestClient
-
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
 
 @pytest.fixture
 def client_with_auth():
     """Create a test client with authentication enabled"""
-    with patch('config.settings') as mock_settings:
+    # Import first to ensure the module is loaded
+    from api import app
+    
+    # Patch the settings object that's actually being used in the API
+    with patch('api.settings') as mock_settings:
         mock_settings.API_TOKEN = "test_token_123"
         mock_settings.ROOT_PATH = ""
         mock_settings.DOCS_URL = "/docs"
         mock_settings.REDOC_URL = "/redoc"
         mock_settings.OPENAPI_URL = "/openapi.json"
         
-        # Import after patching settings
-        from api import app
-        return TestClient(app)
+        yield TestClient(app)
 
 
 @pytest.fixture
 def client_without_auth():
     """Create a test client with authentication disabled"""
-    with patch('config.settings') as mock_settings:
+    # Import first to ensure the module is loaded
+    from api import app
+    
+    # Patch the settings object that's actually being used in the API
+    with patch('api.settings') as mock_settings:
         mock_settings.API_TOKEN = None
         mock_settings.ROOT_PATH = ""
         mock_settings.DOCS_URL = "/docs"
         mock_settings.REDOC_URL = "/redoc"
         mock_settings.OPENAPI_URL = "/openapi.json"
         
-        # Import after patching settings
-        from api import app
-        return TestClient(app)
+        yield TestClient(app)
 
 
 class TestAuthentication:

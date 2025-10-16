@@ -1,12 +1,13 @@
 # Add src to path first
+import sys
+import os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
+
 import json
 from unittest.mock import Mock, AsyncMock, patch
 from fastapi.testclient import TestClient
 import pytest
 from api import app, get_content_type, is_direct_stream
-import sys
-import os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
 
 class TestHelperFunctions:
@@ -226,9 +227,15 @@ class TestAPI:
         # Mock the stream_continuous_direct method used by the endpoint
         mock_response = StreamingResponse(
             mock_stream_generator(), media_type="video/mp4")
+        
+        # Create proper async mocks that accept any arguments
         mock_stream_manager.stream_continuous_direct = AsyncMock(
             return_value=mock_response)
+        mock_stream_manager.stream_transcoded = AsyncMock(
+            return_value=mock_response)
         mock_stream_manager.register_client = AsyncMock(return_value=None)
+        mock_stream_manager.unregister_client = AsyncMock(return_value=None)
+        mock_stream_manager.get_stream_info = Mock(return_value=None)
         mock_stream_manager.clients = {}
 
         response = client.get("/stream/test_stream_123")

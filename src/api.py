@@ -394,8 +394,18 @@ async def create_transcode_stream(request: TranscodeCreateRequest):
         if not profile:
             raise HTTPException(status_code=400, detail=f"Profile '{profile_name}' not found")
         
+        # Prepare template variables by merging required vars with user's custom variables
+        template_vars = {
+            "input_url": request.url,
+            "output_args": "pipe:1",  # Output to stdout for streaming
+            "format": request.output_format or "mpegts",  # Default to MPEGTS for streaming
+        }
+        # Merge with user-provided variables (user vars take precedence for overrides)
+        if request.profile_variables:
+            template_vars.update(request.profile_variables)
+        
         # Generate FFmpeg args from profile and variables
-        ffmpeg_args = profile.render(request.profile_variables or {})
+        ffmpeg_args = profile.render(template_vars)
         
         # Prepare comprehensive metadata including transcoding info
         transcoding_metadata = {
@@ -445,9 +455,9 @@ async def create_transcode_stream(request: TranscodeCreateRequest):
             "stream_type": "transcoded",
             "stream_endpoint": stream_endpoint,
             "direct_url": stream_endpoint,
-            "format": "mpegts",
+            "format": template_vars.get("format", "mpegts"),
             "profile": profile.name,
-            "profile_variables": request.profile_variables or {},
+            "profile_variables": template_vars,  # Show the actual variables used
             "ffmpeg_args": ffmpeg_args,
             "message": "Transcoded stream created successfully (direct MPEGTS pipe)"
         }

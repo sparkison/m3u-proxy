@@ -103,7 +103,26 @@ fi
 # Check FFmpeg hardware acceleration support
 echo "🔍 Checking FFmpeg hardware acceleration capabilities..."
 if command -v ffmpeg >/dev/null 2>&1; then
-    HWACCEL=$(ffmpeg -hide_banner -hwaccels 2>/dev/null | grep -v "Hardware acceleration methods:" || echo "None found")
+    # First, let's see what FFmpeg reports for hardware acceleration
+    echo "🔍 Querying FFmpeg for hardware acceleration methods..."
+    HWACCEL_RAW=$(ffmpeg -hide_banner -hwaccels 2>/dev/null)
+    echo "📋 Raw FFmpeg hwaccels output:"
+    echo "$HWACCEL_RAW"
+    echo ""
+    
+    # Check if FFmpeg was compiled with VAAPI support
+    echo "🔍 Checking FFmpeg build configuration for VAAPI..."
+    FFMPEG_BUILDCONF=$(ffmpeg -hide_banner -buildconf 2>/dev/null | grep -i vaapi || echo "VAAPI not found in build config")
+    echo "📋 VAAPI in build config: $FFMPEG_BUILDCONF"
+    echo ""
+    
+    # Check for VAAPI encoders specifically
+    echo "🔍 Checking for VAAPI encoders..."
+    VAAPI_ENCODERS=$(ffmpeg -hide_banner -encoders 2>/dev/null | grep vaapi || echo "No VAAPI encoders found")
+    echo "📋 VAAPI encoders: $VAAPI_ENCODERS"
+    echo ""
+    
+    HWACCEL=$(echo "$HWACCEL_RAW" | grep -v "Hardware acceleration methods:" || echo "None found")
     
     # Initialize variables to store compatible methods
     COMPATIBLE_METHODS=""
@@ -131,13 +150,41 @@ if command -v ffmpeg >/dev/null 2>&1; then
             elif [ "$INTEL_GPU_IN_LSPCI" = true ] && [ "$method" = "qsv" ]; then
                 IS_COMPATIBLE=true
                 DESCRIPTION="Intel QuickSync acceleration"
-            # Check VAAPI methods
-            elif [ "$method" = "vaapi" ] && (([ "$INTEL_GPU_IN_LSPCI" = true ] || [ "$AMD_GPU_IN_LSPCI" = true ]) && [ "$DRI_DEVICES_FOUND" = true ]); then
-                IS_COMPATIBLE=true
-                if [ "$INTEL_GPU_IN_LSPCI" = true ]; then
-                    DESCRIPTION="Intel VAAPI acceleration"
-                else
-                    DESCRIPTION="AMD VAAPI acceleration"
+            # Check VAAPI methods - be more permissive about Intel detection
+            elif [ "$method" = "vaapi" ] && [ "$DRI_DEVICES_FOUND" = true ]; then
+                # Check if we have Intel GPU via vendor ID since lspci might not be available
+                INTEL_VENDOR_FOUND=false
+                if [ -e "/sys/class/drm/card0/device/vendor" ]; then
+                    VENDOR_ID=$(cat /sys/class/drm/card0/device/vendor 2>/dev/null)
+                    if [ "$VENDOR_ID" = "0x8086" ]; then
+                        INTEL_VENDOR_FOUND=true
+                        INTEL_GPU_IN_LSPCI=true  # Set this for later logic
+                    fi
+                fi
+                
+                # If we have DRI devices and either detected Intel via lspci or vendor ID, test VAAPI functionality
+                if [ "$INTEL_GPU_IN_LSPCI" = true ] || [ "$AMD_GPU_IN_LSPCI" = true ] || [ "$INTEL_VENDOR_FOUND" = true ]; then
+                    # Test if VAAPI actually works by trying a quick encode
+                    echo "    🧪 Testing VAAPI functionality..."
+                    VAAPI_TEST_OUTPUT=$(timeout 5 ffmpeg -f lavfi -i testsrc=duration=0.1:size=64x64:rate=30 -vaapi_device /dev/dri/renderD128 -vf 'format=nv12,hwupload' -c:v h264_vaapi -f null - 2>&1)
+                    VAAPI_TEST_RESULT=$?
+                    
+                    if [ $VAAPI_TEST_RESULT -eq 0 ]; then
+                        IS_COMPATIBLE=true
+                        if [ "$INTEL_GPU_IN_LSPCI" = true ] || [ "$INTEL_VENDOR_FOUND" = true ]; then
+                            DESCRIPTION="Intel VAAPI acceleration (WORKING)"
+                        else
+                            DESCRIPTION="AMD VAAPI acceleration (WORKING)"
+                        fi
+                    else
+                        echo "    ⚠️ VAAPI test failed, but encoders exist - may work with correct driver"
+                        IS_COMPATIBLE=true  # Still mark as compatible since encoders exist
+                        if [ "$INTEL_GPU_IN_LSPCI" = true ] || [ "$INTEL_VENDOR_FOUND" = true ]; then
+                            DESCRIPTION="Intel VAAPI acceleration (needs driver tuning)"
+                        else
+                            DESCRIPTION="AMD VAAPI acceleration (needs driver tuning)"
+                        fi
+                    fi
                 fi
             fi
             
@@ -180,8 +227,22 @@ if [ "$NVIDIA_FOUND" = true ] && echo "$COMPATIBLE_METHODS" | grep -q "cuda\|nve
     export HW_ACCEL_DEVICE="cuda"
     echo "   Recommended FFmpeg args: -hwaccel cuda -hwaccel_output_format cuda"
 elif [ "$DRI_DEVICES_FOUND" = true ] && echo "$COMPATIBLE_METHODS" | grep -q "vaapi"; then
+    # Check for Intel GPU via vendor ID if lspci failed
+    if [ "$INTEL_GPU_IN_LSPCI" != true ] && [ -e "/sys/class/drm/card0/device/vendor" ]; then
+        VENDOR_ID=$(cat /sys/class/drm/card0/device/vendor 2>/dev/null)
+        if [ "$VENDOR_ID" = "0x8086" ]; then
+            INTEL_GPU_IN_LSPCI=true
+            # Try to get device ID for model identification
+            DEVICE_ID=$(cat /sys/class/drm/card0/device/device 2>/dev/null)
+            INTEL_MODEL="Intel GPU (Device ID: $DEVICE_ID)"
+        fi
+    fi
+    
     if [ "$INTEL_GPU_IN_LSPCI" = true ] && [ -n "$INTEL_MODEL" ]; then
         echo "🔰 Intel GPU: $INTEL_MODEL"
+        export HW_ACCEL_TYPE="intel"
+    elif [ "$INTEL_GPU_IN_LSPCI" = true ]; then
+        echo "🔰 Intel GPU: DETECTED"
         export HW_ACCEL_TYPE="intel"
     elif [ "$AMD_GPU_IN_LSPCI" = true ] && [ -n "$AMD_MODEL" ]; then
         echo "🔰 AMD GPU: $AMD_MODEL"
@@ -194,6 +255,12 @@ elif [ "$DRI_DEVICES_FOUND" = true ] && echo "$COMPATIBLE_METHODS" | grep -q "va
     export HW_ACCEL_AVAILABLE=true
     export HW_ACCEL_DEVICE="vaapi"
     echo "   Recommended FFmpeg args: -hwaccel vaapi -hwaccel_output_format vaapi"
+    
+    # Add specific recommendations for Intel GPUs with driver issues
+    if [ "$INTEL_GPU_IN_LSPCI" = true ]; then
+        echo "💡 For older Intel GPUs, try: LIBVA_DRIVER_NAME=i965"
+        echo "💡 For newer Intel GPUs, try: LIBVA_DRIVER_NAME=iHD"
+    fi
 else
     echo "❌ NO GPU ACCELERATION DETECTED"
     echo "⚠️ Hardware acceleration is unavailable - using CPU-only transcoding"

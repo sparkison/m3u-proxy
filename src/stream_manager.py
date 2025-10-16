@@ -896,7 +896,7 @@ class StreamManager:
         inactive_clients = []
 
         for client_id, client_info in self.clients.items():
-            if (current_time - client_info.last_access).seconds > self.client_timeout:
+            if (current_time - client_info.last_access).total_seconds() > self.client_timeout:
                 inactive_clients.append(client_id)
 
         for client_id in inactive_clients:
@@ -917,18 +917,24 @@ class StreamManager:
                         active_client_count += 1
 
             has_active_clients = active_client_count > 0
-            is_old = (current_time - stream_info.last_access).seconds > self.stream_timeout
+            time_diff_seconds = (current_time - stream_info.last_access).total_seconds()
+            is_old = time_diff_seconds > self.stream_timeout
 
             if not has_active_clients and is_old:
+                logger.info(f"Marking stream {stream_id} for cleanup: no_active_clients={not has_active_clients}, time_diff={time_diff_seconds}s, timeout={self.stream_timeout}s")
                 inactive_streams.append(stream_id)
+            elif has_active_clients and is_old:
+                logger.debug(f"Stream {stream_id} is old ({time_diff_seconds}s) but has {active_client_count} active clients - keeping alive")
+            elif not has_active_clients and not is_old:
+                logger.debug(f"Stream {stream_id} has no active clients but is recent ({time_diff_seconds}s < {self.stream_timeout}s) - keeping alive")
 
         for stream_id in inactive_streams:
             if stream_id in self.streams:
+                logger.info(f"Cleaning up inactive stream: {stream_id}")
                 del self.streams[stream_id]
                 if stream_id in self.stream_clients:
                     del self.stream_clients[stream_id]
                 self._stats.active_streams -= 1
-                logger.info(f"Cleaned up inactive stream: {stream_id}")
 
     def get_stats(self) -> Dict:
         """Get comprehensive stats - aggregates variant stream stats into parent streams"""

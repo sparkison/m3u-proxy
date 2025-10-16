@@ -16,6 +16,7 @@ from models import StreamEvent, EventType, WebhookConfig
 from config import settings, VERSION
 from transcoding import get_profile_manager, TranscodingProfileManager
 from redis_config import get_redis_config, should_use_pooling
+from hwaccel import hw_accel
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -291,6 +292,57 @@ async def root():
         "uptime": proxy_stats["uptime_seconds"],
         "stats": proxy_stats
     }
+
+
+@app.get("/info", dependencies=[Depends(verify_token)])
+async def get_info():
+    """
+    Get comprehensive information about the m3u-proxy server configuration and capabilities.
+    Includes hardware acceleration status, Redis pooling, transcoding profiles, and other details.
+    """
+    redis_config = get_redis_config()
+    use_pooling = should_use_pooling()
+    profile_manager = get_profile_manager()
+    
+    # Build the info response
+    info = {
+        "version": VERSION,
+        "hardware_acceleration": {
+            "enabled": hw_accel.is_available(),
+            "type": hw_accel.get_type(),
+            "device": hw_accel.config.device if hw_accel.is_available() else None,
+            "ffmpeg_args": hw_accel.config.ffmpeg_args if hw_accel.is_available() else []
+        },
+        "redis": {
+            "enabled": settings.REDIS_ENABLED,
+            "pooling_enabled": use_pooling,
+            "host": redis_config.get("host") if settings.REDIS_ENABLED else None,
+            "port": redis_config.get("port") if settings.REDIS_ENABLED else None,
+            "db": redis_config.get("db") if settings.REDIS_ENABLED else None,
+            "max_clients_per_stream": settings.MAX_CLIENTS_PER_SHARED_STREAM if use_pooling else None,
+            "stream_timeout": settings.SHARED_STREAM_TIMEOUT if use_pooling else None,
+            "sharing_strategy": settings.STREAM_SHARING_STRATEGY if use_pooling else None
+        },
+        "transcoding": {
+            "enabled": True,
+            "profiles": profile_manager.list_profiles()
+        },
+        "configuration": {
+            "default_user_agent": settings.DEFAULT_USER_AGENT,
+            "client_timeout": settings.CLIENT_TIMEOUT,
+            "stream_timeout": settings.STREAM_TIMEOUT,
+            "cleanup_interval": settings.CLEANUP_INTERVAL,
+            "buffer_size": settings.DEFAULT_BUFFER_SIZE,
+            "max_retries": settings.DEFAULT_MAX_RETRIES
+        },
+        "worker": {
+            "worker_id": settings.WORKER_ID if settings.WORKER_ID else "single",
+            "heartbeat_interval": settings.HEARTBEAT_INTERVAL,
+            "multi_worker_mode": bool(settings.WORKER_ID)
+        }
+    }
+    
+    return info
 
 
 async def resolve_stream_id(

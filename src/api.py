@@ -130,7 +130,7 @@ class TranscodeCreateRequest(BaseModel):
     output_format: Optional[str] = None  # mp4, mkv, ts, etc.
 
     @field_validator('url')
-    @classmethod  
+    @classmethod
     def validate_primary_url(cls, v):
         return validate_url(v)
 
@@ -175,7 +175,8 @@ redis_config = get_redis_config()
 redis_url = redis_config.get('redis_url') if should_use_pooling() else None
 enable_pooling = should_use_pooling()
 
-stream_manager = StreamManager(redis_url=redis_url, enable_pooling=enable_pooling)
+stream_manager = StreamManager(
+    redis_url=redis_url, enable_pooling=enable_pooling)
 event_manager = EventManager()
 
 
@@ -387,13 +388,35 @@ async def create_transcode_stream(request: TranscodeCreateRequest):
     """Create a new transcoded stream with optional failover URLs and custom profile"""
     try:
         profile_manager = get_profile_manager()
-        
-        # Validate profile if provided
-        profile_name = request.profile or "default"
-        profile = profile_manager.get_profile(profile_name)
-        if not profile:
-            raise HTTPException(status_code=400, detail=f"Profile '{profile_name}' not found")
-        
+
+        # Determine if profile is a predefined name or custom template
+        profile_identifier = request.profile or "default"
+        profile = None
+        profile_name = profile_identifier
+
+        # Check if it looks like custom FFmpeg args (starts with -)
+        if profile_identifier.strip().startswith('-'):
+            logger.info(
+                f"Using custom profile template: {profile_identifier[:50]}...")
+            profile = profile_manager.create_profile_from_template(
+                name="custom",
+                parameters=profile_identifier,
+                description="Custom FFmpeg profile from API"
+            )
+            profile_name = "custom"
+        else:
+            # Try to get as predefined profile
+            profile = profile_manager.get_profile(profile_identifier)
+
+            # If not found, error with available profiles
+            if not profile:
+                available_profiles = ', '.join(
+                    profile_manager.list_profiles().keys())
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Profile '{profile_identifier}' not found. Available profiles: {available_profiles}"
+                )
+
         # Prepare template variables by merging required vars with user's custom variables
         template_vars = {
             "input_url": request.url,
@@ -403,10 +426,10 @@ async def create_transcode_stream(request: TranscodeCreateRequest):
         # Merge with user-provided variables (user vars take precedence for overrides)
         if request.profile_variables:
             template_vars.update(request.profile_variables)
-        
+
         # Generate FFmpeg args from profile and variables
         ffmpeg_args = profile.render(template_vars)
-        
+
         # Prepare comprehensive metadata including transcoding info
         transcoding_metadata = {
             "transcoding": "true",
@@ -416,7 +439,7 @@ async def create_transcode_stream(request: TranscodeCreateRequest):
         }
         if request.metadata:
             transcoding_metadata.update(request.metadata)
-        
+
         # Create the stream with transcoding parameters and complete metadata
         stream_id = await stream_manager.get_or_create_stream(
             request.url,
@@ -427,7 +450,7 @@ async def create_transcode_stream(request: TranscodeCreateRequest):
             transcode_profile=profile_name,
             transcode_ffmpeg_args=ffmpeg_args
         )
-        
+
         # Emit stream started event with transcoding info
         event = StreamEvent(
             event_type=EventType.STREAM_STARTED,
@@ -446,7 +469,7 @@ async def create_transcode_stream(request: TranscodeCreateRequest):
 
         # For transcoded streams, we serve them as direct MPEGTS streams
         stream_endpoint = f"/stream/{stream_id}"
-        
+
         response = {
             "stream_id": stream_id,
             "primary_url": request.url,
@@ -480,7 +503,7 @@ async def list_transcode_profiles():
     try:
         profile_manager = get_profile_manager()
         profiles_dict = profile_manager.list_profiles()
-        
+
         # Get individual profile objects for more details
         profile_details = []
         for name in profiles_dict.keys():
@@ -491,13 +514,13 @@ async def list_transcode_profiles():
                     "description": profile.description or profile.name,
                     "parameters": profile.parameters
                 })
-        
+
         # Check hardware acceleration availability
         from hwaccel import HardwareAccelDetector, is_hwaccel_available
         hw_detector = HardwareAccelDetector()
         hw_available = is_hwaccel_available()
         hw_type = hw_detector.config.type if hw_detector.config else None
-        
+
         return {
             "profiles": profile_details,
             "hardware_acceleration": {
@@ -731,7 +754,8 @@ async def get_direct_stream(
 
         # Check if this is a transcoded stream
         if stream_info.is_transcoded:
-            logger.info(f"Using transcoded stream for {stream_id} with profile: {stream_info.transcode_profile}")
+            logger.info(
+                f"Using transcoded stream for {stream_id} with profile: {stream_info.transcode_profile}")
             return await stream_manager.stream_transcoded(
                 stream_id,
                 client_id,

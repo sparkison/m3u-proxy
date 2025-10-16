@@ -51,7 +51,7 @@ class Settings(BaseSettings):
     ENABLE_TRANSCODING_POOLING: bool = True
     MAX_CLIENTS_PER_SHARED_STREAM: int = 10
     SHARED_STREAM_TIMEOUT: int = 300  # 5 minutes
-    
+
     # Worker configuration
     WORKER_ID: Optional[str] = None
     HEARTBEAT_INTERVAL: int = 30  # seconds

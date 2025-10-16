@@ -20,7 +20,7 @@ trap cleanup TERM INT
 pids=()
 
 # Display version information
-echo "📦 m3u-proxy starting up..."
+echo "⚡️ m3u-proxy starting up..."
 echo "🐍 Python version: $(python3 --version)"
 echo "🎬 FFmpeg version: $(ffmpeg -version 2>/dev/null | head -1 | cut -d' ' -f3 || echo 'Not found')"
 

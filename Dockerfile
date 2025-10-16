@@ -30,7 +30,7 @@ COPY docker/ ./docker/
 RUN mkdir -p /tmp/m3u-proxy-streams
 
 # Make scripts executable
-RUN chmod +x /app/docker/entrypoint.sh /app/docker/check-hwaccel.sh
+RUN chmod +x /app/docker/entrypoint.sh /app/docker/check-hwaccel.sh /app/docker/verify-hwaccel.sh
 
 # Environment variables
 ENV PYTHONPATH=/app

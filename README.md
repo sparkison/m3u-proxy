@@ -66,6 +66,10 @@ services:
       - M3U_PROXY_PORT=8085
       - LOG_LEVEL=INFO
       
+      # Base path (default: /m3u-proxy for m3u-editor integration)
+      # Set to empty string if not using reverse proxy: ROOT_PATH=
+      - ROOT_PATH=/m3u-proxy
+      
       # Hardware acceleration (optional)
       - LIBVA_DRIVER_NAME=i965  # For older Intel GPUs
       # - LIBVA_DRIVER_NAME=iHD  # For newer Intel GPUs
@@ -217,6 +221,11 @@ python m3u_client.py delete <stream_id>
 # Server configuration
 M3U_PROXY_HOST=0.0.0.0
 M3U_PROXY_PORT=8085
+
+# Base path for API routes (useful for reverse proxy integration)
+# Default: /m3u-proxy (optimized for m3u-editor integration)
+# Set to empty string for root path
+ROOT_PATH=/m3u-proxy
 
 # API Authentication (optional)
 # Set API_TOKEN to require authentication for management endpoints
@@ -548,6 +557,13 @@ python demo_events.py
 ```
 
 📖 **Full Documentation**: See [EVENT_SYSTEM.md](docs/EVENT_SYSTEM.md) for complete webhook integration guide.
+
+## Additional Documentation
+
+- **[Architecture Overview](docs/ARCHITECTURE.md)** - System design and components
+- **[Event System](docs/EVENT_SYSTEM.md)** - Webhook notifications and events
+- **[Testing Guide](docs/TESTING.md)** - Test suite and development
+- **[Authentication](docs/AUTHENTICATION.md)** - API token authentication
 
 ## Development
 

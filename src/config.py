@@ -22,7 +22,7 @@ class Settings(BaseSettings):
     OPENAPI_URL: str = "/openapi.json"
 
     # Route Configuration
-    ROOT_PATH: str = ""
+    ROOT_PATH: str = "/m3u-proxy"  # Default base path for integration with m3u-editor
     CLIENT_TIMEOUT: int = 30
     STREAM_TIMEOUT: int = 300
     CLEANUP_INTERVAL: int = 60

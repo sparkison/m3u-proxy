@@ -782,29 +782,32 @@ class StreamManager:
                 logger.info(
                     f"Streaming from FFmpeg process PID {shared_process.process.pid} for client {client_id}")
 
-                # Stream data from the shared process stdout
-                stdout = shared_process.process.stdout
+                # Get the client's queue - the broadcaster will feed chunks into it
+                client_queue = shared_process.client_queues.get(client_id)
+                if not client_queue:
+                    raise HTTPException(
+                        status_code=500, detail="Client queue not found")
+
+                # Stream data from the client's queue (fed by broadcaster)
                 while True:
-                    chunk = await stdout.read(32768)
-                    if not chunk:
+                    # Get chunk from queue (broadcaster puts chunks here)
+                    chunk = await client_queue.get()
+                    if chunk is None:  # None signals end of stream
                         break
+                    
                     yield chunk
                     bytes_served += len(chunk)
 
                     # Update client activity
                     if self.pooled_manager:
                         self.pooled_manager.update_client_activity(client_id)
-                    self.clients[client_id].last_access = datetime.now()
-                    self.clients[client_id].bytes_served += len(chunk)
-
-                    # Update shared process stats
-                    shared_process.total_bytes_served += len(chunk)
-                    shared_process.last_access = time.time()
+                    if client_id in self.clients:
+                        self.clients[client_id].last_access = datetime.now()
+                        self.clients[client_id].bytes_served += len(chunk)
 
                     # Update stream-level stats (for bandwidth tracking)
                     if stream_id in self.streams:
-                        self.streams[stream_id].total_bytes_served += len(
-                            chunk)
+                        self.streams[stream_id].total_bytes_served += len(chunk)
                         self.streams[stream_id].last_access = datetime.now()
 
                     # Update global stats

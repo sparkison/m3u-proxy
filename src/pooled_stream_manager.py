@@ -24,7 +24,7 @@ except ImportError:
 
 
 class SharedTranscodingProcess:
-    """Represents a shared FFmpeg transcoding process"""
+    """Represents a shared FFmpeg transcoding process with broadcasting to multiple clients"""
 
     def __init__(self, stream_id: str, url: str, profile: str, ffmpeg_args: List[str]):
         self.stream_id = stream_id
@@ -37,6 +37,11 @@ class SharedTranscodingProcess:
         self.last_access = time.time()
         self.total_bytes_served = 0
         self.status = "starting"
+        
+        # Broadcasting support - each client gets its own queue
+        self.client_queues: Dict[str, asyncio.Queue] = {}
+        self._broadcaster_task: Optional[asyncio.Task] = None
+        self._broadcaster_lock = asyncio.Lock()
 
     async def start_process(self):
         """Start the FFmpeg process"""
@@ -67,6 +72,9 @@ class SharedTranscodingProcess:
 
             # Start stderr logging task
             asyncio.create_task(self._log_stderr())
+            
+            # Start broadcaster task to read from FFmpeg and send to all clients
+            self._broadcaster_task = asyncio.create_task(self._broadcast_loop())
 
             return True
 
@@ -74,6 +82,55 @@ class SharedTranscodingProcess:
             logger.error(f"Failed to start shared FFmpeg process: {e}")
             self.status = "failed"
             return False
+    
+    async def _broadcast_loop(self):
+        """Read from FFmpeg stdout and broadcast to all client queues"""
+        if not self.process or not self.process.stdout:
+            logger.error(f"Cannot start broadcaster - no process or stdout for {self.stream_id}")
+            return
+        
+        logger.info(f"Starting broadcaster for stream {self.stream_id}")
+        
+        try:
+            while self.process and self.process.returncode is None:
+                # Read chunk from FFmpeg
+                chunk = await self.process.stdout.read(32768)
+                if not chunk:
+                    logger.info(f"FFmpeg stdout closed for stream {self.stream_id}")
+                    break
+                
+                # Broadcast to all client queues
+                async with self._broadcaster_lock:
+                    dead_clients = []
+                    for client_id, queue in self.client_queues.items():
+                        try:
+                            # Use put_nowait to avoid blocking if a client's queue is full
+                            queue.put_nowait(chunk)
+                        except asyncio.QueueFull:
+                            logger.warning(f"Client {client_id} queue is full, dropping chunk")
+                        except Exception as e:
+                            logger.error(f"Error sending to client {client_id}: {e}")
+                            dead_clients.append(client_id)
+                    
+                    # Remove dead clients
+                    for client_id in dead_clients:
+                        self.client_queues.pop(client_id, None)
+                
+                # Update stats
+                self.total_bytes_served += len(chunk)
+                self.last_access = time.time()
+                
+        except Exception as e:
+            logger.error(f"Broadcaster error for stream {self.stream_id}: {e}")
+        finally:
+            logger.info(f"Broadcaster stopped for stream {self.stream_id}")
+            # Signal all clients that the stream has ended
+            async with self._broadcaster_lock:
+                for queue in self.client_queues.values():
+                    try:
+                        queue.put_nowait(None)  # None signals end of stream
+                    except:
+                        pass
 
     async def _log_stderr(self):
         """Log FFmpeg stderr output"""
@@ -95,29 +152,39 @@ class SharedTranscodingProcess:
             logger.error(
                 f"Error reading FFmpeg stderr for {self.stream_id}: {e}")
 
-    def add_client(self, client_id: str):
-        """Add a client to this shared process"""
-        self.clients[client_id] = time.time()
-        self.last_access = time.time()
-        logger.info(
-            f"Client {client_id} joined shared stream {self.stream_id} ({len(self.clients)} total)")
-
-    def remove_client(self, client_id: str):
-        """Remove a client from this shared process"""
-        if client_id in self.clients:
-            del self.clients[client_id]
+    async def add_client(self, client_id: str) -> asyncio.Queue:
+        """Add a client to this shared process and return their queue"""
+        async with self._broadcaster_lock:
+            # Create a queue for this client (max 100 chunks buffered)
+            client_queue = asyncio.Queue(maxsize=100)
+            self.client_queues[client_id] = client_queue
+            self.clients[client_id] = time.time()
             self.last_access = time.time()
             logger.info(
-                f"Client {client_id} left shared stream {self.stream_id} ({len(self.clients)} remaining)")
+                f"Client {client_id} joined shared stream {self.stream_id} ({len(self.clients)} total)")
+            return client_queue
 
-    def prune_stale_clients(self, timeout: int):
+    async def remove_client(self, client_id: str):
+        """Remove a client from this shared process"""
+        async with self._broadcaster_lock:
+            if client_id in self.clients:
+                del self.clients[client_id]
+                self.last_access = time.time()
+                logger.info(
+                    f"Client {client_id} left shared stream {self.stream_id} ({len(self.clients)} remaining)")
+            
+            # Remove client's queue
+            if client_id in self.client_queues:
+                del self.client_queues[client_id]
+
+    async def prune_stale_clients(self, timeout: int):
         """Remove clients that have been inactive for a while"""
         stale_clients = [
             cid for cid, last_seen in self.clients.items()
             if time.time() - last_seen > timeout
         ]
         for client_id in stale_clients:
-            self.remove_client(client_id)
+            await self.remove_client(client_id)
 
     def should_cleanup(self, timeout: int = 300) -> bool:
         """Check if this process should be cleaned up (no clients for timeout seconds)"""
@@ -288,7 +355,7 @@ class PooledStreamManager:
 
         for stream_id, process in self.shared_processes.items():
             process.health_check()
-            process.prune_stale_clients(self.client_timeout)
+            await process.prune_stale_clients(self.client_timeout)
             if process.should_cleanup(self.stream_timeout) or process.status == "failed":
                 to_cleanup.append(stream_id)
 
@@ -386,7 +453,7 @@ class PooledStreamManager:
                 # Process will be recreated below
             else:
                 # Process is healthy, reuse it
-                process.add_client(client_id)
+                await process.add_client(client_id)
                 self.client_streams[client_id] = stream_key
                 return stream_key, process
 
@@ -409,7 +476,7 @@ class PooledStreamManager:
 
         if await process.start_process():
             self.shared_processes[stream_key] = process
-            process.add_client(client_id)
+            await process.add_client(client_id)
             self.client_streams[client_id] = stream_key
 
             # Register in Redis
@@ -462,7 +529,7 @@ class PooledStreamManager:
 
         if stream_key and stream_key in self.shared_processes:
             process = self.shared_processes[stream_key]
-            process.remove_client(client_id)
+            await process.remove_client(client_id)
 
             # If no more clients, immediately schedule cleanup
             if not process.clients:

@@ -462,8 +462,15 @@ class StreamManager:
         logger.info(
             f"Starting direct proxy for client {client_id}, stream {stream_id}")
 
+        # Variables to capture from the generator for response headers
+        provider_status_code = None
+        provider_content_range = None
+        provider_content_length = None
+
         async def generate():
             """Generator that directly proxies bytes from provider to client"""
+            nonlocal provider_status_code, provider_content_range, provider_content_length
+            
             bytes_served = 0
             chunk_count = 0
             response = None
@@ -514,8 +521,15 @@ class StreamManager:
                 # Now we can call methods on the actual response object
                 response.raise_for_status()
 
+                # Capture provider response details for proper HTTP 206 handling
+                provider_status_code = response.status_code
+                provider_content_range = response.headers.get('content-range')
+                provider_content_length = response.headers.get('content-length')
+
                 logger.info(
                     f"Provider connected: {response.status_code}, Content-Type: {response.headers.get('content-type')}")
+                if provider_content_range:
+                    logger.info(f"Provider Content-Range: {provider_content_range}")
 
                 # Direct byte-for-byte proxy - NO buffering, NO transcoding
                 async for chunk in response.aiter_bytes(chunk_size=32768):
@@ -724,7 +738,41 @@ class StreamManager:
         else:
             headers["Accept-Ranges"] = "bytes"
 
-        return StreamingResponse(generate(), media_type=content_type, headers=headers)
+        # Create generator to start streaming
+        gen = generate()
+        
+        # Consume first iteration to capture provider response headers
+        # This is necessary to determine if we should return 206 or 200
+        try:
+            first_chunk = await gen.__anext__()
+        except StopAsyncIteration:
+            # Empty stream
+            return StreamingResponse(iter([]), media_type=content_type, headers=headers)
+        
+        # Now we have provider_status_code, provider_content_range, provider_content_length
+        # Determine proper response status and headers
+        status_code = 200
+        if range_header and provider_status_code == 206 and provider_content_range:
+            # Provider returned 206, we should also return 206
+            status_code = 206
+            headers["Content-Range"] = provider_content_range
+            logger.info(f"Returning 206 Partial Content with range: {provider_content_range}")
+        
+        if provider_content_length:
+            headers["Content-Length"] = provider_content_length
+
+        # Create new generator that yields the first chunk then continues with the rest
+        async def generate_with_first_chunk():
+            yield first_chunk
+            async for chunk in gen:
+                yield chunk
+
+        return StreamingResponse(
+            generate_with_first_chunk(), 
+            status_code=status_code,
+            media_type=content_type, 
+            headers=headers
+        )
 
     async def stream_transcoded(
         self,

@@ -37,7 +37,7 @@ class SharedTranscodingProcess:
         self.last_access = time.time()
         self.total_bytes_served = 0
         self.status = "starting"
-        
+
         # Broadcasting support - each client gets its own queue
         self.client_queues: Dict[str, asyncio.Queue] = {}
         self._broadcaster_task: Optional[asyncio.Task] = None
@@ -72,9 +72,10 @@ class SharedTranscodingProcess:
 
             # Start stderr logging task
             asyncio.create_task(self._log_stderr())
-            
+
             # Start broadcaster task to read from FFmpeg and send to all clients
-            self._broadcaster_task = asyncio.create_task(self._broadcast_loop())
+            self._broadcaster_task = asyncio.create_task(
+                self._broadcast_loop())
 
             return True
 
@@ -82,23 +83,25 @@ class SharedTranscodingProcess:
             logger.error(f"Failed to start shared FFmpeg process: {e}")
             self.status = "failed"
             return False
-    
+
     async def _broadcast_loop(self):
         """Read from FFmpeg stdout and broadcast to all client queues"""
         if not self.process or not self.process.stdout:
-            logger.error(f"Cannot start broadcaster - no process or stdout for {self.stream_id}")
+            logger.error(
+                f"Cannot start broadcaster - no process or stdout for {self.stream_id}")
             return
-        
+
         logger.info(f"Starting broadcaster for stream {self.stream_id}")
-        
+
         try:
             while self.process and self.process.returncode is None:
                 # Read chunk from FFmpeg
                 chunk = await self.process.stdout.read(32768)
                 if not chunk:
-                    logger.info(f"FFmpeg stdout closed for stream {self.stream_id}")
+                    logger.info(
+                        f"FFmpeg stdout closed for stream {self.stream_id}")
                     break
-                
+
                 # Broadcast to all client queues
                 async with self._broadcaster_lock:
                     dead_clients = []
@@ -107,19 +110,21 @@ class SharedTranscodingProcess:
                             # Use put_nowait to avoid blocking if a client's queue is full
                             queue.put_nowait(chunk)
                         except asyncio.QueueFull:
-                            logger.warning(f"Client {client_id} queue is full, dropping chunk")
+                            logger.warning(
+                                f"Client {client_id} queue is full, dropping chunk")
                         except Exception as e:
-                            logger.error(f"Error sending to client {client_id}: {e}")
+                            logger.error(
+                                f"Error sending to client {client_id}: {e}")
                             dead_clients.append(client_id)
-                    
+
                     # Remove dead clients
                     for client_id in dead_clients:
                         self.client_queues.pop(client_id, None)
-                
+
                 # Update stats
                 self.total_bytes_served += len(chunk)
                 self.last_access = time.time()
-                
+
         except Exception as e:
             logger.error(f"Broadcaster error for stream {self.stream_id}: {e}")
         finally:
@@ -172,7 +177,7 @@ class SharedTranscodingProcess:
                 self.last_access = time.time()
                 logger.info(
                     f"Client {client_id} left shared stream {self.stream_id} ({len(self.clients)} remaining)")
-            
+
             # Remove client's queue
             if client_id in self.client_queues:
                 del self.client_queues[client_id]
@@ -539,6 +544,33 @@ class PooledStreamManager:
                 # This prevents churning FFmpeg processes for brief disconnects
                 asyncio.create_task(self._delayed_cleanup_if_empty(
                     stream_key, grace_period=10))
+
+    async def force_stop_stream(self, stream_key: str):
+        """
+        Immediately stop a stream and its FFmpeg process without grace period.
+        Used when explicitly deleting a stream via API.
+        """
+        if stream_key not in self.shared_processes:
+            logger.info(f"Stream {stream_key} not found in local processes")
+            return False
+
+        logger.info(
+            f"Force stopping stream {stream_key} and terminating FFmpeg process")
+        process = self.shared_processes[stream_key]
+
+        # Remove all clients from this stream immediately
+        clients_to_remove = list(process.clients.keys())
+        for client_id in clients_to_remove:
+            await process.remove_client(client_id)
+            if client_id in self.client_streams:
+                del self.client_streams[client_id]
+
+        # Immediately cleanup the FFmpeg process
+        await self._cleanup_local_process(stream_key)
+
+        logger.info(
+            f"Stream {stream_key} force stopped, FFmpeg process terminated")
+        return True
 
     async def _delayed_cleanup_if_empty(self, stream_key: str, grace_period: int = 10):
         """

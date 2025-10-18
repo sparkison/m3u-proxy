@@ -150,6 +150,10 @@ class StreamManager:
         self.stream_clients: Dict[str, Set[str]] = {}
         self.client_timeout = settings.CLIENT_TIMEOUT
         self.stream_timeout = settings.STREAM_TIMEOUT
+        
+        # Track cancellation flags for active streaming generators
+        # Key: client_id, Value: asyncio.Event that gets set when stream should stop
+        self.client_cancel_events: Dict[str, asyncio.Event] = {}
 
         # Pooling configuration
         self.enable_pooling = enable_pooling
@@ -411,10 +415,15 @@ class StreamManager:
         return client_info
 
     async def cleanup_client(self, client_id: str):
-        """Clean up a client"""
+        """Clean up a client and signal its streaming generator to stop"""
         if client_id in self.clients:
             client_info = self.clients[client_id]
             stream_id = client_info.stream_id
+            
+            # Signal the streaming generator to stop
+            if client_id in self.client_cancel_events:
+                self.client_cancel_events[client_id].set()
+                logger.info(f"Signaled streaming generator to stop for client: {client_id}")
 
             if stream_id and stream_id in self.stream_clients:
                 self.stream_clients[stream_id].discard(client_id)
@@ -432,6 +441,11 @@ class StreamManager:
 
             del self.clients[client_id]
             self._stats.active_clients -= 1
+            
+            # Clean up cancel event
+            if client_id in self.client_cancel_events:
+                del self.client_cancel_events[client_id]
+            
             logger.info(f"Cleaned up client: {client_id}")
 
     # ============================================================================
@@ -458,6 +472,10 @@ class StreamManager:
         # Register this client
         if client_id not in self.clients:
             await self.register_client(client_id, stream_id)
+
+        # Create cancellation event for this client
+        cancel_event = asyncio.Event()
+        self.client_cancel_events[client_id] = cancel_event
 
         logger.info(
             f"Starting direct proxy for client {client_id}, stream {stream_id}")
@@ -533,6 +551,11 @@ class StreamManager:
 
                 # Direct byte-for-byte proxy - NO buffering, NO transcoding
                 async for chunk in response.aiter_bytes(chunk_size=32768):
+                    # Check if streaming should be cancelled
+                    if cancel_event.is_set():
+                        logger.info(f"Streaming cancelled for client {client_id} by external request")
+                        break
+                    
                     yield chunk
                     bytes_served += len(chunk)
                     chunk_count += 1
@@ -799,6 +822,10 @@ class StreamManager:
         if client_id not in self.clients:
             await self.register_client(client_id, stream_id)
 
+        # Create cancellation event for this client
+        cancel_event = asyncio.Event()
+        self.client_cancel_events[client_id] = cancel_event
+
         logger.info(
             f"Requesting pooled transcoded stream for client {client_id}, stream {stream_id}")
 
@@ -838,8 +865,19 @@ class StreamManager:
 
                 # Stream data from the client's queue (fed by broadcaster)
                 while True:
-                    # Get chunk from queue (broadcaster puts chunks here)
-                    chunk = await client_queue.get()
+                    # Check if streaming should be cancelled
+                    if cancel_event.is_set():
+                        logger.info(f"Transcoded streaming cancelled for client {client_id} by external request")
+                        break
+                    
+                    # Get chunk from queue (broadcaster puts chunks here) with timeout
+                    # to allow checking cancellation event periodically
+                    try:
+                        chunk = await asyncio.wait_for(client_queue.get(), timeout=0.5)
+                    except asyncio.TimeoutError:
+                        # No chunk available, loop back to check cancellation
+                        continue
+                    
                     if chunk is None:  # None signals end of stream
                         break
                     

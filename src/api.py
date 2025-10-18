@@ -303,7 +303,7 @@ async def get_info():
     redis_config = get_redis_config()
     use_pooling = should_use_pooling()
     profile_manager = get_profile_manager()
-    
+
     # Build the info response
     info = {
         "version": VERSION,
@@ -341,7 +341,7 @@ async def get_info():
             "multi_worker_mode": bool(settings.WORKER_ID)
         }
     }
-    
+
     return info
 
 
@@ -1140,7 +1140,21 @@ async def delete_stream(stream_id: str):
         if stream_id not in stream_manager.streams:
             raise HTTPException(status_code=404, detail="Stream not found")
 
-        # Get all clients for this stream
+        stream_info = stream_manager.streams[stream_id]
+
+        # For transcoded streams, force stop the FFmpeg process immediately
+        if stream_info.is_transcoded and stream_manager.pooled_manager:
+            logger.info(f"Force stopping transcoded stream {stream_id}")
+            # Get the stream key used by pooled manager
+            # This is typically based on URL and profile
+            from pooled_stream_manager import PooledStreamManager
+            stream_key = stream_manager.pooled_manager._generate_stream_key(
+                stream_info.current_url or stream_info.original_url,
+                stream_info.transcode_profile or "default"
+            )
+            await stream_manager.pooled_manager.force_stop_stream(stream_key)
+
+        # Get all clients for this stream and clean them up
         if stream_id in stream_manager.stream_clients:
             client_ids = list(stream_manager.stream_clients[stream_id])
             for client_id in client_ids:

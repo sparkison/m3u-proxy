@@ -629,8 +629,22 @@ async def get_hls_playlist(
             logger.debug(
                 f"Reusing existing client {client_id} for stream {stream_id}")
 
-        # Build base URL for this stream
-        base_proxy_url = f"http://localhost:8085/hls/{stream_id}"
+        # Build base URL for this stream using settings.PUBLIC_URL (optional) and settings.PORT
+        # PUBLIC_URL may be an IP, domain, or include a scheme (http/https) and/or port.
+        public_url = getattr(settings, 'PUBLIC_URL', None)
+        port = getattr(settings, 'PORT', None) or 8085
+
+        if public_url:
+            # If PUBLIC_URL includes a scheme, respect it. Otherwise assume http.
+            parsed = urlparse(public_url if public_url.startswith(('http://', 'https://')) else f"http://{public_url}")
+            scheme = parsed.scheme or 'http'
+            netloc = parsed.netloc or parsed.path
+            base = f"{scheme}://{netloc}"
+        else:
+            # Default to localhost with configured port (or 8085)
+            base = f"http://localhost:{port}"
+
+        base_proxy_url = f"{base.rstrip('/')}/hls/{stream_id}"
 
         # Get processed playlist content
         content = await stream_manager.get_playlist_content(stream_id, client_id, base_proxy_url)

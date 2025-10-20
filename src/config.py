@@ -2,7 +2,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from typing import Optional
 
 # Application version
-VERSION = "0.2.10"
+VERSION = "0.2.11"
 
 
 class Settings(BaseSettings):
@@ -14,6 +14,7 @@ class Settings(BaseSettings):
     # Server Configuration
     HOST: str = "0.0.0.0"
     PORT: int = 8085
+    # PUBLIC_URL: str = "http://localhost:8085" # Default public URL for re-writing URLs (HLS streams only)
     LOG_LEVEL: str = "error"
     APP_DEBUG: bool = False
     RELOAD: bool = False

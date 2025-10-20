@@ -2,6 +2,7 @@ FROM linuxserver/ffmpeg:latest
 
 # Install Python and system dependencies
 RUN apt-get update && apt-get install -y \
+    lspci \
     python3 \
     python3-pip \
     python3-venv \

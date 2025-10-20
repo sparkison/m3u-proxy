@@ -14,7 +14,7 @@ class Settings(BaseSettings):
     # Server Configuration
     HOST: str = "0.0.0.0"
     PORT: int = 8085
-    # PUBLIC_URL: str = "http://localhost:8085" # Default public URL for re-writing URLs (HLS streams only)
+    PUBLIC_URL: Optional[str] = None  # Default public URL for re-writing URLs (HLS streams only)
     LOG_LEVEL: str = "error"
     APP_DEBUG: bool = False
     RELOAD: bool = False

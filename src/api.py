@@ -185,7 +185,7 @@ event_manager = EventManager()
 async def lifespan(app: FastAPI):
     """Lifespan context manager for startup and shutdown events"""
     # Startup
-    logger.info("m3u-proxy Enhanced starting up...")
+    logger.info("m3u-proxy starting up...")
     await event_manager.start()
 
     # Connect event manager to stream manager
@@ -205,7 +205,7 @@ async def lifespan(app: FastAPI):
     yield
 
     # Shutdown
-    logger.info("m3u-proxy Enhanced shutting down...")
+    logger.info("m3u-proxy shutting down...")
     await stream_manager.stop()
     await event_manager.stop()
 
@@ -287,7 +287,7 @@ async def root():
     proxy_stats = stats["proxy_stats"]
     return {
         "status": "running",
-        "message": "m3u-proxy Enhanced is running",
+        "message": "m3u-proxy is running",
         "version": VERSION,
         "uptime": proxy_stats["uptime_seconds"],
         "stats": proxy_stats

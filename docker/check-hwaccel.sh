@@ -97,7 +97,7 @@ else
     
     echo "📋 =================================================="
     echo "✅ GPU detection script complete. No GPUs available for hardware acceleration."
-    exit 0   # <-- was 'return 0 2>/dev/null || true'
+    exit 0
 fi
 
 # Check FFmpeg hardware acceleration support

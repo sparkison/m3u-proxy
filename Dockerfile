@@ -2,7 +2,11 @@ FROM linuxserver/ffmpeg:latest
 
 # Install Python and system dependencies
 RUN apt-get update && apt-get install -y \
+    # Add common utilities
     pciutils \
+    wget \
+    nano \
+    # Python dependencies
     python3 \
     python3-pip \
     python3-venv \

@@ -636,10 +636,25 @@ async def get_hls_playlist(
 
         if public_url:
             # If PUBLIC_URL includes a scheme, respect it. Otherwise assume http.
-            parsed = urlparse(public_url if public_url.startswith(('http://', 'https://')) else f"http://{public_url}")
+            public_with_scheme = public_url if public_url.startswith(('http://', 'https://')) else f"http://{public_url}"
+            parsed = urlparse(public_with_scheme)
             scheme = parsed.scheme or 'http'
-            netloc = parsed.netloc or parsed.path
-            base = f"{scheme}://{netloc}"
+
+            # Preserve hostname and path. If PUBLIC_URL provided an explicit port, use it;
+            # otherwise fall back to settings.PORT when available.
+            host = parsed.hostname or ''
+            url_port = parsed.port
+            path = parsed.path or ''
+
+            if url_port:
+                netloc = f"{host}:{url_port}"
+            elif port:
+                netloc = f"{host}:{port}"
+            else:
+                netloc = host
+
+            # Combine scheme, netloc, and any path from PUBLIC_URL (preserve sub-paths)
+            base = f"{scheme}://{netloc}{path.rstrip('/')}"
         else:
             # Default to localhost with configured port (or 8085)
             base = f"http://localhost:{port}"

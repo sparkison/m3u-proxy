@@ -97,7 +97,7 @@ else
     
     echo "📋 =================================================="
     echo "✅ GPU detection script complete. No GPUs available for hardware acceleration."
-    return 0 2>/dev/null || true
+    exit 0   # <-- was 'return 0 2>/dev/null || true'
 fi
 
 # Check FFmpeg hardware acceleration support
@@ -166,7 +166,11 @@ if command -v ffmpeg >/dev/null 2>&1; then
                 if [ "$INTEL_GPU_IN_LSPCI" = true ] || [ "$AMD_GPU_IN_LSPCI" = true ] || [ "$INTEL_VENDOR_FOUND" = true ]; then
                     # Test if VAAPI actually works by trying a quick encode
                     echo "    🧪 Testing VAAPI functionality..."
-                    VAAPI_TEST_OUTPUT=$(timeout 5 ffmpeg -f lavfi -i testsrc=duration=0.1:size=64x64:rate=30 -vaapi_device /dev/dri/renderD128 -vf 'format=nv12,hwupload' -c:v h264_vaapi -f null - 2>&1)
+                    if command -v timeout >/dev/null 2>&1; then
+                        VAAPI_TEST_OUTPUT=$(timeout 6 ffmpeg -f lavfi -i testsrc=duration=0.1:size=128x128:rate=30 -vaapi_device /dev/dri/renderD128 -vf 'format=nv12,hwupload' -c:v h264_vaapi -frames:v 5 -f null - 2>&1)
+                    else
+                        VAAPI_TEST_OUTPUT=$(ffmpeg -v error -hide_banner -f lavfi -i testsrc=duration=0.1:size=128x128:rate=30 -vaapi_device /dev/dri/renderD128 -vf 'format=nv12,hwupload' -c:v h264_vaapi -frames:v 5 -f null - 2>&1)
+                    fi
                     VAAPI_TEST_RESULT=$?
                     
                     if [ $VAAPI_TEST_RESULT -eq 0 ]; then
@@ -246,7 +250,7 @@ elif [ "$DRI_DEVICES_FOUND" = true ] && echo "$COMPATIBLE_METHODS" | grep -q "va
         export HW_ACCEL_TYPE="intel"
     elif [ "$AMD_GPU_IN_LSPCI" = true ] && [ -n "$AMD_MODEL" ]; then
         echo "🔰 AMD GPU: $AMD_MODEL"
-        export HW_ACCEL_TYPE="amd"
+        export HW_ACCEL_TYPE="vaapi"   # <-- changed from "amd" to "vaapi"
     else
         echo "🔰 GPU: VAAPI COMPATIBLE"
         export HW_ACCEL_TYPE="vaapi"

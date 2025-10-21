@@ -30,7 +30,10 @@ cd /app
 # Run hardware acceleration check
 echo "🔍 Running hardware acceleration check..."
 chmod +x /app/docker/check-hwaccel.sh
-source /app/docker/check-hwaccel.sh
+# Run the hardware check in a subshell so any 'exit' in the script doesn't kill this entrypoint
+/bin/bash /app/docker/check-hwaccel.sh || {
+    echo "⚠️ Hardware check script exited with code $? — continuing startup using CPU settings"
+}
 
 # Load hardware acceleration environment variables
 if [ -f /tmp/hwaccel.env ]; then

@@ -89,6 +89,7 @@ class StreamCreateRequest(BaseModel):
     failover_urls: Optional[List[str]] = None
     user_agent: Optional[str] = None
     metadata: Optional[dict] = None
+    headers: Optional[Dict[str, str]] = None
 
     @field_validator('url')
     @classmethod
@@ -388,7 +389,8 @@ async def create_stream(request: StreamCreateRequest):
             request.url,
             request.failover_urls,
             request.user_agent,
-            metadata=request.metadata
+            metadata=request.metadata,
+            headers=request.headers
         )
 
         # Emit stream started event

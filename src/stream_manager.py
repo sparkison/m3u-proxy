@@ -74,6 +74,7 @@ class StreamInfo:
     is_variant_stream: bool = False
     # Custom metadata - arbitrary key/value pairs for external identification
     metadata: Dict[str, str] = field(default_factory=dict)
+    headers: Dict[str, str] = field(default_factory=dict)
     # Transcoding configuration
     is_transcoded: bool = False
     transcode_profile: Optional[str] = None
@@ -296,6 +297,7 @@ class StreamManager:
         user_agent: Optional[str] = None,
         parent_stream_id: Optional[str] = None,
         metadata: Optional[Dict[str, str]] = None,
+        headers: Optional[Dict[str, str]] = None,
         is_transcoded: bool = False,
         transcode_profile: Optional[str] = None,
         transcode_ffmpeg_args: Optional[List[str]] = None
@@ -308,6 +310,7 @@ class StreamManager:
             user_agent: Optional user agent string
             parent_stream_id: Optional parent stream ID for variant playlists
             metadata: Optional custom key/value pairs for external identification
+            headers: Optional dictionary of custom headers
             is_transcoded: Whether this stream should be transcoded
             transcode_profile: Name of the transcoding profile to use
             transcode_ffmpeg_args: FFmpeg arguments for transcoding
@@ -343,6 +346,7 @@ class StreamManager:
                 parent_stream_id=parent_stream_id,
                 is_variant_stream=is_variant,
                 metadata=metadata or {},
+                headers=headers or {},
                 is_transcoded=is_transcoded,
                 transcode_profile=transcode_profile,
                 transcode_ffmpeg_args=transcode_ffmpeg_args or []
@@ -515,6 +519,7 @@ class StreamManager:
                     'Accept': '*/*',
                     'Connection': 'keep-alive'
                 }
+                headers.update(stream_info.headers)
 
                 # IMPORTANT: Do NOT send Range headers for live continuous streams
                 # Live IPTV streams (.ts) are infinite and don't support range requests
@@ -1013,6 +1018,7 @@ class StreamManager:
         try:
             logger.info(f"Fetching HLS playlist from: {current_url}")
             headers = {'User-Agent': stream_info.user_agent}
+            headers.update(stream_info.headers)
             response = await self.http_client.get(current_url, headers=headers)
             response.raise_for_status()
 
@@ -1068,9 +1074,11 @@ class StreamManager:
                 if range_header:
                     headers['Range'] = range_header
 
-                # Get stream info for user agent
+                # Get stream info for user agent and custom headers
                 if stream_id in self.streams:
-                    headers['User-Agent'] = self.streams[stream_id].user_agent
+                    stream_info = self.streams[stream_id]
+                    headers['User-Agent'] = stream_info.user_agent
+                    headers.update(stream_info.headers)
 
                 async with self.http_client.stream('GET', segment_url, headers=headers, follow_redirects=True) as response:
                     response.raise_for_status()

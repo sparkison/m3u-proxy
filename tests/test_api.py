@@ -118,6 +118,23 @@ class TestAPI:
         data = response.json()
         assert data["stream_id"] == "test_stream_123"
 
+    def test_create_stream_with_custom_headers(self, client, mock_stream_manager):
+        payload = {
+            "url": "http://example.com/stream.m3u8",
+            "headers": {
+                "X-Custom-Header": "TestValue",
+                "Authorization": "Bearer token"
+            }
+        }
+
+        response = client.post("/streams", json=payload)
+        assert response.status_code == 200
+
+        # Verify that the stream manager's get_or_create_stream was called with the headers
+        mock_stream_manager.get_or_create_stream.assert_called_once()
+        call_args = mock_stream_manager.get_or_create_stream.call_args
+        assert call_args.kwargs['headers'] == payload['headers']
+
     def test_create_stream_post_invalid_url(self, client):
         payload = {"url": "not_a_valid_url"}
 
@@ -152,7 +169,11 @@ class TestAPI:
         assert "not found" in data["detail"].lower()
 
     def test_delete_stream_exists(self, client, mock_stream_manager):
-        mock_stream_manager.remove_stream = Mock(return_value=True)
+        mock_stream_manager.cleanup_client = AsyncMock()
+        mock_stream_manager.stream_clients = {'test_stream_123': {'client1'}}
+        mock_stream_manager.streams = {
+            'test_stream_123': Mock(is_transcoded=False)
+        }
 
         response = client.delete("/streams/test_stream_123")
         assert response.status_code == 200
@@ -161,8 +182,7 @@ class TestAPI:
         assert "deleted" in data["message"].lower()
 
     def test_delete_stream_not_found(self, client, mock_stream_manager):
-        mock_stream_manager.remove_stream = Mock(return_value=False)
-
+        mock_stream_manager.streams = {}
         response = client.delete("/streams/nonexistent")
         assert response.status_code == 404
 

@@ -242,8 +242,12 @@ class StreamManager:
             await self.pooled_manager.start()
 
         self._cleanup_task = asyncio.create_task(self._periodic_cleanup())
-        self._health_check_task = asyncio.create_task(
-            self._periodic_health_check())
+
+        # Disable health checks for now until we can come up with a better approach
+        # Using get/head requests can interfere with live streams, or 502 errors
+        # Need to instead check the health during actual streaming requests
+        # self._health_check_task = asyncio.create_task(
+        #     self._periodic_health_check())
 
         mode = "with Redis pooling" if (
             self.pooled_manager and self.pooled_manager.enable_sharing) else "single-worker"

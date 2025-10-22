@@ -425,10 +425,10 @@ class PooledStreamManager:
         except Exception as e:
             logger.error(f"Error cleaning up worker streams from Redis: {e}")
 
-    def _generate_stream_key(self, url: str, profile: str, profile_variables: Dict = None) -> str:
+    def _generate_stream_key(self, url: str, profile: str) -> str:
         """Generate a consistent key for stream sharing"""
-        # Create a hash of URL + profile + variables for consistent stream sharing
-        data = f"{url}|{profile}|{json.dumps(profile_variables or {}, sort_keys=True)}"
+        # Create a hash of URL + profile for consistent stream sharing
+        data = f"{url}|{profile}"
         return hashlib.sha256(data.encode()).hexdigest()[:16]
 
     async def get_or_create_shared_stream(
@@ -437,11 +437,10 @@ class PooledStreamManager:
         profile: str,
         ffmpeg_args: List[str],
         client_id: str,
-        profile_variables: Dict = None
     ) -> Tuple[str, SharedTranscodingProcess]:
         """Get existing shared stream or create new one"""
 
-        stream_key = self._generate_stream_key(url, profile, profile_variables)
+        stream_key = self._generate_stream_key(url, profile)
 
         # First check if we have it locally
         if stream_key in self.shared_processes:

@@ -1343,7 +1343,8 @@ class StreamManager:
                     "stream_type": "HLS" if stream.is_hls else ("VOD" if stream.is_vod else "Live Continuous"),
                     "created_at": stream.created_at.isoformat(),
                     "last_access": stream.last_access.isoformat(),
-                    "metadata": stream.metadata
+                    "metadata": stream.metadata,
+                    "headers": stream.headers
                 }
                 for stream in non_variant_streams
             ],

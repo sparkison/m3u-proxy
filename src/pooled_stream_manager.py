@@ -125,7 +125,13 @@ class SharedTranscodingProcess:
                             queue.put_nowait(chunk)
                         except asyncio.QueueFull:
                             logger.warning(
-                                f"Client {client_id} queue is full, dropping chunk")
+                                f"Client {client_id} queue is full, dropping stale chunks")
+                            items_to_remove = max(0, queue.qsize() - 100)
+                            for _ in range(items_to_remove):
+                                try:
+                                    queue.get_nowait()
+                                except asyncio.QueueEmpty:
+                                    break
                         except Exception as e:
                             logger.error(
                                 f"Error sending to client {client_id}: {e}")

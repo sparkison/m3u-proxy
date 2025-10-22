@@ -890,6 +890,7 @@ class StreamManager:
                         continue
                     
                     if chunk is None:  # None signals end of stream
+                        logger.info(f"Transcoded streaming ended for client {client_id}")
                         break
                     
                     yield chunk

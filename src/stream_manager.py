@@ -849,7 +849,9 @@ class StreamManager:
                     url=stream_info.current_url or stream_info.original_url,
                     profile=stream_info.transcode_profile,
                     ffmpeg_args=stream_info.transcode_ffmpeg_args,
-                    client_id=client_id
+                    client_id=client_id,
+                    user_agent=stream_info.user_agent,
+                    headers=stream_info.headers,
                 )
 
                 if not shared_process or not shared_process.process or not shared_process.process.stdout:

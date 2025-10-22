@@ -26,11 +26,13 @@ except ImportError:
 class SharedTranscodingProcess:
     """Represents a shared FFmpeg transcoding process with broadcasting to multiple clients"""
 
-    def __init__(self, stream_id: str, url: str, profile: str, ffmpeg_args: List[str]):
+    def __init__(self, stream_id: str, url: str, profile: str, ffmpeg_args: List[str], user_agent: Optional[str] = None, headers: Optional[Dict[str, str]] = None):
         self.stream_id = stream_id
         self.url = url
         self.profile = profile
         self.ffmpeg_args = ffmpeg_args
+        self.user_agent = user_agent
+        self.headers = headers or {}
         self.process: Optional[asyncio.subprocess.Process] = None
         self.clients: Dict[str, float] = {}  # client_id -> last_access_time
         self.created_at = time.time()
@@ -50,7 +52,19 @@ class SharedTranscodingProcess:
                 f"Starting shared FFmpeg process for stream {self.stream_id}")
 
             # Build FFmpeg command - ensure output to stdout
-            ffmpeg_cmd = ["ffmpeg"] + self.ffmpeg_args
+            ffmpeg_cmd = ["ffmpeg"]
+
+            # Add user agent if provided
+            if self.user_agent:
+                ffmpeg_cmd.extend(["-user_agent", self.user_agent])
+
+            # Add headers if provided, ensuring proper format
+            if self.headers:
+                header_str = "".join(
+                    [f"{k}: {v}\r\n" for k, v in self.headers.items()])
+                ffmpeg_cmd.extend(["-headers", header_str])
+
+            ffmpeg_cmd.extend(self.ffmpeg_args)
 
             # Ensure we're outputting to stdout in MPEGTS format
             if "-f" not in ffmpeg_cmd:
@@ -437,6 +451,8 @@ class PooledStreamManager:
         profile: str,
         ffmpeg_args: List[str],
         client_id: str,
+        user_agent: Optional[str] = None,
+        headers: Optional[Dict[str, str]] = None,
     ) -> Tuple[str, SharedTranscodingProcess]:
         """Get existing shared stream or create new one"""
 
@@ -476,7 +492,7 @@ class PooledStreamManager:
 
         # Create new local process
         process = SharedTranscodingProcess(
-            stream_key, url, profile, ffmpeg_args)
+            stream_key, url, profile, ffmpeg_args, user_agent=user_agent, headers=headers)
 
         if await process.start_process():
             self.shared_processes[stream_key] = process

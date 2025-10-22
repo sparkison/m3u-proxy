@@ -45,6 +45,9 @@ class SharedTranscodingProcess:
         self._broadcaster_task: Optional[asyncio.Task] = None
         self._broadcaster_lock = asyncio.Lock()
 
+        self.last_chunk_time = time.time()  # Track when last chunk was produced
+        self.output_timeout = 30  # Seconds without output before considering failed
+
     async def start_process(self):
         """Start the FFmpeg process"""
         try:
@@ -116,6 +119,9 @@ class SharedTranscodingProcess:
                         f"FFmpeg stdout closed for stream {self.stream_id}")
                     break
 
+                # Update last chunk time
+                self.last_chunk_time = time.time()
+
                 # Broadcast to all client queues
                 async with self._broadcaster_lock:
                     dead_clients = []
@@ -124,14 +130,10 @@ class SharedTranscodingProcess:
                             # Use put_nowait to avoid blocking if a client's queue is full
                             queue.put_nowait(chunk)
                         except asyncio.QueueFull:
+                            while not queue.empty():
+                                queue.get_nowait()
                             logger.warning(
-                                f"Client {client_id} queue is full, dropping stale chunks")
-                            items_to_remove = max(0, queue.qsize() - 100)
-                            for _ in range(items_to_remove):
-                                try:
-                                    queue.get_nowait()
-                                except asyncio.QueueEmpty:
-                                    break
+                                f"Client {client_id} queue full, clearing old data")
                         except Exception as e:
                             logger.error(
                                 f"Error sending to client {client_id}: {e}")
@@ -228,6 +230,13 @@ class SharedTranscodingProcess:
         if self.process is None and self.status == "running":
             logger.warning(
                 f"FFmpeg process for stream {self.stream_id} is None but status is running")
+            self.status = "failed"
+            return False
+        
+        # Check if no output for too long (indicates stuck process)
+        if time.time() - self.last_chunk_time > self.output_timeout:
+            logger.warning(
+                f"FFmpeg process for stream {self.stream_id} has produced no output for {self.output_timeout}s, marking as failed")
             self.status = "failed"
             return False
 

@@ -46,8 +46,6 @@ def main():
     logger.info("✓ Direct proxy architecture (per-client connections)")
     logger.info("✓ Connection pooling enabled (HLS streams only)")
     logger.info("✓ Seamless failover support")
-    if settings.APP_DEBUG:
-        logger.warning("⚠ Debug mode is enabled. Do not use in production.")
     if settings.RELOAD:
         logger.info("✓ Auto-reload is enabled.")
 

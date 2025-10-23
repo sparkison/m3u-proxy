@@ -130,10 +130,18 @@ class SharedTranscodingProcess:
                             # Use put_nowait to avoid blocking if a client's queue is full
                             queue.put_nowait(chunk)
                         except asyncio.QueueFull:
-                            while not queue.empty():
+                            # When the queue is full, remove the oldest chunk to make space
+                            try:
                                 queue.get_nowait()
-                            logger.warning(
-                                f"Client {client_id} queue full, clearing old data")
+                            except asyncio.QueueEmpty:
+                                # Should not happen if QueueFull was just raised, but defensive
+                                pass
+                            # Retry putting the new chunk
+                            try:
+                                queue.put_nowait(chunk)
+                            except asyncio.QueueFull:
+                                logger.warning(
+                                    f"Client {client_id} queue full after dropping chunk")
                         except Exception as e:
                             logger.error(
                                 f"Error sending to client {client_id}: {e}")

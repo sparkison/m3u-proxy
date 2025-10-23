@@ -578,10 +578,10 @@ class PooledStreamManager:
             if not process.clients:
                 logger.info(
                     f"No more clients for stream {stream_key}, scheduling immediate cleanup")
-                # Give it a short grace period (10 seconds) in case client reconnects
+                # Give it a short grace period (1 seconds) in case client reconnects
                 # This prevents churning FFmpeg processes for brief disconnects
                 asyncio.create_task(self._delayed_cleanup_if_empty(
-                    stream_key, grace_period=10))
+                    stream_key, grace_period=1))
 
     async def force_stop_stream(self, stream_key: str):
         """

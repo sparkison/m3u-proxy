@@ -12,6 +12,8 @@ from datetime import datetime
 from typing import Dict, List, Optional, Set, Tuple, Any
 from urllib.parse import urlparse
 import logging
+import os
+import tempfile
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +49,17 @@ class SharedTranscodingProcess:
 
         self.last_chunk_time = time.time()  # Track when last chunk was produced
         self.output_timeout = 30  # Seconds without output before considering failed
+        # Detect output mode (stdout stream vs HLS files)
+        self.mode = "stdout"
+        self.hls_dir: Optional[str] = None
+        # If ffmpeg_args suggest HLS output, switch to hls mode
+        joined_args = ' '.join(self.ffmpeg_args).lower()
+        if '-hls_time' in joined_args or '-hls_list_size' in joined_args or '-f hls' in joined_args:
+            import tempfile
+            self.mode = 'hls'
+            # Create a per-stream temporary directory for HLS segments
+            self.hls_dir = tempfile.mkdtemp(prefix=f"m3u_proxy_hls_{self.stream_id}_")
+            logger.info(f"SharedTranscodingProcess {self.stream_id} will run in HLS mode, hls_dir={self.hls_dir}")
 
     async def start_process(self):
         """Start the FFmpeg process"""
@@ -69,11 +82,31 @@ class SharedTranscodingProcess:
 
             ffmpeg_cmd.extend(self.ffmpeg_args)
 
-            # Ensure we're outputting to stdout in MPEGTS format
-            if "-f" not in ffmpeg_cmd:
-                ffmpeg_cmd.extend(["-f", "mpegts"])
-            if "pipe:1" not in ffmpeg_cmd and "-" not in ffmpeg_cmd:
-                ffmpeg_cmd.append("pipe:1")
+            # If HLS mode, ensure we write to the hls_dir index.m3u8
+            if self.mode == 'hls':
+                # If the ffmpeg args already include an output filename, respect it
+                # Otherwise append the playlist target into the hls dir
+                playlist_path = os.path.join(self.hls_dir, 'index.m3u8')
+                # Remove any trailing empty args
+                if not self.ffmpeg_args or (self.ffmpeg_args and not any((arg.strip() for arg in self.ffmpeg_args if arg))):
+                    ffmpeg_cmd.append(playlist_path)
+                else:
+                    last_arg = self.ffmpeg_args[-1]
+                    # If last arg looks like an output placeholder (empty string or pipe), replace it
+                    if last_arg in ('', None):
+                        ffmpeg_cmd[-1] = playlist_path
+                    else:
+                        # If playlist path not present in args, append
+                        if 'index.m3u8' not in ' '.join(self.ffmpeg_args):
+                            ffmpeg_cmd.append(playlist_path)
+
+            else:
+                # Ensure we're outputting to stdout in MPEGTS format only if no -f specified
+                if "-f" not in [a.lower() for a in ffmpeg_cmd]:
+                    ffmpeg_cmd.extend(["-f", "mpegts"])
+                # Use pipe:1 for stdout-based broadcasting unless an output file is specified
+                if "pipe:1" not in ffmpeg_cmd and "-" not in ffmpeg_cmd and self.mode == 'stdout':
+                    ffmpeg_cmd.append("pipe:1")
 
             logger.info(f"FFmpeg command: {' '.join(ffmpeg_cmd)}")
 
@@ -91,8 +124,12 @@ class SharedTranscodingProcess:
             asyncio.create_task(self._log_stderr())
 
             # Start broadcaster task to read from FFmpeg and send to all clients
-            self._broadcaster_task = asyncio.create_task(
-                self._broadcast_loop())
+            if self.mode == 'stdout':
+                self._broadcaster_task = asyncio.create_task(
+                    self._broadcast_loop())
+            else:
+                # In HLS mode, start a small watcher task to update last_chunk_time
+                self._broadcaster_task = asyncio.create_task(self._hls_watch_loop())
 
             return True
 
@@ -167,6 +204,28 @@ class SharedTranscodingProcess:
                     except:
                         pass
 
+    async def _hls_watch_loop(self):
+        """Watch HLS output directory and update last_chunk_time when new segments appear"""
+        if not self.hls_dir:
+            return
+        try:
+            known = set()
+            while self.process and self.process.returncode is None:
+                # list files
+                try:
+                    files = os.listdir(self.hls_dir)
+                except FileNotFoundError:
+                    files = []
+
+                new_files = [f for f in files if f not in known]
+                if new_files:
+                    self.last_chunk_time = time.time()
+                    for f in new_files:
+                        known.add(f)
+                await asyncio.sleep(0.5)
+        except Exception as e:
+            logger.debug(f"HLS watch loop ended for {self.stream_id}: {e}")
+
     async def _log_stderr(self):
         """Log FFmpeg stderr output"""
         if not self.process or not self.process.stderr:
@@ -186,6 +245,27 @@ class SharedTranscodingProcess:
         except Exception as e:
             logger.error(
                 f"Error reading FFmpeg stderr for {self.stream_id}: {e}")
+
+    async def read_playlist(self) -> Optional[str]:
+        """Read the generated HLS playlist (index.m3u8) if available"""
+        if not self.hls_dir:
+            return None
+        playlist_path = os.path.join(self.hls_dir, 'index.m3u8')
+        try:
+            if os.path.exists(playlist_path):
+                with open(playlist_path, 'r', encoding='utf-8', errors='ignore') as fh:
+                    return fh.read()
+        except Exception as e:
+            logger.error(f"Error reading playlist {playlist_path}: {e}")
+        return None
+
+    def get_segment_path(self, segment_name: str) -> Optional[str]:
+        if not self.hls_dir:
+            return None
+        candidate = os.path.join(self.hls_dir, segment_name)
+        if os.path.exists(candidate):
+            return candidate
+        return None
 
     async def add_client(self, client_id: str) -> asyncio.Queue:
         """Add a client to this shared process and return their queue"""
@@ -268,6 +348,21 @@ class SharedTranscodingProcess:
 
         self.status = "stopped"
         self.clients.clear()
+        # Remove HLS directory if present and empty
+        try:
+            if self.hls_dir and os.path.isdir(self.hls_dir):
+                # Attempt to remove files then dir
+                for fname in os.listdir(self.hls_dir):
+                    try:
+                        os.remove(os.path.join(self.hls_dir, fname))
+                    except Exception:
+                        pass
+                try:
+                    os.rmdir(self.hls_dir)
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.debug(f"Error cleaning up hls_dir for {self.stream_id}: {e}")
 
 
 class PooledStreamManager:

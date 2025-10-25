@@ -80,6 +80,8 @@ class StreamInfo:
     transcode_profile: Optional[str] = None
     transcode_ffmpeg_args: List[str] = field(default_factory=list)
     transcode_process: Optional[asyncio.subprocess.Process] = None
+    # Key used by the pooled manager to identify shared transcoding processes
+    transcode_stream_key: Optional[str] = None
 
 
 @dataclass
@@ -925,13 +927,34 @@ class StreamManager:
                     f"Finished pooled stream for client {client_id}, served {bytes_served} bytes")
 
         headers = {
-            "Content-Type": "video/mp2t",
+            "Content-Type": None,
             "Cache-Control": "no-cache, no-store, must-revalidate",
             "Pragma": "no-cache",
             "Expires": "0",
             "Access-Control-Allow-Origin": "*",
         }
-        return StreamingResponse(generate(), media_type="video/mp2t", headers=headers)
+        # Determine content type from transcode args
+        content_type = "application/octet-stream"
+        try:
+            joined = ' '.join(stream_info.transcode_ffmpeg_args or []).lower()
+            if '-f mp4' in joined or 'movflags' in joined or 'mp4' in joined:
+                content_type = 'video/mp4'
+            elif '-f hls' in joined or '-hls_time' in joined or 'hls' in joined:
+                # HLS transcoding produces playlists/segments; individual stream endpoints
+                # shouldn't normally use this method - fall back to mpegts for raw streaming
+                content_type = 'application/vnd.apple.mpegurl'
+            elif '-f' in joined and 'mpegts' in joined:
+                content_type = 'video/mp2t'
+            else:
+                # default to mpegts for streaming pipelines
+                content_type = 'video/mp2t'
+        except Exception:
+            content_type = 'application/octet-stream'
+
+        # Set header content-type
+        headers['Content-Type'] = content_type
+
+        return StreamingResponse(generate(), media_type=content_type, headers=headers)
 
     async def _seamless_failover(self, stream_id: str, error: Exception) -> Optional[httpx.Response]:
         """
@@ -1018,6 +1041,58 @@ class StreamManager:
         stream_info = self.streams[stream_id]
         current_url = stream_info.current_url or stream_info.original_url
 
+        # If this stream is a transcoded HLS, try to get playlist from the pooled manager
+        if stream_info.is_transcoded and self.pooled_manager:
+            try:
+                # Ensure a shared transcoding process exists for this stream (this will create one if necessary)
+                stream_key, shared_process = await self.pooled_manager.get_or_create_shared_stream(
+                    url=stream_info.current_url or stream_info.original_url,
+                    profile=stream_info.transcode_profile or "",
+                    ffmpeg_args=stream_info.transcode_ffmpeg_args or [],
+                    client_id=client_id,
+                    user_agent=stream_info.user_agent,
+                    headers=stream_info.headers,
+                )
+                # Record the stream key for later mapping
+                stream_info.transcode_stream_key = stream_key
+
+                # If the shared process is HLS-mode, read its playlist file directly
+                if hasattr(shared_process, 'mode') and getattr(shared_process, 'mode') == 'hls':
+                    playlist_text = await shared_process.read_playlist()
+                    if playlist_text:
+                        # Construct pseudo-final URL based on local file path so M3U8Processor can compute bases
+                        final_url = f"file://{shared_process.hls_dir}/index.m3u8"
+                        stream_info.final_playlist_url = final_url
+
+                        parsed_url = urlparse(final_url)
+                        base_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
+                        if parsed_url.path:
+                            path_parts = parsed_url.path.rsplit('/', 1)
+                            if len(path_parts) > 1:
+                                base_url += path_parts[0] + '/'
+                            else:
+                                base_url += '/'
+                        else:
+                            base_url += '/'
+
+                        parent_id = stream_id if not stream_info.is_variant_stream else stream_info.parent_stream_id
+                        processor = M3U8Processor(
+                            base_proxy_url, client_id, stream_info.user_agent, final_url, parent_stream_id=parent_id)
+                        processed_content = processor.process_playlist(
+                            playlist_text, base_proxy_url, base_url)
+
+                        stream_info.last_access = datetime.now()
+                        if client_id in self.clients:
+                            self.clients[client_id].last_access = datetime.now()
+
+                        return processed_content
+
+            except ConnectionAbortedError:
+                # Stream is being managed by another worker. Fall back to fetching via HTTP from that worker if possible.
+                logger.debug("Transcoded HLS is managed by another worker; falling back to HTTP fetch of playlist if available")
+            except Exception as e:
+                logger.error(f"Error retrieving transcoded playlist from pooled manager: {e}")
+
         try:
             logger.info(f"Fetching HLS playlist from: {current_url}")
             headers = {'User-Agent': stream_info.user_agent}
@@ -1083,12 +1158,25 @@ class StreamManager:
                     headers['User-Agent'] = stream_info.user_agent
                     headers.update(stream_info.headers)
 
-                async with self.http_client.stream('GET', segment_url, headers=headers, follow_redirects=True) as response:
-                    response.raise_for_status()
+                # If the segment is a local file generated by an HLS transcoder, read from disk
+                if segment_url.startswith('file://') or os.path.exists(segment_url):
+                    # Strip file:// prefix if present
+                    path = segment_url[7:] if segment_url.startswith('file://') else segment_url
+                    # Stream the file contents
+                    with open(path, 'rb') as fh:
+                        while True:
+                            chunk = fh.read(32768)
+                            if not chunk:
+                                break
+                            yield chunk
+                            bytes_served += len(chunk)
+                else:
+                    async with self.http_client.stream('GET', segment_url, headers=headers, follow_redirects=True) as response:
+                        response.raise_for_status()
 
-                    async for chunk in response.aiter_bytes(chunk_size=32768):
-                        yield chunk
-                        bytes_served += len(chunk)
+                        async for chunk in response.aiter_bytes(chunk_size=32768):
+                            yield chunk
+                            bytes_served += len(chunk)
 
                 # Update stats
                 if client_id in self.clients:

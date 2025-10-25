@@ -58,6 +58,9 @@ class Settings(BaseSettings):
     HEARTBEAT_INTERVAL: int = 30  # seconds
     CLEANUP_INTERVAL: int = 60    # seconds
     STREAM_SHARING_STRATEGY: str = "url_profile"  # url_profile, url_only, disabled
+    # Grace period (seconds) to wait before cleaning up a shared FFmpeg process after
+    # the last client disconnects. This helps avoid churn for brief reconnects.
+    SHARED_STREAM_GRACE: int = 3
 
     # HLS GC configuration
     HLS_GC_ENABLED: bool = True

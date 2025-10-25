@@ -12,8 +12,10 @@ from datetime import datetime
 from typing import Dict, List, Optional, Set, Tuple, Any
 from urllib.parse import urlparse
 import logging
+from config import settings
 import os
 import tempfile
+import shutil
 
 logger = logging.getLogger(__name__)
 
@@ -393,6 +395,14 @@ class PooledStreamManager:
         # seconds - fallback timeout for streams with no clients
         self.stream_timeout = 30
         self.client_timeout = 600       # 10 minutes - timeout for inactive clients
+        # HLS GC configuration (defaults from config.settings)
+        self.hls_gc_enabled = bool(getattr(settings, 'HLS_GC_ENABLED', True))
+        # How often to scan filesystem for stale HLS dirs (seconds)
+        self.hls_gc_interval = int(getattr(settings, 'HLS_GC_INTERVAL', 600))
+        # Age threshold for removing HLS dirs (seconds)
+        self.hls_gc_age_threshold = int(getattr(settings, 'HLS_GC_AGE_THRESHOLD', 60 * 60))
+        # Track last time GC ran so we can respect hls_gc_interval cadence
+        self._last_hls_gc_run = 0
 
         # Tasks
         self._cleanup_task: Optional[asyncio.Task] = None
@@ -479,6 +489,13 @@ class PooledStreamManager:
                 await asyncio.sleep(self.cleanup_interval)
                 await self._cleanup_stale_processes()
 
+                # Optionally run HLS temp-dir GC (scans system temp dir for leftover m3u_proxy_hls_*)
+                if self.hls_gc_enabled:
+                    now = time.time()
+                    if now - getattr(self, '_last_hls_gc_run', 0) >= self.hls_gc_interval:
+                        await self._gc_hls_temp_dirs()
+                        self._last_hls_gc_run = now
+
                 if self.enable_sharing and self.redis_client:
                     await self._cleanup_stale_redis_streams()
 
@@ -557,6 +574,64 @@ class PooledStreamManager:
             await self.redis_client.delete(worker_streams_key)
         except Exception as e:
             logger.error(f"Error cleaning up worker streams from Redis: {e}")
+
+    async def _gc_hls_temp_dirs(self):
+        """Scan the system temp dir for leftover HLS directories and remove ones older than threshold.
+
+        We look for directories created with the prefix 'm3u_proxy_hls_' and remove them if they
+        are not currently in use by any active SharedTranscodingProcess and they have a
+        modification time older than hls_gc_age_threshold.
+        """
+        try:
+            tmpdir = tempfile.gettempdir()
+            prefix = "m3u_proxy_hls_"
+            now = time.time()
+
+            # Build a set of active hls dirs to avoid deleting currently-used ones
+            active_dirs = set()
+            for p in self.shared_processes.values():
+                if p.hls_dir:
+                    active_dirs.add(os.path.abspath(p.hls_dir))
+
+            # Iterate entries in tmpdir
+            try:
+                entries = os.listdir(tmpdir)
+            except Exception:
+                entries = []
+
+            removed = 0
+            for entry in entries:
+                if not entry.startswith(prefix):
+                    continue
+
+                full_path = os.path.abspath(os.path.join(tmpdir, entry))
+                if not os.path.isdir(full_path):
+                    continue
+
+                # Skip any dir that's currently active
+                if full_path in active_dirs:
+                    continue
+
+                # Determine age by mtime
+                try:
+                    mtime = os.path.getmtime(full_path)
+                except Exception:
+                    continue
+
+                age = now - mtime
+                if age > self.hls_gc_age_threshold:
+                    try:
+                        shutil.rmtree(full_path)
+                        removed += 1
+                        logger.info(f"Removed stale HLS dir: {full_path}")
+                    except Exception as e:
+                        logger.error(f"Failed to remove HLS dir {full_path}: {e}")
+
+            if removed:
+                logger.info(f"HLS GC removed {removed} stale directories from {tmpdir}")
+
+        except Exception as e:
+            logger.error(f"Error while running HLS GC: {e}")
 
     def _generate_stream_key(self, url: str, profile: str) -> str:
         """Generate a consistent key for stream sharing"""

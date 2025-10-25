@@ -59,6 +59,10 @@ class Settings(BaseSettings):
     CLEANUP_INTERVAL: int = 60    # seconds
     STREAM_SHARING_STRATEGY: str = "url_profile"  # url_profile, url_only, disabled
 
+    # HLS GC configuration
+    HLS_GC_ENABLED: bool = True
+    HLS_GC_INTERVAL: int = 600
+    HLS_GC_AGE_THRESHOLD: int = 3600  # seconds (1 hour)
     # API Authentication
     API_TOKEN: Optional[str] = None
 

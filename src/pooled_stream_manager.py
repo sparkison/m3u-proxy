@@ -70,12 +70,12 @@ class SharedTranscodingProcess:
             # Build FFmpeg command - ensure output to stdout
             ffmpeg_cmd = ["ffmpeg"]
 
-            # Add user agent if provided
-            if self.user_agent:
+            # Add user agent / headers only for network inputs (http/rtsp/etc.)
+            if self.user_agent and isinstance(self.url, str) and ('://' in self.url and not self.url.startswith('file://')):
                 ffmpeg_cmd.extend(["-user_agent", self.user_agent])
 
-            # Add headers if provided, ensuring proper format
-            if self.headers:
+            # Add headers if provided, ensuring proper format and only for network inputs
+            if self.headers and isinstance(self.url, str) and ('://' in self.url and not self.url.startswith('file://')):
                 header_str = "".join(
                     [f"{k}: {v}\r\n" for k, v in self.headers.items()])
                 ffmpeg_cmd.extend(["-headers", header_str])
@@ -87,18 +87,19 @@ class SharedTranscodingProcess:
                 # If the ffmpeg args already include an output filename, respect it
                 # Otherwise append the playlist target into the hls dir
                 playlist_path = os.path.join(self.hls_dir, 'index.m3u8')
-                # Remove any trailing empty args
-                if not self.ffmpeg_args or (self.ffmpeg_args and not any((arg.strip() for arg in self.ffmpeg_args if arg))):
+                # If ffmpeg_args already specify an output playlist, replace any m3u8 token with absolute path
+                replaced = False
+                for i, token in enumerate(ffmpeg_cmd):
+                    try:
+                        if isinstance(token, str) and token.lower().endswith('.m3u8'):
+                            ffmpeg_cmd[i] = playlist_path
+                            replaced = True
+                    except Exception:
+                        continue
+
+                if not replaced:
+                    # No playlist token found; append absolute playlist path
                     ffmpeg_cmd.append(playlist_path)
-                else:
-                    last_arg = self.ffmpeg_args[-1]
-                    # If last arg looks like an output placeholder (empty string or pipe), replace it
-                    if last_arg in ('', None):
-                        ffmpeg_cmd[-1] = playlist_path
-                    else:
-                        # If playlist path not present in args, append
-                        if 'index.m3u8' not in ' '.join(self.ffmpeg_args):
-                            ffmpeg_cmd.append(playlist_path)
 
             else:
                 # Ensure we're outputting to stdout in MPEGTS format only if no -f specified

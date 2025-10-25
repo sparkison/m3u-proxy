@@ -17,8 +17,11 @@ async def test_hls_gc_removes_old_dirs():
     """Create a fake HLS temp dir older than threshold and ensure GC removes it."""
     from pooled_stream_manager import PooledStreamManager
 
-    tmpdir = tempfile.gettempdir()
-    # Create a fake HLS dir with the expected prefix
+    # Instantiate manager first so we know which base dir GC will scan
+    manager = PooledStreamManager(enable_sharing=False)
+
+    tmpdir = getattr(manager, 'hls_base_dir', tempfile.gettempdir())
+    # Create a fake HLS dir with the expected prefix inside the manager's base dir
     fake_name = f"m3u_proxy_hls_test_{int(time.time())}_{os.getpid()}"
     fake_path = os.path.join(tmpdir, fake_name)
     os.makedirs(fake_path, exist_ok=True)
@@ -34,8 +37,6 @@ async def test_hls_gc_removes_old_dirs():
     # Ensure directory exists before GC
     assert os.path.isdir(fake_path)
 
-    # Instantiate manager and set threshold low enough to remove
-    manager = PooledStreamManager(enable_sharing=False)
     # Force threshold to 1 hour (3600s) which is less than age we set (2h)
     manager.hls_gc_age_threshold = 60 * 60
 

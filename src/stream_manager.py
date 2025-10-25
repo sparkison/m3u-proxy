@@ -1004,6 +1004,11 @@ class StreamManager:
         # Set header content-type
         headers['Content-Type'] = content_type
 
+        # Transcoded streams are live/progressive streams; disallow range requests to
+        # avoid client players issuing range-based reconnects which can cause
+        # duplicate client registrations and premature cleanup.
+        headers['Accept-Ranges'] = 'none'
+        
         return StreamingResponse(generate(), media_type=content_type, headers=headers)
 
     async def _seamless_failover(self, stream_id: str, error: Exception) -> Optional[httpx.Response]:

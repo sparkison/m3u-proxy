@@ -70,6 +70,9 @@ class Settings(BaseSettings):
     # system temp dir (tempfile.gettempdir()) will be used. Set this to
     # a directory that all workers can access if running multiple workers.
     HLS_TEMP_DIR: Optional[str] = None
+    # How long (seconds) to wait for FFmpeg to produce the initial HLS playlist
+    # before considering the transcoder failed and cleaning it up.
+    HLS_WAIT_TIME: int = 10
     # API Authentication
     API_TOKEN: Optional[str] = None
 

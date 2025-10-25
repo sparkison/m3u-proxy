@@ -117,14 +117,28 @@ class SharedTranscodingProcess:
                 replaced = False
                 for i, token in enumerate(ffmpeg_cmd):
                     try:
-                        if isinstance(token, str) and token.lower().endswith('.m3u8'):
+                        if not isinstance(token, str):
+                            continue
+                        t_lower = token.lower()
+                        # Skip tokens that look like input specs ("-i <url>" or "-i<url>")
+                        if t_lower.endswith('.m3u8'):
+                            prev = ffmpeg_cmd[i-1] if i > 0 else None
+                            if isinstance(prev, str) and prev == '-i':
+                                # This is an input URL; do NOT replace it with our output path
+                                continue
+                            if t_lower.startswith('-i') and t_lower[2:].endswith('.m3u8'):
+                                # Token like '-ihttp://.../playlist.m3u8' - treat as input, skip
+                                continue
+                            # Otherwise this looks like an output playlist token, replace it
                             ffmpeg_cmd[i] = playlist_path
                             replaced = True
                     except Exception:
                         continue
 
                 if not replaced:
-                    # No playlist token found; append absolute playlist path
+                    # Remove any pipe outputs which are inappropriate for file-based HLS output
+                    ffmpeg_cmd = [t for t in ffmpeg_cmd if not (isinstance(t, str) and t.startswith('pipe:'))]
+                    # Append absolute playlist path as the intended HLS output
                     ffmpeg_cmd.append(playlist_path)
 
             else:

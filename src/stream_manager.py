@@ -1008,7 +1008,7 @@ class StreamManager:
         # avoid client players issuing range-based reconnects which can cause
         # duplicate client registrations and premature cleanup.
         headers['Accept-Ranges'] = 'none'
-        
+
         return StreamingResponse(generate(), media_type=content_type, headers=headers)
 
     async def _seamless_failover(self, stream_id: str, error: Exception) -> Optional[httpx.Response]:
@@ -1113,7 +1113,29 @@ class StreamManager:
 
                 # If the shared process is HLS-mode, read its playlist file directly
                 if hasattr(shared_process, 'mode') and getattr(shared_process, 'mode') == 'hls':
+                    # Wait briefly for FFmpeg to produce the initial playlist if it's not yet present.
                     playlist_text = await shared_process.read_playlist()
+                    waited = 0.0
+                    poll_interval = 0.5
+                    # Allow configurable wait time via settings.HLS_WAIT_TIME (seconds)
+                    max_wait = float(getattr(settings, 'HLS_WAIT_TIME', 10))
+                    while not playlist_text and waited < max_wait and shared_process.process and shared_process.process.returncode is None:
+                        await asyncio.sleep(poll_interval)
+                        waited += poll_interval
+                        playlist_text = await shared_process.read_playlist()
+
+                    # If playlist still not available after waiting, consider the transcoder failed
+                    if not playlist_text:
+                        logger.warning(f"HLS playlist not produced within {max_wait}s for stream {stream_id}; cleaning up transcoder")
+                        try:
+                            # Attempt to stop and remove the shared process
+                            if self.pooled_manager:
+                                await self.pooled_manager.force_stop_stream(stream_key)
+                        except Exception as e:
+                            logger.error(f"Error force-stopping failed HLS transcoder for {stream_key}: {e}")
+                        # Return None so caller will treat playlist as unavailable
+                        return None
+
                     if playlist_text:
                         # Construct pseudo-final URL based on local file path so M3U8Processor can compute bases
                         final_url = f"file://{shared_process.hls_dir}/index.m3u8"

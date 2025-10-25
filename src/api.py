@@ -521,8 +521,39 @@ async def create_transcode_stream(request: TranscodeCreateRequest):
         )
         await event_manager.emit_event(event)
 
-        # For transcoded streams, we serve them as direct MPEGTS streams
-        stream_endpoint = f"/stream/{stream_id}"
+        # Determine whether this transcoded profile produces HLS output
+        def _detect_hls_from_args(args: List[str]) -> bool:
+            try:
+                lowered = [str(a).lower() for a in (args or [])]
+                for i, a in enumerate(lowered):
+                    if a == '-f' and i + 1 < len(lowered) and lowered[i + 1] == 'hls':
+                        return True
+                    if a.startswith('-f') and 'hls' in a:
+                        return True
+                    if a.startswith('-hls_time') or 'hls_time' in a:
+                        return True
+                    if a.endswith('.m3u8'):
+                        return True
+                # also check joined string as fallback
+                if ' -f hls' in ' '.join(lowered) or '-hls_time' in ' '.join(lowered):
+                    return True
+            except Exception:
+                pass
+            return False
+
+        is_hls_output = _detect_hls_from_args(ffmpeg_args)
+
+        # Choose endpoint based on output type
+        if is_hls_output:
+            stream_endpoint = f"/hls/{stream_id}/playlist.m3u8"
+            direct_url = stream_endpoint
+            out_format = 'hls'
+            message = "Transcoded stream created successfully (HLS output)"
+        else:
+            stream_endpoint = f"/stream/{stream_id}"
+            direct_url = stream_endpoint
+            out_format = template_vars.get("format", "mpegts")
+            message = "Transcoded stream created successfully (direct MPEGTS pipe)"
 
         response = {
             "stream_id": stream_id,
@@ -531,12 +562,13 @@ async def create_transcode_stream(request: TranscodeCreateRequest):
             "user_agent": request.user_agent or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36",
             "stream_type": "transcoded",
             "stream_endpoint": stream_endpoint,
-            "direct_url": stream_endpoint,
-            "format": template_vars.get("format", "mpegts"),
+            "playlist_url": stream_endpoint if is_hls_output else None,
+            "direct_url": direct_url,
+            "format": out_format,
             "profile": profile.name,
             "profile_variables": template_vars,  # Show the actual variables used
             "ffmpeg_args": ffmpeg_args,
-            "message": "Transcoded stream created successfully (direct MPEGTS pipe)"
+            "message": message
         }
 
         # Include metadata in response if provided
@@ -839,6 +871,60 @@ async def get_direct_stream(
         if stream_info.is_transcoded:
             logger.info(
                 f"Using transcoded stream for {stream_id} with profile: {stream_info.transcode_profile}")
+
+            # Detect if transcoding args indicate HLS output
+            try:
+                args = stream_info.transcode_ffmpeg_args or []
+                lowered = [str(a).lower() for a in args]
+                is_hls_output = any([
+                    (i + 1 < len(lowered) and lowered[i] == '-f' and lowered[i + 1] == 'hls')
+                    for i in range(len(lowered))
+                ]) or any('-hls_time' in a or a.endswith('.m3u8') for a in lowered) or (' -f hls' in ' '.join(lowered))
+            except Exception:
+                is_hls_output = False
+
+            if is_hls_output:
+                # Serve playlist directly instead of redirecting. Build base_proxy_url
+                public_url = getattr(settings, 'PUBLIC_URL', None)
+                port = getattr(settings, 'PORT', None) or 8085
+
+                if public_url:
+                    public_with_scheme = public_url if public_url.startswith(('http://', 'https://')) else f"http://{public_url}"
+                    parsed = urlparse(public_with_scheme)
+                    scheme = parsed.scheme or 'http'
+                    host = parsed.hostname or ''
+                    url_port = parsed.port
+                    path = parsed.path or ''
+
+                    if url_port:
+                        netloc = f"{host}:{url_port}"
+                    elif port:
+                        netloc = f"{host}:{port}"
+                    else:
+                        netloc = host
+
+                    base = f"{scheme}://{netloc}{path.rstrip('/')}"
+                else:
+                    base = f"http://localhost:{port}"
+
+                base_proxy_url = f"{base.rstrip('/')}/hls/{stream_id}"
+
+                content = await stream_manager.get_playlist_content(stream_id, client_id, base_proxy_url)
+                if content is None:
+                    raise HTTPException(status_code=503, detail="Playlist not available")
+
+                logger.info(f"Serving HLS playlist directly to client {client_id} for stream {stream_id}")
+
+                response = Response(content=content, media_type="application/vnd.apple.mpegurl")
+                response.headers["X-Client-ID"] = client_id
+                response.headers["X-Stream-ID"] = stream_id
+                response.headers["Access-Control-Allow-Origin"] = "*"
+                response.headers["Access-Control-Allow-Methods"] = "GET, HEAD, OPTIONS"
+                response.headers["Access-Control-Allow-Headers"] = "*"
+                response.headers["Access-Control-Expose-Headers"] = "*"
+                return response
+
+            # Non-HLS transcoded streams - use streamed transcoding path
             return await stream_manager.stream_transcoded(
                 stream_id,
                 client_id,

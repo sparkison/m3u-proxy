@@ -119,3 +119,42 @@ async def test_stream_transcoded_content_type_detection(monkeypatch):
     from fastapi.responses import StreamingResponse
     assert isinstance(response, StreamingResponse)
     assert response.media_type in ('video/mp4', 'video/mp2t', 'application/octet-stream')
+
+
+@pytest.mark.asyncio
+async def test_stream_transcoded_content_type_detection_matroska(monkeypatch):
+    """Verify stream_transcoded detects matroska/mkv format from ffmpeg args"""
+    sm = StreamManager()
+
+    # Create a stream configured to transcode to matroska
+    url = "http://example.com/video_source"
+    stream_id = await sm.get_or_create_stream(url, is_transcoded=True, transcode_profile='mkv', transcode_ffmpeg_args=['-f', 'matroska'])
+
+    client_id = 'client_mkv'
+    await sm.register_client(client_id, stream_id)
+
+    class FakeProcess:
+        def __init__(self):
+            self.mode = 'stdout'
+            class P:
+                returncode = None
+                pid = 4321
+                stdout = object()
+            self.process = P()
+            self.client_queues = {client_id: asyncio.Queue()}
+
+    fake_shared = FakeProcess()
+
+    async def fake_get_or_create_shared_stream(url, profile, ffmpeg_args, client_id, user_agent=None, headers=None):
+        return ('fakekey3', fake_shared)
+
+    class FakePooled3:
+        async def get_or_create_shared_stream(self, url, profile, ffmpeg_args, client_id, user_agent=None, headers=None):
+            return await fake_get_or_create_shared_stream(url, profile, ffmpeg_args, client_id, user_agent, headers)
+
+    sm.pooled_manager = FakePooled3()
+
+    response = await sm.stream_transcoded(stream_id, client_id)
+    from fastapi.responses import StreamingResponse
+    assert isinstance(response, StreamingResponse)
+    assert response.media_type == 'video/x-matroska'

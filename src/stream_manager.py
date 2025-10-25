@@ -934,22 +934,72 @@ class StreamManager:
             "Access-Control-Allow-Origin": "*",
         }
         # Determine content type from transcode args
-        content_type = "application/octet-stream"
-        try:
-            joined = ' '.join(stream_info.transcode_ffmpeg_args or []).lower()
-            if '-f mp4' in joined or 'movflags' in joined or 'mp4' in joined:
-                content_type = 'video/mp4'
-            elif '-f hls' in joined or '-hls_time' in joined or 'hls' in joined:
-                # HLS transcoding produces playlists/segments; individual stream endpoints
-                # shouldn't normally use this method - fall back to mpegts for raw streaming
-                content_type = 'application/vnd.apple.mpegurl'
-            elif '-f' in joined and 'mpegts' in joined:
-                content_type = 'video/mp2t'
-            else:
-                # default to mpegts for streaming pipelines
-                content_type = 'video/mp2t'
-        except Exception:
-            content_type = 'application/octet-stream'
+        def _detect_content_type_from_ffmpeg_args(ffmpeg_args: List[str]) -> str:
+            # Map common ffmpeg format names/extensions to Content-Type
+            fmt_map = {
+                'mp4': 'video/mp4',
+                'mov': 'video/mp4',
+                'matroska': 'video/x-matroska',
+                'mkv': 'video/x-matroska',
+                'webm': 'video/webm',
+                'mpegts': 'video/mp2t',
+                'mpeg': 'video/mpeg',
+                'hls': 'application/vnd.apple.mpegurl',
+                'hls_native': 'application/vnd.apple.mpegurl',
+                'flv': 'video/x-flv',
+                'ogg': 'video/ogg',
+                'mp3': 'audio/mpeg'
+            }
+
+            try:
+                args = ffmpeg_args or []
+                # Look for explicit -f <format>
+                fmt = None
+                for i, a in enumerate(args):
+                    if a == '-f' and i + 1 < len(args):
+                        fmt = args[i + 1].lower()
+                        break
+                    # handle combined -fmatroska (rare)
+                    if a.startswith('-f') and len(a) > 2:
+                        fmt = a[2:].lower()
+                        break
+
+                # If we found a format token, map it
+                if fmt:
+                    if fmt in fmt_map:
+                        return fmt_map[fmt]
+                    # Some formats may include codec lists like "mov,mp4,m4a"
+                    if ',' in fmt:
+                        for part in fmt.split(','):
+                            if part in fmt_map:
+                                return fmt_map[part]
+
+                # Fallback: inspect any output filenames in args for known extensions
+                for a in args:
+                    if isinstance(a, str):
+                        la = a.lower()
+                        if la.endswith('.mp4'):
+                            return 'video/mp4'
+                        if la.endswith('.mkv') or la.endswith('.mk3d'):
+                            return 'video/x-matroska'
+                        if la.endswith('.webm'):
+                            return 'video/webm'
+                        if la.endswith('.ts'):
+                            return 'video/mp2t'
+                        if la.endswith('.m3u8'):
+                            return 'application/vnd.apple.mpegurl'
+
+                # If output is a pipe (pipe:1) and no explicit fmt, assume streaming MPEG-TS
+                joined = ' '.join(args).lower()
+                if 'pipe:1' in joined or 'pipe:' in joined:
+                    return 'video/mp2t'
+
+            except Exception:
+                pass
+
+            return 'application/octet-stream'
+
+        content_type = _detect_content_type_from_ffmpeg_args(stream_info.transcode_ffmpeg_args)
 
         # Set header content-type
         headers['Content-Type'] = content_type

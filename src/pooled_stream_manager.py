@@ -30,13 +30,16 @@ except ImportError:
 class SharedTranscodingProcess:
     """Represents a shared FFmpeg transcoding process with broadcasting to multiple clients"""
 
-    def __init__(self, stream_id: str, url: str, profile: str, ffmpeg_args: List[str], user_agent: Optional[str] = None, headers: Optional[Dict[str, str]] = None):
+    def __init__(self, stream_id: str, url: str, profile: str, ffmpeg_args: List[str], user_agent: Optional[str] = None, headers: Optional[Dict[str, str]] = None, hls_base_dir: Optional[str] = None):
         self.stream_id = stream_id
         self.url = url
         self.profile = profile
         self.ffmpeg_args = ffmpeg_args
         self.user_agent = user_agent
         self.headers = headers or {}
+        # Base directory to create HLS per-stream directories in. If None,
+        # the process will fall back to the system tempdir.
+        self.hls_base_dir = hls_base_dir
         self.process: Optional[asyncio.subprocess.Process] = None
         self.clients: Dict[str, float] = {}  # client_id -> last_access_time
         self.created_at = time.time()
@@ -57,10 +60,31 @@ class SharedTranscodingProcess:
         # If ffmpeg_args suggest HLS output, switch to hls mode
         joined_args = ' '.join(self.ffmpeg_args).lower()
         if '-hls_time' in joined_args or '-hls_list_size' in joined_args or '-f hls' in joined_args:
-            import tempfile
             self.mode = 'hls'
-            # Create a per-stream temporary directory for HLS segments
-            self.hls_dir = tempfile.mkdtemp(prefix=f"m3u_proxy_hls_{self.stream_id}_")
+            # Determine base dir for HLS output
+            base_dir = None
+            if self.hls_base_dir:
+                base_dir = self.hls_base_dir
+            else:
+                try:
+                    base_dir = tempfile.gettempdir()
+                except Exception:
+                    base_dir = None
+
+            # Ensure base dir exists if provided
+            if base_dir:
+                try:
+                    os.makedirs(base_dir, exist_ok=True)
+                except Exception:
+                    pass
+
+            # Create a per-stream directory for HLS segments
+            try:
+                self.hls_dir = tempfile.mkdtemp(prefix=f"m3u_proxy_hls_{self.stream_id}_", dir=base_dir)
+            except Exception:
+                # Fallback to system tempdir without dir param
+                self.hls_dir = tempfile.mkdtemp(prefix=f"m3u_proxy_hls_{self.stream_id}_")
+
             logger.info(f"SharedTranscodingProcess {self.stream_id} will run in HLS mode, hls_dir={self.hls_dir}")
 
     async def start_process(self):
@@ -88,7 +112,7 @@ class SharedTranscodingProcess:
             if self.mode == 'hls':
                 # If the ffmpeg args already include an output filename, respect it
                 # Otherwise append the playlist target into the hls dir
-                playlist_path = os.path.join(self.hls_dir, 'index.m3u8')
+                playlist_path = os.path.join(self.hls_dir if self.hls_dir else tempfile.gettempdir(), 'index.m3u8')
                 # If ffmpeg_args already specify an output playlist, replace any m3u8 token with absolute path
                 replaced = False
                 for i, token in enumerate(ffmpeg_cmd):
@@ -403,6 +427,9 @@ class PooledStreamManager:
         self.hls_gc_age_threshold = int(getattr(settings, 'HLS_GC_AGE_THRESHOLD', 60 * 60))
         # Track last time GC ran so we can respect hls_gc_interval cadence
         self._last_hls_gc_run = 0
+        # Base directory for HLS per-stream output. If settings.HLS_TEMP_DIR is not set,
+        # fall back to the system tempdir used by tempfile.gettempdir()
+        self.hls_base_dir = getattr(settings, 'HLS_TEMP_DIR', None) or tempfile.gettempdir()
 
         # Tasks
         self._cleanup_task: Optional[asyncio.Task] = None
@@ -583,7 +610,8 @@ class PooledStreamManager:
         modification time older than hls_gc_age_threshold.
         """
         try:
-            tmpdir = tempfile.gettempdir()
+            # Use configured HLS base dir (may be system tempdir by default)
+            tmpdir = getattr(self, 'hls_base_dir', None) or tempfile.gettempdir()
             prefix = "m3u_proxy_hls_"
             now = time.time()
 
@@ -686,7 +714,7 @@ class PooledStreamManager:
 
         # Create new local process
         process = SharedTranscodingProcess(
-            stream_key, url, profile, ffmpeg_args, user_agent=user_agent, headers=headers)
+            stream_key, url, profile, ffmpeg_args, user_agent=user_agent, headers=headers, hls_base_dir=self.hls_base_dir)
 
         if await process.start_process():
             self.shared_processes[stream_key] = process

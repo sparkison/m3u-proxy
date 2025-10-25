@@ -63,6 +63,10 @@ class Settings(BaseSettings):
     HLS_GC_ENABLED: bool = True
     HLS_GC_INTERVAL: int = 600
     HLS_GC_AGE_THRESHOLD: int = 3600  # seconds (1 hour)
+    # Optional base directory for HLS transcoding output. If unset, the
+    # system temp dir (tempfile.gettempdir()) will be used. Set this to
+    # a directory that all workers can access if running multiple workers.
+    HLS_TEMP_DIR: Optional[str] = None
     # API Authentication
     API_TOKEN: Optional[str] = None
 

@@ -9,7 +9,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 from pooled_stream_manager import PooledStreamManager
 
 async def main():
-    print('Starting smoke HLS debug test')
+    print('Starting HLS debug test')
     pm = PooledStreamManager(enable_sharing=False)
     await pm.start()
 
@@ -33,8 +33,8 @@ async def main():
             url='testsrc',
             profile='hls_test',
             ffmpeg_args=ffmpeg_args,
-            client_id='smoke-client',
-            user_agent='smoke-test'
+            client_id='hls-client',
+            user_agent='hls-test'
         )
 
         print('Started shared process, stream_key=', stream_key, 'mode=', getattr(proc, 'mode', None))
@@ -66,7 +66,7 @@ async def main():
         await proc.cleanup()
         await pm.stop()
     except Exception as e:
-        print('Error during debug smoke test:', e)
+        print('Error during debug test:', e)
         try:
             await pm.stop()
         except:

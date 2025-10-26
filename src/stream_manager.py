@@ -448,6 +448,13 @@ class StreamManager:
                 "bytes_served": client_info.bytes_served,
                 "segments_served": client_info.segments_served
             })
+            # Notify pooled manager (if any) that this client is gone so shared
+            # transcoding processes can be cleaned up when no clients remain.
+            if self.pooled_manager:
+                try:
+                    await self.pooled_manager.remove_client_from_stream(client_id)
+                except Exception as e:
+                    logger.error(f"Error notifying pooled manager about client {client_id} removal: {e}")
 
             del self.clients[client_id]
             self._stats.active_clients -= 1

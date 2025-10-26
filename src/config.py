@@ -62,7 +62,8 @@ class Settings(BaseSettings):
     # the last client disconnects. This helps avoid churn for brief reconnects.
     SHARED_STREAM_GRACE: int = 3
 
-    # HLS GC configuration
+    # Transcoding configuration
+    # HLS garbage collection configuration
     HLS_GC_ENABLED: bool = True
     HLS_GC_INTERVAL: int = 600
     HLS_GC_AGE_THRESHOLD: int = 3600  # seconds (1 hour)
@@ -73,6 +74,7 @@ class Settings(BaseSettings):
     # How long (seconds) to wait for FFmpeg to produce the initial HLS playlist
     # before considering the transcoder failed and cleaning it up.
     HLS_WAIT_TIME: int = 10
+
     # API Authentication
     API_TOKEN: Optional[str] = None
 

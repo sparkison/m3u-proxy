@@ -153,7 +153,7 @@ class StreamManager:
         self.stream_clients: Dict[str, Set[str]] = {}
         self.client_timeout = settings.CLIENT_TIMEOUT
         self.stream_timeout = settings.STREAM_TIMEOUT
-        
+
         # Track cancellation flags for active streaming generators
         # Key: client_id, Value: asyncio.Event that gets set when stream should stop
         self.client_cancel_events: Dict[str, asyncio.Event] = {}
@@ -360,7 +360,8 @@ class StreamManager:
                 self._stats.total_streams += 1
                 self._stats.active_streams += 1
 
-            stream_type = "HLS" if is_hls else ("Transcoding" if is_transcoded else ("VOD" if is_vod else "Live Continuous"))
+            stream_type = "Transcoding" if is_transcoded  else (
+                "HLS" if is_hls else("VOD" if is_vod else "Live Continuous"))
             variant_info = f" (variant of {parent_stream_id})" if is_variant else ""
             logger.info(
                 f"Created new stream: {stream_id} ({stream_type}){variant_info} with user agent: {user_agent}")
@@ -428,11 +429,12 @@ class StreamManager:
         if client_id in self.clients:
             client_info = self.clients[client_id]
             stream_id = client_info.stream_id
-            
+
             # Signal the streaming generator to stop
             if client_id in self.client_cancel_events:
                 self.client_cancel_events[client_id].set()
-                logger.info(f"Signaled streaming generator to stop for client: {client_id}")
+                logger.info(
+                    f"Signaled streaming generator to stop for client: {client_id}")
 
             if stream_id and stream_id in self.stream_clients:
                 self.stream_clients[stream_id].discard(client_id)
@@ -453,15 +455,16 @@ class StreamManager:
                 try:
                     await self.pooled_manager.remove_client_from_stream(client_id)
                 except Exception as e:
-                    logger.error(f"Error notifying pooled manager about client {client_id} removal: {e}")
+                    logger.error(
+                        f"Error notifying pooled manager about client {client_id} removal: {e}")
 
             del self.clients[client_id]
             self._stats.active_clients -= 1
-            
+
             # Clean up cancel event
             if client_id in self.client_cancel_events:
                 del self.client_cancel_events[client_id]
-            
+
             logger.info(f"Cleaned up client: {client_id}")
 
     # ============================================================================
@@ -504,7 +507,7 @@ class StreamManager:
         async def generate():
             """Generator that directly proxies bytes from provider to client"""
             nonlocal provider_status_code, provider_content_range, provider_content_length
-            
+
             bytes_served = 0
             chunk_count = 0
             response = None
@@ -559,20 +562,23 @@ class StreamManager:
                 # Capture provider response details for proper HTTP 206 handling
                 provider_status_code = response.status_code
                 provider_content_range = response.headers.get('content-range')
-                provider_content_length = response.headers.get('content-length')
+                provider_content_length = response.headers.get(
+                    'content-length')
 
                 logger.info(
                     f"Provider connected: {response.status_code}, Content-Type: {response.headers.get('content-type')}")
                 if provider_content_range:
-                    logger.info(f"Provider Content-Range: {provider_content_range}")
+                    logger.info(
+                        f"Provider Content-Range: {provider_content_range}")
 
                 # Direct byte-for-byte proxy - NO buffering, NO transcoding
                 async for chunk in response.aiter_bytes(chunk_size=32768):
                     # Check if streaming should be cancelled
                     if cancel_event.is_set():
-                        logger.info(f"Streaming cancelled for client {client_id} by external request")
+                        logger.info(
+                            f"Streaming cancelled for client {client_id} by external request")
                         break
-                    
+
                     yield chunk
                     bytes_served += len(chunk)
                     chunk_count += 1
@@ -780,7 +786,7 @@ class StreamManager:
 
         # Create generator to start streaming
         gen = generate()
-        
+
         # Consume first iteration to capture provider response headers
         # This is necessary to determine if we should return 206 or 200
         try:
@@ -788,7 +794,7 @@ class StreamManager:
         except StopAsyncIteration:
             # Empty stream
             return StreamingResponse(iter([]), media_type=content_type, headers=headers)
-        
+
         # Now we have provider_status_code, provider_content_range, provider_content_length
         # Determine proper response status and headers
         status_code = 200
@@ -796,8 +802,9 @@ class StreamManager:
             # Provider returned 206, we should also return 206
             status_code = 206
             headers["Content-Range"] = provider_content_range
-            logger.info(f"Returning 206 Partial Content with range: {provider_content_range}")
-        
+            logger.info(
+                f"Returning 206 Partial Content with range: {provider_content_range}")
+
         if provider_content_length:
             headers["Content-Length"] = provider_content_length
 
@@ -808,9 +815,9 @@ class StreamManager:
                 yield chunk
 
         return StreamingResponse(
-            generate_with_first_chunk(), 
+            generate_with_first_chunk(),
             status_code=status_code,
-            media_type=content_type, 
+            media_type=content_type,
             headers=headers
         )
 
@@ -886,9 +893,10 @@ class StreamManager:
                 while True:
                     # Check if streaming should be cancelled
                     if cancel_event.is_set():
-                        logger.info(f"Transcoded streaming cancelled for client {client_id} by external request")
+                        logger.info(
+                            f"Transcoded streaming cancelled for client {client_id} by external request")
                         break
-                    
+
                     # Get chunk from queue (broadcaster puts chunks here) with timeout
                     # to allow checking cancellation event periodically
                     try:
@@ -896,11 +904,12 @@ class StreamManager:
                     except asyncio.TimeoutError:
                         # No chunk available, loop back to check cancellation
                         continue
-                    
+
                     if chunk is None:  # None signals end of stream
-                        logger.info(f"Transcoded streaming ended for client {client_id}")
+                        logger.info(
+                            f"Transcoded streaming ended for client {client_id}")
                         break
-                    
+
                     yield chunk
                     bytes_served += len(chunk)
 
@@ -913,7 +922,8 @@ class StreamManager:
 
                     # Update stream-level stats (for bandwidth tracking)
                     if stream_id in self.streams:
-                        self.streams[stream_id].total_bytes_served += len(chunk)
+                        self.streams[stream_id].total_bytes_served += len(
+                            chunk)
                         self.streams[stream_id].last_access = datetime.now()
 
                     # Update global stats
@@ -940,6 +950,7 @@ class StreamManager:
             "Access-Control-Allow-Origin": "*",
         }
         # Determine content type from transcode args
+
         def _detect_content_type_from_ffmpeg_args(ffmpeg_args: List[str]) -> str:
             # Map common ffmpeg format names/extensions to Content-Type
             fmt_map = {
@@ -1005,7 +1016,8 @@ class StreamManager:
 
             return 'application/octet-stream'
 
-        content_type = _detect_content_type_from_ffmpeg_args(stream_info.transcode_ffmpeg_args)
+        content_type = _detect_content_type_from_ffmpeg_args(
+            stream_info.transcode_ffmpeg_args)
 
         # Set header content-type
         headers['Content-Type'] = content_type
@@ -1132,13 +1144,15 @@ class StreamManager:
 
                     # If playlist still not available after waiting, consider the transcoder failed
                     if not playlist_text:
-                        logger.warning(f"HLS playlist not produced within {max_wait}s for stream {stream_id}; cleaning up transcoder")
+                        logger.warning(
+                            f"HLS playlist not produced within {max_wait}s for stream {stream_id}; cleaning up transcoder")
                         try:
                             # Attempt to stop and remove the shared process
                             if self.pooled_manager:
                                 await self.pooled_manager.force_stop_stream(stream_key)
                         except Exception as e:
-                            logger.error(f"Error force-stopping failed HLS transcoder for {stream_key}: {e}")
+                            logger.error(
+                                f"Error force-stopping failed HLS transcoder for {stream_key}: {e}")
                         # Return None so caller will treat playlist as unavailable
                         return None
 
@@ -1172,9 +1186,11 @@ class StreamManager:
 
             except ConnectionAbortedError:
                 # Stream is being managed by another worker. Fall back to fetching via HTTP from that worker if possible.
-                logger.debug("Transcoded HLS is managed by another worker; falling back to HTTP fetch of playlist if available")
+                logger.debug(
+                    "Transcoded HLS is managed by another worker; falling back to HTTP fetch of playlist if available")
             except Exception as e:
-                logger.error(f"Error retrieving transcoded playlist from pooled manager: {e}")
+                logger.error(
+                    f"Error retrieving transcoded playlist from pooled manager: {e}")
 
         try:
             logger.info(f"Fetching HLS playlist from: {current_url}")
@@ -1244,7 +1260,8 @@ class StreamManager:
                 # If the segment is a local file generated by an HLS transcoder, read from disk
                 if segment_url.startswith('file://') or os.path.exists(segment_url):
                     # Strip file:// prefix if present
-                    path = segment_url[7:] if segment_url.startswith('file://') else segment_url
+                    path = segment_url[7:] if segment_url.startswith(
+                        'file://') else segment_url
                     # Stream the file contents
                     with open(path, 'rb') as fh:
                         while True:
@@ -1514,7 +1531,7 @@ class StreamManager:
                     "error_count": stream_stats_map.get(stream.stream_id, {}).get("errors", stream.error_count),
                     "is_active": stream.is_active,
                     "has_failover": len(stream.failover_urls) > 0,
-                    "stream_type": "HLS" if stream.is_hls else ("Transcoding" if stream.metadata.get("transcoding") else ("VOD" if stream.is_vod else "Live Continuous")),
+                    "stream_type": "Transcoding" if stream.metadata.get("transcoding") else ("HLS" if stream.is_hls else ("VOD" if stream.is_vod else "Live Continuous")),
                     "created_at": stream.created_at.isoformat(),
                     "last_access": stream.last_access.isoformat(),
                     "metadata": stream.metadata,

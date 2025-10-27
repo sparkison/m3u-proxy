@@ -333,7 +333,6 @@ async def get_info():
             "client_timeout": settings.CLIENT_TIMEOUT,
             "stream_timeout": settings.STREAM_TIMEOUT,
             "cleanup_interval": settings.CLEANUP_INTERVAL,
-            "buffer_size": settings.DEFAULT_BUFFER_SIZE,
             "max_retries": settings.DEFAULT_MAX_RETRIES
         },
         "worker": {

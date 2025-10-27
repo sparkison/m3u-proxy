@@ -1197,7 +1197,7 @@ async def get_streams_by_metadata(
             'last_access': stream_info.last_access.isoformat(),
             'is_active': stream_info.is_active,
             'url': stream_info.current_url or stream_info.original_url,
-            'stream_type': 'HLS' if stream_info.is_hls else ('VOD' if stream_info.is_vod else 'Live Continuous')
+            'stream_type': 'HLS' if stream_info.is_hls else ('Transcoding' if stream_info.metadata.get('transcoding') else ('VOD' if stream_info.is_vod else 'Live Continuous'))
         })
 
     return {

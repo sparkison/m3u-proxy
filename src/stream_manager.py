@@ -360,8 +360,7 @@ class StreamManager:
                 self._stats.total_streams += 1
                 self._stats.active_streams += 1
 
-            stream_type = "HLS" if is_hls else (
-                "VOD" if is_vod else "Live Continuous")
+            stream_type = "HLS" if is_hls else ("Transcoding" if is_transcoded else ("VOD" if is_vod else "Live Continuous"))
             variant_info = f" (variant of {parent_stream_id})" if is_variant else ""
             logger.info(
                 f"Created new stream: {stream_id} ({stream_type}){variant_info} with user agent: {user_agent}")
@@ -1515,7 +1514,7 @@ class StreamManager:
                     "error_count": stream_stats_map.get(stream.stream_id, {}).get("errors", stream.error_count),
                     "is_active": stream.is_active,
                     "has_failover": len(stream.failover_urls) > 0,
-                    "stream_type": "HLS" if stream.is_hls else ("VOD" if stream.is_vod else "Live Continuous"),
+                    "stream_type": "HLS" if stream.is_hls else ("Transcoding" if stream.metadata.get("transcoding") else ("VOD" if stream.is_vod else "Live Continuous")),
                     "created_at": stream.created_at.isoformat(),
                     "last_access": stream.last_access.isoformat(),
                     "metadata": stream.metadata,

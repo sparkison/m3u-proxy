@@ -876,10 +876,26 @@ async def get_direct_stream(
             try:
                 args = stream_info.transcode_ffmpeg_args or []
                 lowered = [str(a).lower() for a in args]
-                is_hls_output = any([
-                    (i + 1 < len(lowered) and lowered[i] == '-f' and lowered[i + 1] == 'hls')
-                    for i in range(len(lowered))
-                ]) or any('-hls_time' in a or a.endswith('.m3u8') for a in lowered) or (' -f hls' in ' '.join(lowered))
+
+                # Detect explicit -f hls or -hls_time flags (output indicators)
+                is_hls_output = False
+                for i, token in enumerate(lowered):
+                    # explicit -f hls
+                    if token == '-f' and i + 1 < len(lowered) and lowered[i + 1] == 'hls':
+                        is_hls_output = True
+                        break
+                    # hls-specific flags
+                    if token.startswith('-hls_time') or token == '-hls_time':
+                        is_hls_output = True
+                        break
+                    # an output file ending with .m3u8 that is NOT an input (-i) token
+                    # we consider it an output only if the previous token is not '-i'
+                    if token.endswith('.m3u8'):
+                        prev = lowered[i - 1] if i - 1 >= 0 else ''
+                        # skip tokens that are input specs like '-i' or '-ihttp...'
+                        if prev != '-i' and not token.startswith('-i'):
+                            is_hls_output = True
+                            break
             except Exception:
                 is_hls_output = False
 

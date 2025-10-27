@@ -24,9 +24,9 @@ class Settings(BaseSettings):
 
     # Route Configuration
     ROOT_PATH: str = "/m3u-proxy"  # Default base path for integration with m3u-editor
-    CLIENT_TIMEOUT: int = 30
-    STREAM_TIMEOUT: int = 300
-    CLEANUP_INTERVAL: int = 60
+    CLIENT_TIMEOUT: int = 10
+    STREAM_TIMEOUT: int = 60
+    CLEANUP_INTERVAL: int = 30
 
     # Default stream properties (can be overridden per stream)
     DEFAULT_USER_AGENT: str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"

@@ -428,11 +428,12 @@ class PooledStreamManager:
         self.client_streams: Dict[str, str] = {}
 
         # Configuration
-        self.cleanup_interval = 60      # seconds - how often to run cleanup loop
-        self.heartbeat_interval = 30    # seconds - Redis worker heartbeat
+        self.cleanup_interval = int(getattr(settings, 'CLEANUP_INTERVAL', 60))      # seconds - how often to run cleanup loop
+        self.heartbeat_interval = int(getattr(settings, 'HEARTBEAT_INTERVAL', 30))  # seconds - Redis worker heartbeat
         # seconds - fallback timeout for streams with no clients
-        self.stream_timeout = 30
-        self.client_timeout = 600       # 10 minutes - timeout for inactive clients
+        self.stream_timeout = int(getattr(settings, 'STREAM_TIMEOUT', 300))
+        # Default 30 seconds - timeout for inactive clients
+        self.client_timeout = int(getattr(settings, 'CLIENT_TIMEOUT', 30))
         # HLS GC configuration (defaults from config.settings)
         self.hls_gc_enabled = bool(getattr(settings, 'HLS_GC_ENABLED', True))
         # How often to scan filesystem for stale HLS dirs (seconds)

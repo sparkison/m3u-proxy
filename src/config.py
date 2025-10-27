@@ -26,7 +26,7 @@ class Settings(BaseSettings):
     # Route Configuration
     ROOT_PATH: str = "/m3u-proxy"  # Default base path for integration with m3u-editor
     CLIENT_TIMEOUT: int = 10
-    STREAM_TIMEOUT: int = 60
+    STREAM_TIMEOUT: int = 30
     CLEANUP_INTERVAL: int = 30
 
     # Default stream properties (can be overridden per stream)
@@ -52,12 +52,12 @@ class Settings(BaseSettings):
     REDIS_ENABLED: bool = False
     ENABLE_TRANSCODING_POOLING: bool = True
     MAX_CLIENTS_PER_SHARED_STREAM: int = 10
-    SHARED_STREAM_TIMEOUT: int = 300  # 5 minutes
+    SHARED_STREAM_TIMEOUT: int = 30  # seconds
 
     # Worker configuration
     WORKER_ID: Optional[str] = None
     HEARTBEAT_INTERVAL: int = 30  # seconds
-    CLEANUP_INTERVAL: int = 60    # seconds
+    CLEANUP_INTERVAL: int = 30    # seconds
     STREAM_SHARING_STRATEGY: str = "url_profile"  # url_profile, url_only, disabled
     # Grace period (seconds) to wait before cleaning up a shared FFmpeg process after
     # the last client disconnects. This helps avoid churn for brief reconnects.

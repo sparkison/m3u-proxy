@@ -26,8 +26,13 @@ class Settings(BaseSettings):
     # Route Configuration
     ROOT_PATH: str = "/m3u-proxy"  # Default base path for integration with m3u-editor
     CLIENT_TIMEOUT: int = 10
-    STREAM_TIMEOUT: int = 30
+    STREAM_TIMEOUT: int = 15
+    SHARED_STREAM_TIMEOUT: int = 30
     CLEANUP_INTERVAL: int = 30
+    # Grace period (seconds) to wait before cleaning up a shared FFmpeg process after
+    # the last client disconnects. This helps avoid churn for brief reconnects.
+    SHARED_STREAM_GRACE: int = 3
+    STREAM_SHARING_STRATEGY: str = "url_profile"  # url_profile, url_only, disabled
 
     # Default stream properties (can be overridden per stream)
     DEFAULT_USER_AGENT: str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"
@@ -38,8 +43,6 @@ class Settings(BaseSettings):
     DEFAULT_HEALTH_CHECK_INTERVAL: float = 300.0
 
     # Additional configuration from .env file
-    DEFAULT_BUFFER_SIZE: int = 1048576
-    DEFAULT_TIMEOUT: int = 30
     DEFAULT_RETRY_ATTEMPTS: int = 3
     DEFAULT_RETRY_DELAY: int = 5
     TEMP_DIR: str = "/tmp/m3u-proxy-streams"
@@ -52,16 +55,10 @@ class Settings(BaseSettings):
     REDIS_ENABLED: bool = False
     ENABLE_TRANSCODING_POOLING: bool = True
     MAX_CLIENTS_PER_SHARED_STREAM: int = 10
-    SHARED_STREAM_TIMEOUT: int = 30  # seconds
 
     # Worker configuration
     WORKER_ID: Optional[str] = None
     HEARTBEAT_INTERVAL: int = 30  # seconds
-    CLEANUP_INTERVAL: int = 30    # seconds
-    STREAM_SHARING_STRATEGY: str = "url_profile"  # url_profile, url_only, disabled
-    # Grace period (seconds) to wait before cleaning up a shared FFmpeg process after
-    # the last client disconnects. This helps avoid churn for brief reconnects.
-    SHARED_STREAM_GRACE: int = 3
 
     # Transcoding configuration
     # HLS garbage collection configuration

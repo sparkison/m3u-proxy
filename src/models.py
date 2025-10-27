@@ -9,8 +9,6 @@ try:
 except ImportError:
     # Fallback for when config is not available
     class MockSettings:
-        DEFAULT_BUFFER_SIZE = 1024 * 1024
-        DEFAULT_TIMEOUT = 30
         DEFAULT_RETRY_ATTEMPTS = 3
         DEFAULT_RETRY_DELAY = 5
     settings = MockSettings()
@@ -55,16 +53,6 @@ class StreamConfig(BaseModel):
 
     def model_post_init(self, __context) -> None:
         """Set defaults from config after validation."""
-        # Treat 0 or None as "use default"
-        if self.buffer_size is None or self.buffer_size == 0:
-            self.buffer_size = settings.DEFAULT_BUFFER_SIZE
-        elif self.buffer_size < 64 * 1024:
-            raise ValueError(f"buffer_size must be at least {64 * 1024} bytes")
-
-        if self.timeout is None or self.timeout == 0:
-            self.timeout = settings.DEFAULT_TIMEOUT
-        elif self.timeout < 5:
-            raise ValueError("timeout must be at least 5 seconds")
 
         if self.retry_attempts is None or self.retry_attempts == 0:
             self.retry_attempts = settings.DEFAULT_RETRY_ATTEMPTS

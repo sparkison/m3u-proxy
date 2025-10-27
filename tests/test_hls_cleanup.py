@@ -18,6 +18,13 @@ async def test_hls_shared_process_cleanup(monkeypatch, tmp_path):
     # Import the module under test
     import pooled_stream_manager as psm
 
+    # Ensure grace period is small for test determinism
+    try:
+        monkeypatch.setattr(psm, 'settings', psm.settings)
+        setattr(psm.settings, 'SHARED_STREAM_GRACE', 1)
+    except Exception:
+        pass
+
     # Stub out start_process to avoid launching real ffmpeg and to create an hls_dir
     async def fake_start(self):
         # Create a per-stream hls_dir under the pytest tmp_path

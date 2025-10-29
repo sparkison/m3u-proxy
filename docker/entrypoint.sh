@@ -51,6 +51,5 @@ echo "✅ m3u-proxy started with PID $app_pid"
 pids+=("$app_pid")
 
 # Wait for the application to exit
-echo "⏳ Waiting for application processes..."
 wait "${pids[@]}"
 echo "✅ All processes have exited. Container shutting down."

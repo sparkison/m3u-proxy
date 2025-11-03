@@ -7,7 +7,7 @@ from stream_manager import (
 )
 import pytest
 import asyncio
-from datetime import datetime
+from datetime import datetime, timezone
 from unittest.mock import Mock, AsyncMock, patch
 import httpx
 
@@ -23,8 +23,8 @@ class TestClientInfo:
     def test_client_info_creation(self):
         client = ClientInfo(
             client_id="test_client",
-            created_at=datetime.now(),
-            last_access=datetime.now()
+            created_at=datetime.now(timezone.utc),
+            last_access=datetime.now(timezone.utc)
         )
         assert client.client_id == "test_client"
         assert client.bytes_served == 0
@@ -39,8 +39,8 @@ class TestStreamInfo:
         stream = StreamInfo(
             stream_id="test_stream",
             original_url="http://example.com/stream.m3u8",
-            created_at=datetime.now(),
-            last_access=datetime.now()
+            created_at=datetime.now(timezone.utc),
+            last_access=datetime.now(timezone.utc)
         )
         assert stream.stream_id == "test_stream"
         assert stream.original_url == "http://example.com/stream.m3u8"

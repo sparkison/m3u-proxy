@@ -8,7 +8,7 @@ import hashlib
 from urllib.parse import unquote, urlparse
 from typing import Optional, List, Dict
 from pydantic import BaseModel, field_validator, ValidationError
-from datetime import datetime
+from datetime import datetime, timezone
 
 from stream_manager import StreamManager
 from events import EventManager
@@ -1115,7 +1115,7 @@ async def get_performance_stats():
             "performance_metrics": proxy_stats.get("performance_metrics", {}),
             "failover_stats": proxy_stats.get("failover_stats", {}),
             "error_stats": proxy_stats.get("error_stats", {}),
-            "timestamp": datetime.now().isoformat()
+            "timestamp": datetime.now(timezone.utc).isoformat()
         }
     except Exception as e:
         logger.error(f"Error getting performance stats: {e}")

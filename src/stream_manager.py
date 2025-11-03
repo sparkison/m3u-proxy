@@ -14,7 +14,7 @@ import os
 import time
 from typing import Dict, Optional, AsyncIterator, List, Set, Any
 from urllib.parse import urljoin, urlparse, quote, unquote
-from datetime import datetime, timedelta
+from datetime import datetime, timezone, timedelta
 from dataclasses import dataclass, field
 from asyncio import Queue
 from fastapi import HTTPException
@@ -92,7 +92,7 @@ class ProxyStats:
     active_clients: int = 0
     total_bytes_served: int = 0
     total_segments_served: int = 0
-    uptime_start: datetime = field(default_factory=datetime.now)
+    uptime_start: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     connection_pool_stats: Dict = field(default_factory=dict)
     failover_stats: Dict = field(default_factory=dict)
 
@@ -321,7 +321,7 @@ class StreamManager:
         stream_id = hashlib.md5(stream_url.encode()).hexdigest()
 
         if stream_id not in self.streams:
-            now = datetime.now()
+            now = datetime.now(timezone.utc)
             if user_agent is None:
                 user_agent = settings.DEFAULT_USER_AGENT
 
@@ -366,7 +366,7 @@ class StreamManager:
             logger.info(
                 f"Created new stream: {stream_id} ({stream_type}){variant_info} with user agent: {user_agent}")
 
-        self.streams[stream_id].last_access = datetime.now()
+        self.streams[stream_id].last_access = datetime.now(timezone.utc)
         return stream_id
 
     async def register_client(
@@ -380,7 +380,7 @@ class StreamManager:
 
         If the stream is a variant, the client is registered with the parent stream instead.
         """
-        now = datetime.now()
+        now = datetime.now(timezone.utc)
 
         # If this is a variant stream, register client with the parent instead
         effective_stream_id = stream_id
@@ -589,10 +589,10 @@ class StreamManager:
                         bytes_delta = bytes_served - last_stats_update
 
                         if client_id in self.clients:
-                            self.clients[client_id].last_access = datetime.now()
+                            self.clients[client_id].last_access = datetime.now(timezone.utc)
                             self.clients[client_id].bytes_served += bytes_delta
                         if stream_id in self.streams:
-                            self.streams[stream_id].last_access = datetime.now()
+                            self.streams[stream_id].last_access = datetime.now(timezone.utc)
                             self.streams[stream_id].total_bytes_served += bytes_delta
                         self._stats.total_bytes_served += bytes_delta
 
@@ -744,11 +744,11 @@ class StreamManager:
                 if bytes_remaining > 0:
                     if client_id in self.clients:
                         self.clients[client_id].bytes_served += bytes_remaining
-                        self.clients[client_id].last_access = datetime.now()
+                        self.clients[client_id].last_access = datetime.now(timezone.utc)
 
                     if stream_id in self.streams:
                         self.streams[stream_id].total_bytes_served += bytes_remaining
-                        self.streams[stream_id].last_access = datetime.now()
+                        self.streams[stream_id].last_access = datetime.now(timezone.utc)
 
                     self._stats.total_bytes_served += bytes_remaining
 
@@ -917,14 +917,14 @@ class StreamManager:
                     if self.pooled_manager:
                         self.pooled_manager.update_client_activity(client_id)
                     if client_id in self.clients:
-                        self.clients[client_id].last_access = datetime.now()
+                        self.clients[client_id].last_access = datetime.now(timezone.utc)
                         self.clients[client_id].bytes_served += len(chunk)
 
                     # Update stream-level stats (for bandwidth tracking)
                     if stream_id in self.streams:
                         self.streams[stream_id].total_bytes_served += len(
                             chunk)
-                        self.streams[stream_id].last_access = datetime.now()
+                        self.streams[stream_id].last_access = datetime.now(timezone.utc)
 
                     # Update global stats
                     self._stats.total_bytes_served += len(chunk)
@@ -1071,7 +1071,7 @@ class StreamManager:
             stream_info.current_url = next_url
             stream_info.current_failover_index = next_index
             stream_info.failover_attempts += 1
-            stream_info.last_failover_time = datetime.now()
+            stream_info.last_failover_time = datetime.now(timezone.utc)
 
             logger.info(f"Seamless failover successful for stream {stream_id}")
 
@@ -1178,9 +1178,9 @@ class StreamManager:
                         processed_content = processor.process_playlist(
                             playlist_text, base_proxy_url, base_url)
 
-                        stream_info.last_access = datetime.now()
+                        stream_info.last_access = datetime.now(timezone.utc)
                         if client_id in self.clients:
-                            self.clients[client_id].last_access = datetime.now()
+                            self.clients[client_id].last_access = datetime.now(timezone.utc)
 
                         return processed_content
 
@@ -1221,9 +1221,9 @@ class StreamManager:
             processed_content = processor.process_playlist(
                 content, base_proxy_url, base_url)
 
-            stream_info.last_access = datetime.now()
+            stream_info.last_access = datetime.now(timezone.utc)
             if client_id in self.clients:
-                self.clients[client_id].last_access = datetime.now()
+                self.clients[client_id].last_access = datetime.now(timezone.utc)
 
             return processed_content
 
@@ -1282,12 +1282,12 @@ class StreamManager:
                 if client_id in self.clients:
                     self.clients[client_id].bytes_served += bytes_served
                     self.clients[client_id].segments_served += 1
-                    self.clients[client_id].last_access = datetime.now()
+                    self.clients[client_id].last_access = datetime.now(timezone.utc)
 
                 if stream_id in self.streams:
                     self.streams[stream_id].total_bytes_served += bytes_served
                     self.streams[stream_id].total_segments_served += 1
-                    self.streams[stream_id].last_access = datetime.now()
+                    self.streams[stream_id].last_access = datetime.now(timezone.utc)
 
                 self._stats.total_bytes_served += bytes_served
                 self._stats.total_segments_served += 1
@@ -1321,7 +1321,7 @@ class StreamManager:
                         continue
 
                     if (stream_info.last_health_check is None or
-                            (datetime.now() - stream_info.last_health_check).total_seconds() >= stream_info.health_check_interval):
+                            (datetime.now(timezone.utc) - stream_info.last_health_check).total_seconds() >= stream_info.health_check_interval):
 
                         is_healthy = await self._health_check_stream(stream_id)
 
@@ -1355,7 +1355,7 @@ class StreamManager:
                 response = await self.http_client.head(current_url, headers=headers, timeout=10.0)
 
             response.raise_for_status()
-            stream_info.last_health_check = datetime.now()
+            stream_info.last_health_check = datetime.now(timezone.utc)
             return True
         except Exception as e:
             logger.warning(f"Health check failed for stream {stream_id}: {e}")
@@ -1395,7 +1395,7 @@ class StreamManager:
 
     async def _cleanup_inactive_clients(self):
         """Clean up clients that haven't been accessed recently"""
-        current_time = datetime.now()
+        current_time = datetime.now(timezone.utc)
         inactive_clients = []
 
         for client_id, client_info in self.clients.items():
@@ -1407,7 +1407,7 @@ class StreamManager:
 
     async def _cleanup_inactive_streams(self):
         """Clean up streams with no active clients"""
-        current_time = datetime.now()
+        current_time = datetime.now(timezone.utc)
         inactive_streams = []
 
         for stream_id, stream_info in self.streams.items():
@@ -1517,7 +1517,7 @@ class StreamManager:
                 "active_clients": active_client_count,
                 "total_bytes_served": self._stats.total_bytes_served,
                 "total_segments_served": self._stats.total_segments_served,
-                "uptime_seconds": (datetime.now() - self._stats.uptime_start).seconds
+                "uptime_seconds": (datetime.now(timezone.utc) - self._stats.uptime_start).seconds
             },
             "streams": [
                 {

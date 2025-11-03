@@ -6,7 +6,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 import pytest
 from unittest.mock import Mock, AsyncMock, patch, MagicMock
 from fastapi.testclient import TestClient
-from datetime import datetime
+from datetime import datetime, timezone
 from api import app, StreamCreateRequest
 from stream_manager import StreamInfo
 
@@ -199,7 +199,7 @@ class TestMetadataFeature:
 
     def test_stream_info_metadata_storage(self):
         """Test that StreamInfo properly stores metadata"""
-        now = datetime.now()
+        now = datetime.now(timezone.utc)
         stream_info = StreamInfo(
             stream_id="test_123",
             original_url="https://example.com/stream.m3u8",
@@ -217,7 +217,7 @@ class TestMetadataFeature:
 
     def test_stream_info_empty_metadata_default(self):
         """Test that StreamInfo has empty metadata by default"""
-        now = datetime.now()
+        now = datetime.now(timezone.utc)
         stream_info = StreamInfo(
             stream_id="test_123",
             original_url="https://example.com/stream.m3u8",
@@ -232,7 +232,7 @@ class TestMetadataFeature:
     def test_get_stats_includes_metadata(self, client, mock_stream_manager):
         """Test that GET /streams includes metadata in response"""
         # Mock a stream with metadata
-        now = datetime.now()
+        now = datetime.now(timezone.utc)
         mock_stream = StreamInfo(
             stream_id="test_123",
             original_url="https://example.com/stream.m3u8",

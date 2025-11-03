@@ -1,6 +1,6 @@
 from stream_manager import StreamManager, ClientInfo, StreamInfo, M3U8Processor
 import pytest
-from datetime import datetime
+from datetime import datetime, timezone
 
 # Add src to path
 import sys
@@ -15,8 +15,8 @@ class TestBasicFunctionality:
         """Test that ClientInfo dataclass works correctly"""
         # Arrange
         client_id = "test_client_123"
-        created_time = datetime.now()
-        last_access_time = datetime.now()
+        created_time = datetime.now(timezone.utc)
+        last_access_time = datetime.now(timezone.utc)
 
         # Act
         client = ClientInfo(
@@ -38,8 +38,8 @@ class TestBasicFunctionality:
         # Arrange
         stream_id = "abc12345"
         url = "http://example.com/stream.m3u8"
-        created_time = datetime.now()
-        last_access_time = datetime.now()
+        created_time = datetime.now(timezone.utc)
+        last_access_time = datetime.now(timezone.utc)
 
         # Act
         stream = StreamInfo(

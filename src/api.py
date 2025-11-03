@@ -237,9 +237,21 @@ app.add_middleware(
 
 def get_client_info(request: Request):
     """Extract client information from request"""
+    # Try to get IP from X-Forwarded-For header first (for proxied requests)
+    # X-Forwarded-For can contain multiple IPs: "client, proxy1, proxy2"
+    # We want the first one (the original client IP)
+    ip_address = "unknown"
+    forwarded_for = request.headers.get("x-forwarded-for")
+    if forwarded_for:
+        # Take the first IP in the chain (original client)
+        ip_address = forwarded_for.split(",")[0].strip()
+    elif request.client:
+        # Fallback to direct connection IP
+        ip_address = request.client.host
+    
     return {
         "user_agent": request.headers.get("user-agent") or "unknown",
-        "ip_address": request.client.host if request.client else "unknown"
+        "ip_address": ip_address
     }
 
 

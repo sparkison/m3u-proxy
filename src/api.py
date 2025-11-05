@@ -1338,6 +1338,12 @@ async def delete_stream(stream_id: str):
             for client_id in client_ids:
                 await stream_manager.cleanup_client(client_id)
 
+        # Emit stream_stopped event before removing the stream
+        await stream_manager._emit_event("STREAM_STOPPED", stream_id, {
+            "reason": "manual_deletion",
+            "was_transcoded": stream_info.is_transcoded
+        })
+
         # Remove stream
         if stream_id in stream_manager.streams:
             del stream_manager.streams[stream_id]

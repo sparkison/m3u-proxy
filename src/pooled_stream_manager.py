@@ -437,10 +437,16 @@ class PooledStreamManager:
         # Use Any to avoid type issues when Redis not available
         self.redis_client: Optional[Any] = None
 
+        # Event manager (set by stream manager)
+        self.event_manager = None
+        self.parent_stream_manager = None
+
         # Local process management
         self.shared_processes: Dict[str, SharedTranscodingProcess] = {}
         # client_id -> stream_id mapping
         self.client_streams: Dict[str, str] = {}
+        # stream_key -> stream_id mapping (for event emission)
+        self.stream_key_to_id: Dict[str, str] = {}
 
         # Configuration
         self.cleanup_interval = int(getattr(settings, 'CLEANUP_INTERVAL', 60))      # seconds - how often to run cleanup loop
@@ -465,6 +471,28 @@ class PooledStreamManager:
         self._cleanup_task: Optional[asyncio.Task] = None
         self._heartbeat_task: Optional[asyncio.Task] = None
         self._running = False
+
+    def set_event_manager(self, event_manager):
+        """Set the event manager for emitting events"""
+        self.event_manager = event_manager
+
+    def set_parent_stream_manager(self, stream_manager):
+        """Set the parent stream manager for accessing stream info"""
+        self.parent_stream_manager = stream_manager
+
+    async def _emit_event(self, event_type: str, stream_id: str, data: dict):
+        """Helper method to emit events if event manager is available"""
+        if self.event_manager:
+            try:
+                from models import StreamEvent, EventType
+                event = StreamEvent(
+                    event_type=getattr(EventType, event_type),
+                    stream_id=stream_id,
+                    data=data
+                )
+                await self.event_manager.emit_event(event)
+            except Exception as e:
+                logger.error(f"Error emitting event: {e}")
 
     async def start(self):
         """Start the pooled stream manager"""
@@ -575,15 +603,35 @@ class PooledStreamManager:
             logger.info(f"Cleaning up stale process for stream {stream_id}")
             await self._cleanup_local_process(stream_id)
 
-    async def _cleanup_local_process(self, stream_id: str):
-        """Clean up a specific local process"""
-        if stream_id in self.shared_processes:
-            process = self.shared_processes.pop(stream_id)
+    async def _cleanup_local_process(self, stream_key: str, emit_event: bool = False):
+        """
+        Clean up a specific local process.
+        
+        Args:
+            stream_key: The key identifying the transcoding process
+            emit_event: Whether to emit stream_stopped event (default: False)
+                       Set to True only when this is the sole cleanup point
+        """
+        if stream_key in self.shared_processes:
+            process = self.shared_processes.pop(stream_key)
             await process.cleanup()
+
+            # Only emit event if explicitly requested
+            # Normally, the parent StreamManager handles event emission
+            if emit_event:
+                stream_id = self.stream_key_to_id.get(stream_key, stream_key)
+                await self._emit_event("STREAM_STOPPED", stream_id, {
+                    "reason": "transcoding_cleanup",
+                    "stream_key": stream_key
+                })
+
+            # Clean up the mapping
+            if stream_key in self.stream_key_to_id:
+                del self.stream_key_to_id[stream_key]
 
             # Update Redis
             if self.redis_client:
-                redis_key = f"stream:{stream_id}"
+                redis_key = f"stream:{stream_key}"
                 await self.redis_client.delete(redis_key)
                 await self.redis_client.srem(f"worker:{self.worker_id}:streams", redis_key)
 
@@ -705,10 +753,15 @@ class PooledStreamManager:
         client_id: str,
         user_agent: Optional[str] = None,
         headers: Optional[Dict[str, str]] = None,
+        stream_id: Optional[str] = None,
     ) -> Tuple[str, SharedTranscodingProcess]:
         """Get existing shared stream or create new one"""
 
         stream_key = self._generate_stream_key(url, profile)
+
+        # Track the stream_id -> stream_key mapping for event emission
+        if stream_id:
+            self.stream_key_to_id[stream_key] = stream_id
 
         # First check if we have it locally
         if stream_key in self.shared_processes:

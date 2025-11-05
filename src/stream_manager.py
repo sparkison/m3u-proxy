@@ -174,6 +174,8 @@ class StreamManager:
             try:
                 from pooled_stream_manager import PooledStreamManager
                 self.pooled_manager = PooledStreamManager(redis_url=redis_url)
+                # Set parent stream manager reference for event coordination
+                self.pooled_manager.set_parent_stream_manager(self)
                 logger.info("Redis pooling enabled")
             except ImportError:
                 logger.warning(
@@ -227,6 +229,9 @@ class StreamManager:
     def set_event_manager(self, event_manager):
         """Set the event manager for emitting events"""
         self.event_manager = event_manager
+        # Also set it on the pooled manager if available
+        if self.pooled_manager:
+            self.pooled_manager.set_event_manager(event_manager)
 
     async def _emit_event(self, event_type: str, stream_id: str, data: dict):
         """Helper method to emit events if event manager is available"""
@@ -1072,6 +1077,7 @@ class StreamManager:
                         client_id=client_id,
                         user_agent=stream_info.user_agent,
                         headers=stream_info.headers,
+                        stream_id=stream_id,
                     )
                     
                     # Update the tracked stream key so future failovers can stop the correct process
@@ -1399,6 +1405,7 @@ class StreamManager:
                     client_id=client_id,
                     user_agent=stream_info.user_agent,
                     headers=stream_info.headers,
+                    stream_id=stream_id,
                 )
                 # Record the stream key for later mapping
                 stream_info.transcode_stream_key = stream_key
@@ -1776,6 +1783,13 @@ class StreamManager:
         for stream_id in inactive_streams:
             if stream_id in self.streams:
                 logger.info(f"Cleaning up inactive stream: {stream_id}")
+                
+                # Emit stream_stopped event before removing the stream
+                await self._emit_event("STREAM_STOPPED", stream_id, {
+                    "reason": "inactive_timeout",
+                    "timeout_seconds": self.stream_timeout
+                })
+                
                 del self.streams[stream_id]
                 if stream_id in self.stream_clients:
                     del self.stream_clients[stream_id]

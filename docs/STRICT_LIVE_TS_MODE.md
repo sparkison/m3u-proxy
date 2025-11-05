@@ -330,9 +330,3 @@ Response includes `strict_live_ts` status:
   - Startup pre-buffering
   - Circuit breaker with failover
   - HEAD request optimization
-
-## See Also
-
-- [Stream Pooling](stream-pooling.md) - For HLS and transcoded streams
-- [Deployment Guide](deployment.md) - Production deployment recommendations
-- [M3U Proxy Integration](m3u-proxy-integration.md) - Integration with m3u-editor

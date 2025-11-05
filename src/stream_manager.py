@@ -910,6 +910,7 @@ class StreamManager:
             bytes_served = 0
             failover_count = 0
             max_failovers = 3
+            is_failover = False  # Track if we broke due to failover
 
             # Main loop with automatic reconnection on failover
             while failover_count <= max_failovers:
@@ -931,6 +932,9 @@ class StreamManager:
                         user_agent=stream_info.user_agent,
                         headers=stream_info.headers,
                     )
+                    
+                    # Update the tracked stream key so future failovers can stop the correct process
+                    stream_info.transcode_stream_key = stream_key
 
                     if not shared_process or not shared_process.process or not shared_process.process.stdout:
                         # Try failover if available
@@ -991,6 +995,7 @@ class StreamManager:
                                     logger.warning(f"Error removing client from old stream: {e}")
                             # Clear the stream_key so we don't try to clean it up again
                             stream_key = None
+                            is_failover = True  # Mark that we're doing a failover
                             failover_count += 1
                             # Break inner loop to reconnect with new URL
                             break
@@ -1027,11 +1032,12 @@ class StreamManager:
                         # Update global stats
                         self._stats.total_bytes_served += len(chunk)
                     
-                    # If we reach here and failover event was set, continue to next iteration
-                    if stream_info.failover_event.is_set():
+                    # If we broke due to failover, continue to next iteration to reconnect
+                    if is_failover:
+                        is_failover = False  # Reset flag
                         continue
                     else:
-                        # Normal completion
+                        # Normal completion - break outer loop
                         break
 
                 except (HTTPException, ConnectionError, BrokenPipeError) as e:

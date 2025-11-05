@@ -106,7 +106,22 @@ class SharedTranscodingProcess:
                     [f"{k}: {v}\r\n" for k, v in self.headers.items()])
                 ffmpeg_cmd.extend(["-headers", header_str])
 
-            ffmpeg_cmd.extend(self.ffmpeg_args)
+            # Process ffmpeg_args and replace input URL with self.url (for failover support)
+            # Find -i flag and replace the next arg with self.url
+            processed_args = []
+            i = 0
+            while i < len(self.ffmpeg_args):
+                arg = self.ffmpeg_args[i]
+                if arg == "-i" and i + 1 < len(self.ffmpeg_args):
+                    # Found -i flag, add it and use self.url as the input
+                    processed_args.append(arg)
+                    processed_args.append(self.url)  # Use current URL (updated during failover)
+                    i += 2  # Skip the old URL in ffmpeg_args
+                else:
+                    processed_args.append(arg)
+                    i += 1
+            
+            ffmpeg_cmd.extend(processed_args)
 
             # If HLS mode, ensure we write to the hls_dir index.m3u8
             if self.mode == 'hls':

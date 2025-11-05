@@ -90,6 +90,7 @@ class StreamCreateRequest(BaseModel):
     user_agent: Optional[str] = None
     metadata: Optional[dict] = None
     headers: Optional[Dict[str, str]] = None
+    strict_live_ts: Optional[bool] = None  # Enable Strict Live TS Mode for this stream
 
     @field_validator('url')
     @classmethod
@@ -401,7 +402,8 @@ async def create_stream(request: StreamCreateRequest):
             request.failover_urls,
             request.user_agent,
             metadata=request.metadata,
-            headers=request.headers
+            headers=request.headers,
+            strict_live_ts=request.strict_live_ts
         )
 
         # Emit stream started event
@@ -980,7 +982,10 @@ async def head_direct_stream(
     client_id: Optional[str] = Query(
         None, description="Client ID (auto-generated if not provided)")
 ):
-    """Handle HEAD requests for direct streams (needed for MP4 duration/seeking)"""
+    """Handle HEAD requests for direct streams (needed for MP4 duration/seeking)
+    
+    In Strict Live TS Mode, this returns quickly without upstream hits for live TS streams.
+    """
     try:
         # The stream_id is now validated by the resolve_stream_id dependency
         stream_info = stream_manager.streams[stream_id]
@@ -991,6 +996,35 @@ async def head_direct_stream(
 
         # Check for Range header
         range_header = request.headers.get('range')
+
+        # Determine if strict mode is enabled (global or per-stream)
+        strict_mode_enabled = settings.STRICT_LIVE_TS or stream_info.strict_live_ts
+
+        # STRICT MODE OPTIMIZATION: For live TS streams in strict mode, return immediately
+        # without hitting upstream to prevent redundant requests and connection issues
+        if strict_mode_enabled and stream_info.is_live_continuous:
+            logger.info(
+                f"STRICT MODE: HEAD request for live TS stream {stream_id} - returning quick response without upstream hit")
+            
+            response_headers = {
+                "Content-Type": content_type,
+                "Accept-Ranges": "none",  # Live streams don't support ranges
+                "Cache-Control": "no-cache, no-store, must-revalidate",
+                "Pragma": "no-cache",
+                "Expires": "0",
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+                "Access-Control-Allow-Headers": "*",
+                "Access-Control-Expose-Headers": "*",
+                "Connection": "keep-alive"
+            }
+            
+            # Do NOT include Content-Length for live streams
+            return Response(
+                content=None,
+                status_code=200,  # Always 200 for live streams, never 206
+                headers=response_headers
+            )
 
         # For HEAD requests, we need to make a HEAD request to the origin server
         # to get metadata like Content-Length for MP4 files

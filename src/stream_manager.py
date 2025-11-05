@@ -84,6 +84,10 @@ class StreamInfo:
     transcode_process: Optional[asyncio.subprocess.Process] = None
     # Key used by the pooled manager to identify shared transcoding processes
     transcode_stream_key: Optional[str] = None
+    # Strict Live TS Mode - improved handling for live MPEG-TS streams
+    strict_live_ts: bool = False
+    # Circuit breaker - track bad upstream endpoints temporarily
+    upstream_marked_bad_until: Optional[datetime] = None
 
 
 @dataclass
@@ -304,7 +308,8 @@ class StreamManager:
         headers: Optional[Dict[str, str]] = None,
         is_transcoded: bool = False,
         transcode_profile: Optional[str] = None,
-        transcode_ffmpeg_args: Optional[List[str]] = None
+        transcode_ffmpeg_args: Optional[List[str]] = None,
+        strict_live_ts: Optional[bool] = None
     ) -> str:
         """Get or create a stream and return its ID
 
@@ -318,6 +323,7 @@ class StreamManager:
             is_transcoded: Whether this stream should be transcoded
             transcode_profile: Name of the transcoding profile to use
             transcode_ffmpeg_args: FFmpeg arguments for transcoding
+            strict_live_ts: Enable Strict Live TS Mode for this stream
         """
         import hashlib
         stream_id = hashlib.md5(stream_url.encode()).hexdigest()
@@ -353,7 +359,8 @@ class StreamManager:
                 headers=headers or {},
                 is_transcoded=is_transcoded,
                 transcode_profile=transcode_profile,
-                transcode_ffmpeg_args=transcode_ffmpeg_args or []
+                transcode_ffmpeg_args=transcode_ffmpeg_args or [],
+                strict_live_ts=strict_live_ts or False
             )
             self.stream_clients[stream_id] = set()
 
@@ -483,6 +490,12 @@ class StreamManager:
         Direct byte-for-byte proxy for continuous streams (.ts, .mp4, .mkv).
         Each client gets their own provider connection - NO shared buffer.
         Provider connection is truly ephemeral and only open while streaming.
+        
+        When Strict Live TS Mode is enabled (globally via STRICT_LIVE_TS=true or per-stream):
+        - Strips Range headers completely for live TS streams
+        - Pre-buffers 256-512 KB before sending to client for smoother playback
+        - Implements circuit breaker to detect and avoid stalled upstream endpoints
+        - Returns HTTP 200 (never 206) with no Content-Length for live streams
         """
         if stream_id not in self.streams:
             raise HTTPException(status_code=404, detail="Stream not found")
@@ -498,8 +511,30 @@ class StreamManager:
         cancel_event = asyncio.Event()
         self.client_cancel_events[client_id] = cancel_event
 
-        logger.info(
-            f"Starting direct proxy for client {client_id}, stream {stream_id}")
+        # Determine if strict mode is enabled (global or per-stream)
+        strict_mode_enabled = settings.STRICT_LIVE_TS or stream_info.strict_live_ts
+        
+        # Check circuit breaker - if upstream marked as bad, try failover immediately
+        if strict_mode_enabled and stream_info.upstream_marked_bad_until:
+            if datetime.now(timezone.utc) < stream_info.upstream_marked_bad_until:
+                logger.warning(
+                    f"Stream {stream_id} upstream marked as bad until {stream_info.upstream_marked_bad_until}, attempting immediate failover")
+                if stream_info.failover_urls:
+                    await self._try_update_failover_url(stream_id, "circuit_breaker_bad_upstream")
+                    current_url = stream_info.current_url or stream_info.original_url
+                    # Clear the bad marker since we switched to a new upstream
+                    stream_info.upstream_marked_bad_until = None
+            else:
+                # Cooldown expired, clear the marker
+                logger.info(f"Stream {stream_id} circuit breaker cooldown expired, clearing bad upstream marker")
+                stream_info.upstream_marked_bad_until = None
+
+        if strict_mode_enabled and stream_info.is_live_continuous:
+            logger.info(
+                f"Starting direct proxy with STRICT LIVE TS MODE for client {client_id}, stream {stream_id}")
+        else:
+            logger.info(
+                f"Starting direct proxy for client {client_id}, stream {stream_id}")
 
         # Variables to capture from the generator for response headers
         provider_status_code = None
@@ -547,13 +582,21 @@ class StreamManager:
                     # IMPORTANT: Do NOT send Range headers for live continuous streams
                     # Live IPTV streams (.ts) are infinite and don't support range requests
                     # Range requests can cause providers to immediately close the connection
-                    if range_header and not stream_info.is_live_continuous:
-                        headers['Range'] = range_header
-                        logger.info(
-                            f"Including Range header for VOD stream: {range_header}")
-                    elif range_header and stream_info.is_live_continuous:
-                        logger.info(
-                            f"Ignoring Range header for live stream (not supported)")
+                    # In strict mode, we are even more aggressive about stripping Range headers
+                    if range_header:
+                        if stream_info.is_live_continuous:
+                            # Never send Range for live streams
+                            if strict_mode_enabled:
+                                logger.info(
+                                    f"STRICT MODE: Completely stripping Range header for live TS stream: {range_header}")
+                            else:
+                                logger.info(
+                                    f"Ignoring Range header for live stream (not supported)")
+                        elif not strict_mode_enabled:
+                            # VOD stream, not in strict mode - honor range request
+                            headers['Range'] = range_header
+                            logger.info(
+                                f"Including Range header for VOD stream: {range_header}")
 
                     # Select appropriate HTTP client
                     client_to_use = self.live_stream_client if stream_info.is_live_continuous else self.http_client
@@ -583,8 +626,66 @@ class StreamManager:
                         logger.info(
                             f"Provider Content-Range: {provider_content_range}")
 
-                    # Direct byte-for-byte proxy - NO buffering, NO transcoding
-                    async for chunk in response.aiter_bytes(chunk_size=32768):
+                    # Create a single iterator for the response stream
+                    # IMPORTANT: Async iterators can only be consumed once! We must use the same
+                    # iterator for both pre-buffering and main streaming. The pre-buffer phase yields
+                    # chunks directly (no storage), then breaks to let the main loop continue seamlessly.
+                    stream_iterator = response.aiter_bytes(chunk_size=32768)
+                    
+                    # Initialize last_chunk_time for circuit breaker tracking
+                    last_chunk_time = asyncio.get_event_loop().time()
+                    
+                    # Pre-buffering for Strict Live TS Mode
+                    target_prebuffer = settings.STRICT_LIVE_TS_PREBUFFER_SIZE if strict_mode_enabled and stream_info.is_live_continuous else 0
+                    
+                    if target_prebuffer > 0:
+                        logger.info(
+                            f"STRICT MODE: Pre-buffering {target_prebuffer} bytes (~0.5-1s) before streaming to client {client_id}")
+                        prebuffer_start = asyncio.get_event_loop().time()
+                        prebuffer_timeout = settings.STRICT_LIVE_TS_PREBUFFER_TIMEOUT
+                        prebuffer_size = 0
+                        prebuffer_chunks = 0
+                        
+                        # Pre-buffer by reading from the iterator until we reach target
+                        try:
+                            async for chunk in stream_iterator:
+                                # Yield immediately - no separate storage needed
+                                yield chunk
+                                bytes_served += len(chunk)
+                                chunk_count += 1
+                                prebuffer_size += len(chunk)
+                                prebuffer_chunks += 1
+                                
+                                # Update last chunk time for circuit breaker
+                                last_chunk_time = asyncio.get_event_loop().time()
+                                
+                                # Check timeout
+                                if asyncio.get_event_loop().time() - prebuffer_start > prebuffer_timeout:
+                                    logger.warning(
+                                        f"STRICT MODE: Pre-buffer timeout after {prebuffer_timeout}s, proceeding with {prebuffer_size} bytes")
+                                    break
+                                
+                                # Reached target - break and continue with normal streaming
+                                if prebuffer_size >= target_prebuffer:
+                                    logger.info(
+                                        f"STRICT MODE: Pre-buffer complete: {prebuffer_size} bytes in {prebuffer_chunks} chunks")
+                                    break
+                        except asyncio.TimeoutError:
+                            logger.warning(
+                                f"STRICT MODE: Pre-buffer read timeout, proceeding with {prebuffer_size} bytes")
+                        
+                        logger.info(
+                            f"STRICT MODE: Emitted pre-buffer, now streaming live for client {client_id}")
+
+                    # Direct byte-for-byte proxy - Continue with the SAME iterator
+                    # Track time of last received chunk for circuit breaker
+                    circuit_breaker_timeout = settings.STRICT_LIVE_TS_CIRCUIT_BREAKER_TIMEOUT if strict_mode_enabled else 0
+                    
+                    # Continue streaming from where pre-buffer left off (or from start if no pre-buffer)
+                    async for chunk in stream_iterator:
+                        # Update last chunk time
+                        last_chunk_time = asyncio.get_event_loop().time()
+                        
                         # Check if streaming should be cancelled
                         if cancel_event.is_set():
                             logger.info(
@@ -638,6 +739,33 @@ class StreamManager:
                         elif chunk_count % 100 == 0:
                             logger.info(
                                 f"Client {client_id}: {chunk_count} chunks, {bytes_served:,} bytes served")
+                    
+                    # Check circuit breaker after loop exits (if strict mode enabled)
+                    if strict_mode_enabled and circuit_breaker_timeout > 0:
+                        time_since_last_chunk = asyncio.get_event_loop().time() - last_chunk_time
+                        if time_since_last_chunk > circuit_breaker_timeout:
+                            logger.error(
+                                f"STRICT MODE: Circuit breaker triggered - no data for {time_since_last_chunk:.1f}s (threshold: {circuit_breaker_timeout}s)")
+                            # Mark upstream as bad
+                            cooldown_seconds = settings.STRICT_LIVE_TS_CIRCUIT_BREAKER_COOLDOWN
+                            stream_info.upstream_marked_bad_until = datetime.now(timezone.utc) + timedelta(seconds=cooldown_seconds)
+                            logger.warning(
+                                f"STRICT MODE: Marking upstream as bad for {cooldown_seconds}s until {stream_info.upstream_marked_bad_until}")
+                            
+                            # Try failover if available
+                            if stream_info.failover_urls and failover_count < max_failovers:
+                                logger.info(f"STRICT MODE: Attempting failover due to circuit breaker")
+                                await self._try_update_failover_url(stream_id, "circuit_breaker_timeout")
+                                failover_count += 1
+                                # Close current connection
+                                if stream_context is not None:
+                                    try:
+                                        await stream_context.__aexit__(None, None, None)
+                                    except Exception:
+                                        pass
+                                stream_context = None
+                                response = None
+                                continue  # Retry with failover URL
                     
                     # If we reach here, streaming completed successfully (failover event not set)
                     if not stream_info.failover_event.is_set():
@@ -830,8 +958,13 @@ class StreamManager:
         }
 
         # For live streams, explicitly state we don't support range requests
+        # In strict mode, be even more explicit
         if stream_info.is_live_continuous:
             headers["Accept-Ranges"] = "none"
+            if strict_mode_enabled:
+                # Remove any connection-related headers that might interfere
+                headers["Connection"] = "keep-alive"
+                logger.debug("STRICT MODE: Setting Accept-Ranges: none and Connection: keep-alive")
         else:
             headers["Accept-Ranges"] = "bytes"
 
@@ -849,14 +982,22 @@ class StreamManager:
         # Now we have provider_status_code, provider_content_range, provider_content_length
         # Determine proper response status and headers
         status_code = 200
-        if range_header and provider_status_code == 206 and provider_content_range:
-            # Provider returned 206, we should also return 206
+        
+        # In strict mode for live TS, NEVER return 206 or Content-Length
+        if strict_mode_enabled and stream_info.is_live_continuous:
+            status_code = 200
+            # Do NOT include Content-Length or Content-Range for live streams in strict mode
+            logger.info("STRICT MODE: Returning 200 OK without Content-Length for live TS stream")
+        elif range_header and provider_status_code == 206 and provider_content_range:
+            # Provider returned 206, we should also return 206 (only for non-strict or VOD)
             status_code = 206
             headers["Content-Range"] = provider_content_range
             logger.info(
                 f"Returning 206 Partial Content with range: {provider_content_range}")
-
-        if provider_content_length:
+            if provider_content_length:
+                headers["Content-Length"] = provider_content_length
+        elif provider_content_length and not (strict_mode_enabled and stream_info.is_live_continuous):
+            # Only include Content-Length for non-live or non-strict streams
             headers["Content-Length"] = provider_content_length
 
         # Create new generator that yields the first chunk then continues with the rest

@@ -76,6 +76,18 @@ class Settings(BaseSettings):
     # API Authentication
     API_TOKEN: Optional[str] = None
 
+    # Strict Live TS Mode Configuration
+    # Enable strict mode for live MPEG-TS streams to improve playback stability
+    STRICT_LIVE_TS: bool = False
+    # Pre-buffer size in bytes (256KB-512KB recommended for 0.5-1s of data)
+    STRICT_LIVE_TS_PREBUFFER_SIZE: int = 262144  # 256 KB default
+    # Circuit breaker timeout - if no data received for this many seconds, mark upstream as bad
+    STRICT_LIVE_TS_CIRCUIT_BREAKER_TIMEOUT: int = 2
+    # How long to mark a failed upstream as bad (seconds) before retrying
+    STRICT_LIVE_TS_CIRCUIT_BREAKER_COOLDOWN: int = 60
+    # Maximum chunk wait time in seconds for pre-buffer (to avoid infinite wait)
+    STRICT_LIVE_TS_PREBUFFER_TIMEOUT: int = 10
+
     # Model configuration
     model_config = SettingsConfigDict(
         env_file=".env",

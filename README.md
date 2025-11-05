@@ -12,6 +12,7 @@ A high-performance HTTP proxy server for IPTV content with **true live proxying*
 - 📡 **Continuous Streams**: Direct proxy for .ts, .mp4, .mkv, .webm, .avi files
 - 🔄 **Real-time URL Rewriting**: Automatic playlist modification for proxied content
 - 📱 **Full VOD Support**: Byte-range requests, seeking, multiple positions
+- 🎬 **Strict Live TS Mode**: Enhanced stability for live MPEG-TS with pre-buffering & circuit breaker
 
 ### Performance & Reliability
 - ⚡ **uvloop Integration**: 2-4x faster async I/O operations
@@ -400,72 +401,6 @@ python main.py
 python main.py --port 8002 --debug --reload
 ```
 
-## Architecture
-
-### Core Design Philosophy
-
-**Direct Per-Client Proxy** - Each client gets independent provider connections. No shared buffers, no buffering at all. True ephemeral architecture where provider connections exist only when actively serving a client.
-
-### Key Components
-
-1. **Stream Manager** (`src/stream_manager.py`)
-   - **Per-Client Direct Proxy**: Independent provider connection per client
-   - **Stream Type Detection**: Automatic HLS vs continuous stream identification
-   - **Seamless Failover**: <100ms transparent URL switching with connection handoff
-   - **Connection Pooling**: httpx client with optimized keepalive (20 connections)
-   - **Automatic Cleanup**: Instant connection closure on client disconnect
-
-2. **Stream Handling Approaches**
-
-   **Continuous Streams** (.ts, .mp4, .mkv direct files):
-   - Each client → Separate provider connection
-   - Direct byte-for-byte streaming (StreamingResponse)
-   - Zero buffering, zero shared state
-   - Failover per-client without affecting others
-   - Connection closes immediately when client stops
-
-   **HLS Streams** (playlists and segments):
-   - Playlist parsing and URL rewriting
-   - Segment proxying with connection pooling
-   - Efficient small-file handling
-   - Real-time playlist modification
-
-3. **FastAPI Application** (`src/api.py`)
-   - RESTful endpoints for all operations
-   - Client tracking and bandwidth monitoring
-   - Statistics aggregation and reporting
-   - Event emission for external monitoring
-
-### Data Models
-
-```python
-# Client tracking
-ClientInfo(
-    client_id: str,
-    stream_id: Optional[str],
-    user_agent: str,
-    ip_address: str,
-    first_seen: datetime,
-    last_seen: datetime,
-    bytes_served: int,
-    segments_served: int
-)
-
-# Stream information
-StreamInfo(
-    stream_id: str,
-    original_url: str,
-    current_url: str,
-    failover_urls: List[str],
-    client_count: int,
-    total_bytes_served: int,
-    total_segments_served: int,
-    error_count: int,
-    created_at: datetime,
-    last_access: datetime
-)
-```
-
 ## Troubleshooting
 
 ### Common Issues
@@ -560,6 +495,7 @@ python demo_events.py
 
 ## Additional Documentation
 
+- **[Strict Live TS Mode](docs/STRICT_LIVE_TS_MODE.md)** - Enhanced live stream stability
 - **[Architecture Overview](docs/ARCHITECTURE.md)** - System design and components
 - **[Event System](docs/EVENT_SYSTEM.md)** - Webhook notifications and events
 - **[Testing Guide](docs/TESTING.md)** - Test suite and development

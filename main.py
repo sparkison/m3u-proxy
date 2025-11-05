@@ -44,7 +44,8 @@ def main():
     else:
         logger.info("✓ Using standard asyncio (install uvloop for better performance)")
     logger.info("✓ Direct proxy architecture (per-client connections)")
-    logger.info("✓ Connection pooling enabled (HLS streams only)")
+    logger.info("✓ Transcoding support via FFmpeg")
+    logger.info("✓ Connection pooling enabled (HLS and Transcoded streams only)")
     logger.info("✓ Seamless failover support")
     if settings.RELOAD:
         logger.info("✓ Auto-reload is enabled.")

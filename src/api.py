@@ -1322,25 +1322,44 @@ async def delete_stream(stream_id: str):
 
 @app.post("/streams/{stream_id}/failover", dependencies=[Depends(verify_token)])
 async def trigger_failover(stream_id: str):
-    """Manually trigger failover for a stream"""
+    """Manually trigger failover for a stream - will seamlessly switch all active clients to the next failover URL"""
     try:
         if stream_id not in stream_manager.streams:
             raise HTTPException(status_code=404, detail="Stream not found")
 
-        # Update to next failover URL
-        success = await stream_manager._try_update_failover_url(stream_id)
+        stream_info = stream_manager.streams[stream_id]
+        
+        if not stream_info.failover_urls:
+            raise HTTPException(
+                status_code=400, 
+                detail="No failover URLs configured for this stream"
+            )
+
+        # Trigger failover which will:
+        # 1. Update current_url to next failover URL
+        # 2. Signal all active clients via failover_event
+        # 3. For transcoded streams, restart FFmpeg with new URL
+        # 4. Emit FAILOVER_TRIGGERED event
+        success = await stream_manager._try_update_failover_url(stream_id, "manual")
 
         if success:
-            stream_info = stream_manager.streams[stream_id]
             return {
-                "message": "Failover successful",
+                "message": "Failover triggered successfully - all clients will seamlessly reconnect",
                 "new_url": stream_info.current_url,
-                "failover_index": stream_info.current_failover_index
+                "failover_index": stream_info.current_failover_index,
+                "failover_attempts": stream_info.failover_attempts,
+                "active_clients": len(stream_info.connected_clients),
+                "stream_type": "Transcoded" if stream_info.is_transcoded else (
+                    "HLS" if stream_info.is_hls else (
+                        "VOD" if stream_info.is_vod else "Live Continuous"
+                    )
+                )
             }
         else:
-            return {
-                "message": "Failover failed - no working failover URLs available"
-            }, 500
+            raise HTTPException(
+                status_code=500,
+                detail="Failover failed - no working failover URLs available"
+            )
     except HTTPException:
         raise
     except Exception as e:

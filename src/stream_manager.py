@@ -593,6 +593,7 @@ class StreamManager:
 
                         # Check for failover event
                         if stream_info.failover_event.is_set():
+                            stream_info.failover_event.clear()  # Clear immediately to prevent infinite loop
                             logger.info(
                                 f"Failover detected for stream {stream_id}, reconnecting client {client_id}")
                             # Close current connection
@@ -916,6 +917,11 @@ class StreamManager:
                     # Get current URL (may have changed due to failover)
                     active_url = stream_info.current_url or stream_info.original_url
                     
+                    if failover_count > 0:
+                        logger.info(
+                            f"Starting failover attempt {failover_count}/{max_failovers} for client {client_id}, " +
+                            f"new URL: {active_url}")
+                    
                     # Get or create a shared transcoding process
                     stream_key, shared_process = await self.pooled_manager.get_or_create_shared_stream(
                         url=active_url,
@@ -970,10 +976,21 @@ class StreamManager:
                         # Check for failover event
                         if stream_info.failover_event.is_set():
                             logger.info(
-                                f"Failover detected for transcoded stream {stream_id}, reconnecting client {client_id}")
+                                f"Failover detected for transcoded stream {stream_id}, will reconnect client {client_id} to new URL: {stream_info.current_url}")
+                            
+                            # IMPORTANT: Clear the event immediately so other checks don't trigger
+                            # This prevents infinite loop where event keeps getting detected
+                            stream_info.failover_event.clear()
+                            
                             # Clean up current connection
                             if client_id and stream_key and self.pooled_manager:
-                                await self.pooled_manager.remove_client_from_stream(client_id)
+                                try:
+                                    await self.pooled_manager.remove_client_from_stream(client_id)
+                                    logger.info(f"Removed client {client_id} from old stream {stream_key}")
+                                except Exception as e:
+                                    logger.warning(f"Error removing client from old stream: {e}")
+                            # Clear the stream_key so we don't try to clean it up again
+                            stream_key = None
                             failover_count += 1
                             # Break inner loop to reconnect with new URL
                             break
@@ -1036,14 +1053,16 @@ class StreamManager:
                 except Exception as e:
                     logger.error(
                         f"Unexpected error during pooled transcoding for client {client_id}: {e}")
-                    raise
-                finally:
-                    # Clean up: remove client from the shared stream
-                    if client_id and stream_key and self.pooled_manager:
-                        try:
-                            await self.pooled_manager.remove_client_from_stream(client_id)
-                        except Exception:
-                            pass
+                    # Don't retry on unexpected exceptions
+                    break
+
+            # Final cleanup after all retries exhausted or normal completion
+            # Clean up: remove client from the shared stream
+            if client_id and stream_key and self.pooled_manager:
+                try:
+                    await self.pooled_manager.remove_client_from_stream(client_id)
+                except Exception:
+                    pass
 
             # Final client cleanup
             await self.cleanup_client(client_id)

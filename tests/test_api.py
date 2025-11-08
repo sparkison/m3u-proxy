@@ -170,6 +170,7 @@ class TestAPI:
 
     def test_delete_stream_exists(self, client, mock_stream_manager):
         mock_stream_manager.cleanup_client = AsyncMock()
+        mock_stream_manager._emit_event = AsyncMock()
         mock_stream_manager.stream_clients = {'test_stream_123': {'client1'}}
         mock_stream_manager.streams = {
             'test_stream_123': Mock(is_transcoded=False)

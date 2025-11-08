@@ -60,7 +60,7 @@ segment2.ts
         async def stop(self):
             return None
 
-        async def get_or_create_shared_stream(self, url, profile, ffmpeg_args, client_id, user_agent=None, headers=None):
+        async def get_or_create_shared_stream(self, url, profile, ffmpeg_args, client_id, user_agent=None, headers=None, stream_id=None):
             # Return a dummy stream key and our fake shared process
             return ('fake-stream-key', fake_shared)
 

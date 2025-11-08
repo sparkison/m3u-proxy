@@ -57,13 +57,13 @@ async def test_stream_manager_get_playlist_from_pooled_hls(monkeypatch):
 
     fake_shared = FakeShared(hls_dir, playlist_text)
 
-    async def fake_get_or_create_shared_stream(url, profile, ffmpeg_args, client_id, user_agent=None, headers=None):
+    async def fake_get_or_create_shared_stream(url, profile, ffmpeg_args, client_id, user_agent=None, headers=None, stream_id=None):
         return ('fakekey', fake_shared)
 
     # Attach a mocked pooled manager to the stream manager
     class FakePooled:
-        async def get_or_create_shared_stream(self, url, profile, ffmpeg_args, client_id, user_agent=None, headers=None):
-            return await fake_get_or_create_shared_stream(url, profile, ffmpeg_args, client_id, user_agent, headers)
+        async def get_or_create_shared_stream(self, url, profile, ffmpeg_args, client_id, user_agent=None, headers=None, stream_id=None):
+            return await fake_get_or_create_shared_stream(url, profile, ffmpeg_args, client_id, user_agent, headers, stream_id)
 
     sm.pooled_manager = FakePooled()
 

@@ -640,7 +640,7 @@ async def get_hls_playlist(
     client_id: Optional[str] = Query(
         None, description="Client ID (auto-generated if not provided)")
 ):
-    """Get HLS playlist for a stream"""
+    """Get HLS playlist for a stream (supports both direct proxy and transcoded HLS streams)"""
     try:
         # Generate or reuse client ID based on request characteristics
         # Use IP + User-Agent + Stream ID to create a consistent client ID
@@ -708,15 +708,19 @@ async def get_hls_playlist(
 
         base_proxy_url = f"{base.rstrip('/')}/hls/{stream_id}"
 
-        # Get processed playlist content
+        # Get processed playlist content (works for both direct HLS and transcoded HLS)
         content = await stream_manager.get_playlist_content(stream_id, client_id, base_proxy_url)
 
         if content is None:
             raise HTTPException(
                 status_code=503, detail="Playlist not available")
 
+        # Check if this is a transcoded stream for logging purposes
+        stream_info = stream_manager.streams.get(stream_id)
+        stream_type = "transcoded HLS" if stream_info and stream_info.is_transcoded else "direct HLS"
+        
         logger.info(
-            f"Serving playlist to client {client_id} for stream {stream_id}")
+            f"Serving {stream_type} playlist to client {client_id} for stream {stream_id}")
 
         response = Response(
             content=content, media_type="application/vnd.apple.mpegurl")
@@ -885,75 +889,8 @@ async def get_direct_stream(
             logger.info(
                 f"Using transcoded stream for {stream_id} with profile: {stream_info.transcode_profile}")
 
-            # Detect if transcoding args indicate HLS output
-            try:
-                args = stream_info.transcode_ffmpeg_args or []
-                lowered = [str(a).lower() for a in args]
-
-                # Detect explicit -f hls or -hls_time flags (output indicators)
-                is_hls_output = False
-                for i, token in enumerate(lowered):
-                    # explicit -f hls
-                    if token == '-f' and i + 1 < len(lowered) and lowered[i + 1] == 'hls':
-                        is_hls_output = True
-                        break
-                    # hls-specific flags
-                    if token.startswith('-hls_time') or token == '-hls_time':
-                        is_hls_output = True
-                        break
-                    # an output file ending with .m3u8 that is NOT an input (-i) token
-                    # we consider it an output only if the previous token is not '-i'
-                    if token.endswith('.m3u8'):
-                        prev = lowered[i - 1] if i - 1 >= 0 else ''
-                        # skip tokens that are input specs like '-i' or '-ihttp...'
-                        if prev != '-i' and not token.startswith('-i'):
-                            is_hls_output = True
-                            break
-            except Exception:
-                is_hls_output = False
-
-            if is_hls_output:
-                # Serve playlist directly instead of redirecting. Build base_proxy_url
-                public_url = getattr(settings, 'PUBLIC_URL', None)
-                port = getattr(settings, 'PORT', None) or 8085
-
-                if public_url:
-                    public_with_scheme = public_url if public_url.startswith(('http://', 'https://')) else f"http://{public_url}"
-                    parsed = urlparse(public_with_scheme)
-                    scheme = parsed.scheme or 'http'
-                    host = parsed.hostname or ''
-                    url_port = parsed.port
-                    path = parsed.path or ''
-
-                    if url_port:
-                        netloc = f"{host}:{url_port}"
-                    elif port:
-                        netloc = f"{host}:{port}"
-                    else:
-                        netloc = host
-
-                    base = f"{scheme}://{netloc}{path.rstrip('/')}"
-                else:
-                    base = f"http://localhost:{port}"
-
-                base_proxy_url = f"{base.rstrip('/')}/hls/{stream_id}"
-
-                content = await stream_manager.get_playlist_content(stream_id, client_id, base_proxy_url)
-                if content is None:
-                    raise HTTPException(status_code=503, detail="Playlist not available")
-
-                logger.info(f"Serving HLS playlist directly to client {client_id} for stream {stream_id}")
-
-                response = Response(content=content, media_type="application/vnd.apple.mpegurl")
-                response.headers["X-Client-ID"] = client_id
-                response.headers["X-Stream-ID"] = stream_id
-                response.headers["Access-Control-Allow-Origin"] = "*"
-                response.headers["Access-Control-Allow-Methods"] = "GET, HEAD, OPTIONS"
-                response.headers["Access-Control-Allow-Headers"] = "*"
-                response.headers["Access-Control-Expose-Headers"] = "*"
-                return response
-
-            # Non-HLS transcoded streams - use streamed transcoding path
+            # For transcoded streams outputting to pipe:1 or other non-HLS formats,
+            # use streamed transcoding path
             return await stream_manager.stream_transcoded(
                 stream_id,
                 client_id,

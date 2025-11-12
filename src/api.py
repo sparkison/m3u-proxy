@@ -680,6 +680,7 @@ async def get_hls_playlist(
         # PUBLIC_URL may be an IP, domain, or include a scheme (http/https) and/or port.
         public_url = getattr(settings, 'PUBLIC_URL', None)
         port = getattr(settings, 'PORT', None) or 8085
+        root_path = getattr(settings, 'ROOT_PATH', '')
 
         if public_url:
             # If PUBLIC_URL includes a scheme, respect it. Otherwise assume http.
@@ -692,6 +693,10 @@ async def get_hls_playlist(
             host = parsed.hostname or ''
             url_port = parsed.port
             path = parsed.path or ''
+
+            # If ROOT_PATH is already included in the PUBLIC_URL path, remove it to prevent duplication
+            if root_path and path.startswith(root_path):
+                path = path[len(root_path):]
 
             if url_port:
                 netloc = f"{host}:{url_port}"

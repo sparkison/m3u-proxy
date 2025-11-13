@@ -106,14 +106,21 @@ class SharedTranscodingProcess:
                     [f"{k}: {v}\r\n" for k, v in self.headers.items()])
                 ffmpeg_cmd.extend(["-headers", header_str])
 
-            # Process ffmpeg_args and replace input URL with self.url (for failover support)
-            # Find -i flag and replace the next arg with self.url
+            # Process ffmpeg_args and insert HLS-specific options right before -i flag
+            # For HLS inputs with extensionless segment URLs, we need special handling
             processed_args = []
+            is_hls_input = isinstance(self.url, str) and self.url.lower().endswith('.m3u8')
             i = 0
             while i < len(self.ffmpeg_args):
                 arg = self.ffmpeg_args[i]
                 if arg == "-i" and i + 1 < len(self.ffmpeg_args):
-                    # Found -i flag, add it and use self.url as the input
+                    # Found -i flag - inject HLS options right before it if needed
+                    if is_hls_input:
+                        # Add protocol whitelist to allow http/https URLs in playlists
+                        processed_args.extend(["-protocol_whitelist", "file,http,https,tcp,tls,crypto"])
+                        # Disable strict extension matching for HLS segments without file extensions
+                        processed_args.extend(["-extension_picky", "0"])
+                    # Add -i flag and use self.url as the input
                     processed_args.append(arg)
                     processed_args.append(self.url)  # Use current URL (updated during failover)
                     i += 2  # Skip the old URL in ffmpeg_args

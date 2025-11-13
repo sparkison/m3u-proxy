@@ -1357,6 +1357,7 @@ async def health_check():
         proxy_stats = stats["proxy_stats"]
         return {
             "status": "healthy",
+            "public_url": settings.PUBLIC_URL,
             "version": VERSION,
             "uptime_seconds": proxy_stats["uptime_seconds"],
             "active_streams": proxy_stats["active_streams"],

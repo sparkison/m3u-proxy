@@ -81,9 +81,20 @@ class SharedTranscodingProcess:
             # Create a per-stream directory for HLS segments
             try:
                 self.hls_dir = tempfile.mkdtemp(prefix=f"m3u_proxy_hls_{self.stream_id}_", dir=base_dir)
-            except Exception:
+                # Fix #6: Set explicit permissions to ensure NGINX can read segments
+                # rwxr-xr-x (755) allows owner full access, group/others can read/execute
+                try:
+                    os.chmod(self.hls_dir, 0o755)
+                except Exception as e:
+                    logger.warning(f"Failed to set permissions on HLS dir {self.hls_dir}: {e}")
+            except Exception as e:
                 # Fallback to system tempdir without dir param
+                logger.warning(f"Failed to create HLS dir in {base_dir}: {e}, falling back to system tempdir")
                 self.hls_dir = tempfile.mkdtemp(prefix=f"m3u_proxy_hls_{self.stream_id}_")
+                try:
+                    os.chmod(self.hls_dir, 0o755)
+                except Exception:
+                    pass
 
             logger.info(f"SharedTranscodingProcess {self.stream_id} will run in HLS mode, hls_dir={self.hls_dir}")
 
@@ -290,11 +301,22 @@ class SharedTranscodingProcess:
             logger.debug(f"HLS watch loop ended for {self.stream_id}: {e}")
 
     async def _log_stderr(self):
-        """Log FFmpeg stderr output"""
+        """Log FFmpeg stderr output and monitor for write errors"""
         if not self.process or not self.process.stderr:
             return
 
         try:
+            # Fix #8: Monitor FFmpeg stderr for write errors
+            error_patterns = [
+                'no space left on device',
+                'permission denied',
+                'i/o error',
+                'disk full',
+                'cannot write',
+                'failed to open',
+                'error writing',
+            ]
+
             while self.process and self.process.returncode is None:
                 line = await self.process.stderr.readline()
                 if not line:
@@ -304,6 +326,17 @@ class SharedTranscodingProcess:
                 if line_str:
                     # Log FFmpeg output (you could parse stats here)
                     logger.debug(f"FFmpeg [{self.stream_id}]: {line_str}")
+
+                    # Fix #8: Check for write errors
+                    line_lower = line_str.lower()
+                    for pattern in error_patterns:
+                        if pattern in line_lower:
+                            logger.error(
+                                f"FFmpeg write error detected for {self.stream_id}: {line_str}"
+                            )
+                            # Mark stream as failed to trigger cleanup
+                            self.status = "failed"
+                            break
 
         except Exception as e:
             logger.error(
@@ -394,38 +427,63 @@ class SharedTranscodingProcess:
         return self.status == "running" and self.process is not None
 
     async def cleanup(self):
-        """Clean up the FFmpeg process"""
-        if self.process and self.process.returncode is None:
-            logger.info(
-                f"Terminating shared FFmpeg process for stream {self.stream_id}")
-            try:
-                self.process.terminate()
-                await asyncio.wait_for(self.process.wait(), timeout=5.0)
-            except asyncio.TimeoutError:
-                logger.warning(
-                    f"FFmpeg process didn't terminate cleanly, killing it")
-                self.process.kill()
-                await self.process.wait()
-            except Exception as e:
-                logger.error(f"Error cleaning up FFmpeg process: {e}")
-
-        self.status = "stopped"
-        self.clients.clear()
-        # Remove HLS directory if present and empty
+        """Clean up the FFmpeg process and HLS directory"""
+        # Fix #5: Improved cleanup with better error handling and logging
         try:
-            if self.hls_dir and os.path.isdir(self.hls_dir):
-                # Attempt to remove files then dir
-                for fname in os.listdir(self.hls_dir):
-                    try:
-                        os.remove(os.path.join(self.hls_dir, fname))
-                    except Exception:
-                        pass
+            if self.process and self.process.returncode is None:
+                logger.info(
+                    f"Terminating shared FFmpeg process for stream {self.stream_id}")
                 try:
-                    os.rmdir(self.hls_dir)
-                except Exception:
-                    pass
+                    self.process.terminate()
+                    await asyncio.wait_for(self.process.wait(), timeout=5.0)
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        f"FFmpeg process didn't terminate cleanly, killing it")
+                    self.process.kill()
+                    await self.process.wait()
+                except Exception as e:
+                    logger.error(f"Error cleaning up FFmpeg process: {e}")
+
+            self.status = "stopped"
+            self.clients.clear()
+        finally:
+            # Fix #5: Always attempt HLS cleanup in finally block to ensure it runs even if FFmpeg cleanup fails
+            await self._cleanup_hls_directory()
+
+    async def _cleanup_hls_directory(self):
+        """Clean up HLS directory and all segments"""
+        if not self.hls_dir or not os.path.isdir(self.hls_dir):
+            return
+
+        try:
+            # Count files for logging
+            files = os.listdir(self.hls_dir)
+            file_count = len(files)
+
+            # Remove all files in the directory
+            removed_count = 0
+            failed_count = 0
+            for fname in files:
+                try:
+                    file_path = os.path.join(self.hls_dir, fname)
+                    os.remove(file_path)
+                    removed_count += 1
+                except Exception as e:
+                    failed_count += 1
+                    logger.warning(f"Failed to remove HLS file {fname}: {e}")
+
+            # Try to remove the directory itself
+            try:
+                os.rmdir(self.hls_dir)
+                logger.info(f"Cleaned up HLS directory for {self.stream_id}: removed {removed_count}/{file_count} files")
+            except OSError as e:
+                # Directory not empty or other error
+                logger.warning(f"Failed to remove HLS directory {self.hls_dir}: {e} ({failed_count} files failed to delete)")
+            except Exception as e:
+                logger.error(f"Unexpected error removing HLS directory {self.hls_dir}: {e}")
+
         except Exception as e:
-            logger.debug(f"Error cleaning up hls_dir for {self.stream_id}: {e}")
+            logger.error(f"Error cleaning up HLS directory for {self.stream_id}: {e}")
 
 
 class PooledStreamManager:
@@ -688,11 +746,13 @@ class PooledStreamManager:
             logger.error(f"Error cleaning up worker streams from Redis: {e}")
 
     async def _gc_hls_temp_dirs(self):
-        """Scan the system temp dir for leftover HLS directories and remove ones older than threshold.
+        """Scan the HLS temp dir for leftover HLS directories and remove stale ones.
+
+        Fix #3: Improved GC to avoid race conditions with active streams
+        Fix #4: Only delete empty directories to avoid conflicts with FFmpeg's own segment deletion
 
         We look for directories created with the prefix 'm3u_proxy_hls_' and remove them if they
-        are not currently in use by any active SharedTranscodingProcess and they have a
-        modification time older than hls_gc_age_threshold.
+        are not currently in use by any active SharedTranscodingProcess and meet cleanup criteria.
         """
         try:
             # Use configured HLS base dir (may be system tempdir by default)
@@ -709,10 +769,15 @@ class PooledStreamManager:
             # Iterate entries in tmpdir
             try:
                 entries = os.listdir(tmpdir)
-            except Exception:
+            except Exception as e:
+                logger.warning(f"Failed to list HLS temp directory {tmpdir}: {e}")
                 entries = []
 
             removed = 0
+            skipped_active = 0
+            skipped_not_empty = 0
+            skipped_too_young = 0
+
             for entry in entries:
                 if not entry.startswith(prefix):
                     continue
@@ -723,25 +788,52 @@ class PooledStreamManager:
 
                 # Skip any dir that's currently active
                 if full_path in active_dirs:
+                    skipped_active += 1
                     continue
 
-                # Determine age by mtime
+                # Fix #4: Only delete EMPTY directories
+                # FFmpeg handles segment deletion via -hls_delete_threshold
+                # We only clean up directories that are completely empty (stream ended)
+                try:
+                    dir_contents = os.listdir(full_path)
+                    if dir_contents:
+                        # Directory not empty - skip it
+                        # FFmpeg is still managing this directory or cleanup failed
+                        skipped_not_empty += 1
+                        continue
+                except Exception as e:
+                    logger.warning(f"Failed to check contents of {full_path}: {e}")
+                    continue
+
+                # Fix #3: Check age to avoid deleting recently-created directories
+                # Use mtime for empty directories (they won't be updated anymore)
                 try:
                     mtime = os.path.getmtime(full_path)
-                except Exception:
+                except Exception as e:
+                    logger.warning(f"Failed to get mtime for {full_path}: {e}")
                     continue
 
                 age = now - mtime
                 if age > self.hls_gc_age_threshold:
+                    # Directory is empty and old enough - safe to remove
                     try:
-                        shutil.rmtree(full_path)
+                        os.rmdir(full_path)  # Use rmdir instead of rmtree for safety (only works on empty dirs)
                         removed += 1
-                        logger.info(f"Removed stale HLS dir: {full_path}")
+                        logger.info(f"Removed empty stale HLS dir: {full_path} (age: {int(age)}s)")
+                    except OSError as e:
+                        # Directory not empty or permission error
+                        logger.warning(f"Failed to remove HLS dir {full_path}: {e}")
                     except Exception as e:
-                        logger.error(f"Failed to remove HLS dir {full_path}: {e}")
+                        logger.error(f"Unexpected error removing HLS dir {full_path}: {e}")
+                else:
+                    skipped_too_young += 1
 
-            if removed:
-                logger.info(f"HLS GC removed {removed} stale directories from {tmpdir}")
+            if removed or skipped_active or skipped_not_empty:
+                logger.info(
+                    f"HLS GC scan complete: removed {removed} empty dirs, "
+                    f"skipped {skipped_active} active, {skipped_not_empty} non-empty, "
+                    f"{skipped_too_young} too young (from {tmpdir})"
+                )
 
         except Exception as e:
             logger.error(f"Error while running HLS GC: {e}")

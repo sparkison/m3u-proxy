@@ -695,6 +695,7 @@ async def get_hls_playlist(
             path = parsed.path or ''
 
             # If ROOT_PATH is already included in the PUBLIC_URL path, remove it to prevent duplication
+            # We'll add it back later to ensure it's always present in the final URL
             if root_path and path.startswith(root_path):
                 path = path[len(root_path):]
 
@@ -707,9 +708,16 @@ async def get_hls_playlist(
 
             # Combine scheme, netloc, and any path from PUBLIC_URL (preserve sub-paths)
             base = f"{scheme}://{netloc}{path.rstrip('/')}"
+
+            # Add ROOT_PATH back to ensure segment URLs include the correct prefix for NGINX routing
+            if root_path:
+                base = f"{base}{root_path}"
         else:
             # Default to localhost with configured port (or 8085)
             base = f"http://localhost:{port}"
+            # Add ROOT_PATH if configured
+            if root_path:
+                base = f"{base}{root_path}"
 
         base_proxy_url = f"{base.rstrip('/')}/hls/{stream_id}"
 

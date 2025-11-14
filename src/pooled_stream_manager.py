@@ -129,8 +129,8 @@ class SharedTranscodingProcess:
                     if is_hls_input:
                         # Add protocol whitelist to allow http/https URLs in playlists
                         processed_args.extend(["-protocol_whitelist", "file,http,https,tcp,tls,crypto"])
-                        # Disable strict extension matching for HLS segments without file extensions
-                        processed_args.extend(["-extension_picky", "0"])
+                        # Note: -extension_picky is not a valid FFmpeg option and has been removed
+                        # FFmpeg handles HLS segment extensions automatically
                     # Add -i flag and use self.url as the input
                     processed_args.append(arg)
                     processed_args.append(self.url)  # Use current URL (updated during failover)

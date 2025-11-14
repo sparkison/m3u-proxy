@@ -14,7 +14,11 @@ import pytest
 
 @pytest.mark.asyncio
 async def test_hls_gc_removes_old_dirs():
-    """Create a fake HLS temp dir older than threshold and ensure GC removes it."""
+    """Create a fake HLS temp dir older than threshold and ensure GC removes it.
+    
+    Updated to match new GC behavior: only empty directories are removed.
+    FFmpeg handles segment deletion via -hls_delete_threshold.
+    """
     from pooled_stream_manager import PooledStreamManager
 
     # Instantiate manager first so we know which base dir GC will scan
@@ -26,9 +30,8 @@ async def test_hls_gc_removes_old_dirs():
     fake_path = os.path.join(tmpdir, fake_name)
     os.makedirs(fake_path, exist_ok=True)
 
-    # Create a dummy file inside
-    with open(os.path.join(fake_path, 'index.m3u8'), 'w') as fh:
-        fh.write('#EXTM3U\n')
+    # Don't create any files inside - the new GC only removes EMPTY directories
+    # This simulates a directory that was left behind after FFmpeg cleaned up its segments
 
     # Set mtime to an older time (2 hours ago)
     old_time = time.time() - (2 * 60 * 60)
@@ -43,5 +46,27 @@ async def test_hls_gc_removes_old_dirs():
     # Run GC
     await manager._gc_hls_temp_dirs()
 
-    # Directory should be removed
-    assert not os.path.exists(fake_path)
+    # Directory should be removed (since it's empty and old)
+    assert not os.path.exists(fake_path), "GC should remove empty old directories"
+
+    # Test that non-empty directories are NOT removed
+    # Create another old directory with content
+    fake_name_nonempty = f"m3u_proxy_hls_test_{int(time.time())}_{os.getpid()}_nonempty"
+    fake_path_nonempty = os.path.join(tmpdir, fake_name_nonempty)
+    os.makedirs(fake_path_nonempty, exist_ok=True)
+    
+    # Add a file
+    with open(os.path.join(fake_path_nonempty, 'segment.ts'), 'w') as fh:
+        fh.write('fake segment data')
+    
+    # Make it old
+    os.utime(fake_path_nonempty, (old_time, old_time))
+    
+    # Run GC again
+    await manager._gc_hls_temp_dirs()
+    
+    # Non-empty directory should still exist
+    assert os.path.exists(fake_path_nonempty), "GC should NOT remove non-empty directories"
+    
+    # Clean up
+    shutil.rmtree(fake_path_nonempty, ignore_errors=True)

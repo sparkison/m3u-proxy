@@ -72,8 +72,9 @@ async def test_stream_manager_get_playlist_from_pooled_hls(monkeypatch):
 
     assert processed is not None
     assert '#EXTM3U' in processed
-    # Since M3U8Processor rewrites segment URLs, we expect 'segment.ts?url=' in processed
-    assert 'segment.ts?url=' in processed or 'segment1.ts' in processed
+    # Since M3U8Processor rewrites segment URLs, we expect 'segment?url=' in processed
+    # (Note: Changed from 'segment.ts' to 'segment' to match actual API endpoint)
+    assert 'segment?url=' in processed or 'segment1.ts' in processed
 
 
 @pytest.mark.asyncio

@@ -47,6 +47,104 @@ def is_direct_stream(url: str) -> bool:
     return url.lower().endswith(('.ts', '.mp4', '.mkv', '.webm', '.avi'))
 
 
+def detect_https_from_headers(request: Request) -> bool:
+    """
+    Universal HTTPS detection from reverse proxy headers.
+
+    Works with all major reverse proxies:
+    - NGINX, Caddy, Traefik, Apache (X-Forwarded-Proto)
+    - Cloudflare, AWS ELB (X-Forwarded-Ssl)
+    - Microsoft IIS, Azure (Front-End-Https)
+    - RFC 7239 compliant proxies (Forwarded header)
+    - NGINX Proxy Manager, Tailscale, Headscale, Netbird, etc.
+
+    Returns True if HTTPS is detected, False otherwise.
+    """
+    # Debug logging (disabled by default - enable if needed for troubleshooting)
+    # logger.debug("=" * 80)
+    # logger.debug("🔍 DEBUG: ALL HEADERS RECEIVED BY m3u-proxy:")
+    # for header_name, header_value in request.headers.items():
+    #     logger.debug(f"  {header_name}: {header_value}")
+    # logger.debug("=" * 80)
+
+    # Check X-Forwarded-Proto (most common - NGINX, Caddy, Traefik, NPM)
+    forwarded_proto = request.headers.get("x-forwarded-proto")
+    if forwarded_proto and forwarded_proto.lower() == "https":
+        logger.debug("✅ Detected HTTPS via X-Forwarded-Proto: https")
+        return True
+
+    # Check X-Forwarded-Scheme (NGINX Proxy Manager, some reverse proxies)
+    # NPM sets this correctly even when X-Forwarded-Proto is wrong
+    forwarded_scheme = request.headers.get("x-forwarded-scheme")
+    if forwarded_scheme and forwarded_scheme.lower() == "https":
+        logger.debug("✅ Detected HTTPS via X-Forwarded-Scheme: https")
+        return True
+
+    # Check X-Forwarded-Ssl (Cloudflare, some load balancers)
+    forwarded_ssl = request.headers.get("x-forwarded-ssl")
+    if forwarded_ssl == "on":
+        logger.debug("✅ Detected HTTPS via X-Forwarded-Ssl: on")
+        return True
+
+    # Check Front-End-Https (Microsoft IIS, Azure)
+    frontend_https = request.headers.get("front-end-https")
+    if frontend_https == "on":
+        logger.debug("✅ Detected HTTPS via Front-End-Https: on")
+        return True
+
+    # Check Forwarded header (RFC 7239 standard)
+    forwarded = request.headers.get("forwarded")
+    if forwarded and "proto=https" in forwarded.lower():
+        logger.debug("✅ Detected HTTPS via Forwarded header (RFC 7239)")
+        return True
+
+    # Check X-Forwarded-Port (if 443, assume HTTPS)
+    forwarded_port = request.headers.get("x-forwarded-port")
+    if forwarded_port == "443":
+        logger.debug("✅ Detected HTTPS via X-Forwarded-Port: 443")
+        return True
+
+    # No HTTPS detected
+    logger.debug("No HTTPS headers detected - using HTTP")
+    return False
+
+
+def detect_reverse_proxy(request: Request) -> bool:
+    """
+    Detect if request is coming through a reverse proxy (HTTP or HTTPS).
+
+    Returns True if any reverse proxy headers are present, False otherwise.
+    This is used to determine whether to include the internal port in URLs.
+
+    When a reverse proxy is detected, we should NOT include the internal port
+    (e.g., :8085) in generated URLs because the reverse proxy handles the
+    external port mapping (e.g., :80 or :443).
+    """
+    # Check for any common reverse proxy headers
+    proxy_headers = [
+        "x-forwarded-for",
+        "x-forwarded-proto",
+        "x-forwarded-scheme",
+        "x-forwarded-host",
+        "x-forwarded-port",
+        "x-forwarded-ssl",
+        "x-real-ip",
+        "forwarded",
+        "front-end-https",
+        "cf-connecting-ip",  # Cloudflare
+        "true-client-ip",    # Cloudflare Enterprise
+        "x-original-forwarded-for",  # AWS ELB
+    ]
+
+    for header in proxy_headers:
+        if request.headers.get(header):
+            logger.debug(f"🔍 Reverse proxy detected via header: {header}")
+            return True
+
+    logger.debug("🔍 No reverse proxy headers detected - direct access")
+    return False
+
+
 def validate_url(url: str) -> str:
     """Validate URL format and security"""
     if not url or not url.strip():
@@ -688,6 +786,15 @@ async def get_hls_playlist(
             parsed = urlparse(public_with_scheme)
             scheme = parsed.scheme or 'http'
 
+            # ✅ UNIVERSAL FIX: Auto-detect HTTPS from reverse proxy headers
+            # This works with ALL major reverse proxies without requiring user configuration
+            https_detected = detect_https_from_headers(request)
+            if https_detected:
+                scheme = "https"
+
+            # Detect if request is coming through ANY reverse proxy (HTTP or HTTPS)
+            reverse_proxy_detected = detect_reverse_proxy(request)
+
             # Preserve hostname and path. If PUBLIC_URL provided an explicit port, use it;
             # otherwise fall back to settings.PORT when available.
             host = parsed.hostname or ''
@@ -699,11 +806,23 @@ async def get_hls_playlist(
             if root_path and path.startswith(root_path):
                 path = path[len(root_path):]
 
+            # ✅ FIX: When reverse proxy is detected, don't add internal port
+            # The reverse proxy handles the external port (443 for HTTPS, 80 for HTTP)
+            # Only use the internal port (8085) when:
+            # 1. PUBLIC_URL explicitly includes a port, OR
+            # 2. No reverse proxy is detected (direct access)
             if url_port:
+                # PUBLIC_URL explicitly includes a port - respect it
                 netloc = f"{host}:{url_port}"
-            elif port:
+            elif reverse_proxy_detected:
+                # Reverse proxy detected (HTTP or HTTPS) - use hostname only
+                # The reverse proxy handles the external port mapping
+                netloc = host
+            elif port and port != 80:
+                # Direct access with non-standard port - include port
                 netloc = f"{host}:{port}"
             else:
+                # Direct access with standard port 80 or no port specified
                 netloc = host
 
             # Combine scheme, netloc, and any path from PUBLIC_URL (preserve sub-paths)

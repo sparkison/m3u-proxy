@@ -109,6 +109,42 @@ def detect_https_from_headers(request: Request) -> bool:
     return False
 
 
+def detect_reverse_proxy(request: Request) -> bool:
+    """
+    Detect if request is coming through a reverse proxy (HTTP or HTTPS).
+
+    Returns True if any reverse proxy headers are present, False otherwise.
+    This is used to determine whether to include the internal port in URLs.
+
+    When a reverse proxy is detected, we should NOT include the internal port
+    (e.g., :8085) in generated URLs because the reverse proxy handles the
+    external port mapping (e.g., :80 or :443).
+    """
+    # Check for any common reverse proxy headers
+    proxy_headers = [
+        "x-forwarded-for",
+        "x-forwarded-proto",
+        "x-forwarded-scheme",
+        "x-forwarded-host",
+        "x-forwarded-port",
+        "x-forwarded-ssl",
+        "x-real-ip",
+        "forwarded",
+        "front-end-https",
+        "cf-connecting-ip",  # Cloudflare
+        "true-client-ip",    # Cloudflare Enterprise
+        "x-original-forwarded-for",  # AWS ELB
+    ]
+
+    for header in proxy_headers:
+        if request.headers.get(header):
+            logger.debug(f"🔍 Reverse proxy detected via header: {header}")
+            return True
+
+    logger.debug("🔍 No reverse proxy headers detected - direct access")
+    return False
+
+
 def validate_url(url: str) -> str:
     """Validate URL format and security"""
     if not url or not url.strip():
@@ -756,6 +792,9 @@ async def get_hls_playlist(
             if https_detected:
                 scheme = "https"
 
+            # Detect if request is coming through ANY reverse proxy (HTTP or HTTPS)
+            reverse_proxy_detected = detect_reverse_proxy(request)
+
             # Preserve hostname and path. If PUBLIC_URL provided an explicit port, use it;
             # otherwise fall back to settings.PORT when available.
             host = parsed.hostname or ''
@@ -767,7 +806,7 @@ async def get_hls_playlist(
             if root_path and path.startswith(root_path):
                 path = path[len(root_path):]
 
-            # ✅ FIX: When HTTPS is detected via reverse proxy headers, don't add internal port
+            # ✅ FIX: When reverse proxy is detected, don't add internal port
             # The reverse proxy handles the external port (443 for HTTPS, 80 for HTTP)
             # Only use the internal port (8085) when:
             # 1. PUBLIC_URL explicitly includes a port, OR
@@ -775,14 +814,15 @@ async def get_hls_playlist(
             if url_port:
                 # PUBLIC_URL explicitly includes a port - respect it
                 netloc = f"{host}:{url_port}"
-            elif https_detected:
-                # HTTPS detected via reverse proxy - use hostname only (standard port 443)
+            elif reverse_proxy_detected:
+                # Reverse proxy detected (HTTP or HTTPS) - use hostname only
+                # The reverse proxy handles the external port mapping
                 netloc = host
             elif port and port != 80:
-                # HTTP direct access with non-standard port - include port
+                # Direct access with non-standard port - include port
                 netloc = f"{host}:{port}"
             else:
-                # HTTP with standard port 80 or no port specified
+                # Direct access with standard port 80 or no port specified
                 netloc = host
 
             # Combine scheme, netloc, and any path from PUBLIC_URL (preserve sub-paths)

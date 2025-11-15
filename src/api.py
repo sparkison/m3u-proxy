@@ -688,6 +688,13 @@ async def get_hls_playlist(
             parsed = urlparse(public_with_scheme)
             scheme = parsed.scheme or 'http'
 
+            # ✅ FIX: Respect X-Forwarded-Proto header from reverse proxy (for SSL/TLS termination)
+            # This allows m3u-proxy to detect HTTPS when behind a reverse proxy with SSL
+            forwarded_proto = request.headers.get("x-forwarded-proto")
+            if forwarded_proto and forwarded_proto.lower() in ('http', 'https'):
+                scheme = forwarded_proto.lower()
+                logger.debug(f"Using X-Forwarded-Proto: {scheme} for HLS playlist URLs")
+
             # Preserve hostname and path. If PUBLIC_URL provided an explicit port, use it;
             # otherwise fall back to settings.PORT when available.
             host = parsed.hostname or ''

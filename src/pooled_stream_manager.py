@@ -80,23 +80,28 @@ class SharedTranscodingProcess:
 
             # Create a per-stream directory for HLS segments
             try:
-                self.hls_dir = tempfile.mkdtemp(prefix=f"m3u_proxy_hls_{self.stream_id}_", dir=base_dir)
+                self.hls_dir = tempfile.mkdtemp(
+                    prefix=f"m3u_proxy_hls_{self.stream_id}_", dir=base_dir)
                 # Fix #6: Set explicit permissions to ensure NGINX can read segments
                 # rwxr-xr-x (755) allows owner full access, group/others can read/execute
                 try:
                     os.chmod(self.hls_dir, 0o755)
                 except Exception as e:
-                    logger.warning(f"Failed to set permissions on HLS dir {self.hls_dir}: {e}")
+                    logger.warning(
+                        f"Failed to set permissions on HLS dir {self.hls_dir}: {e}")
             except Exception as e:
                 # Fallback to system tempdir without dir param
-                logger.warning(f"Failed to create HLS dir in {base_dir}: {e}, falling back to system tempdir")
-                self.hls_dir = tempfile.mkdtemp(prefix=f"m3u_proxy_hls_{self.stream_id}_")
+                logger.warning(
+                    f"Failed to create HLS dir in {base_dir}: {e}, falling back to system tempdir")
+                self.hls_dir = tempfile.mkdtemp(
+                    prefix=f"m3u_proxy_hls_{self.stream_id}_")
                 try:
                     os.chmod(self.hls_dir, 0o755)
                 except Exception:
                     pass
 
-            logger.info(f"SharedTranscodingProcess {self.stream_id} will run in HLS mode, hls_dir={self.hls_dir}")
+            logger.info(
+                f"SharedTranscodingProcess {self.stream_id} will run in HLS mode, hls_dir={self.hls_dir}")
 
     async def start_process(self):
         """Start the FFmpeg process"""
@@ -120,7 +125,8 @@ class SharedTranscodingProcess:
             # Process ffmpeg_args and insert HLS-specific options right before -i flag
             # For HLS inputs with extensionless segment URLs, we need special handling
             processed_args = []
-            is_hls_input = isinstance(self.url, str) and self.url.lower().endswith('.m3u8')
+            is_hls_input = isinstance(
+                self.url, str) and self.url.lower().endswith('.m3u8')
             i = 0
             while i < len(self.ffmpeg_args):
                 arg = self.ffmpeg_args[i]
@@ -128,26 +134,30 @@ class SharedTranscodingProcess:
                     # Found -i flag - inject HLS options right before it if needed
                     if is_hls_input:
                         # Add protocol whitelist to allow http/https URLs in playlists
-                        processed_args.extend(["-protocol_whitelist", "file,http,https,tcp,tls,crypto"])
-                        # Enable following HTTP redirects for HLS streams  
-                        processed_args.extend(["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "2"])
+                        processed_args.extend(
+                            ["-protocol_whitelist", "file,http,https,tcp,tls,crypto"])
+                        # Enable following HTTP redirects for HLS streams
+                        processed_args.extend(
+                            ["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "2"])
                         # Disable extension checking to allow extensionless segment URLs (FFmpeg 7 only, removed in FFmpeg 8)
                         processed_args.extend(["-extension_picky", "false"])
                     # Add -i flag and use self.url as the input
                     processed_args.append(arg)
-                    processed_args.append(self.url)  # Use current URL (updated during failover)
+                    # Use current URL (updated during failover)
+                    processed_args.append(self.url)
                     i += 2  # Skip the old URL in ffmpeg_args
                 else:
                     processed_args.append(arg)
                     i += 1
-            
+
             ffmpeg_cmd.extend(processed_args)
 
             # If HLS mode, ensure we write to the hls_dir index.m3u8
             if self.mode == 'hls':
                 # If the ffmpeg args already include an output filename, respect it
                 # Otherwise append the playlist target into the hls dir
-                playlist_path = os.path.join(self.hls_dir if self.hls_dir else tempfile.gettempdir(), 'index.m3u8')
+                playlist_path = os.path.join(
+                    self.hls_dir if self.hls_dir else tempfile.gettempdir(), 'index.m3u8')
                 # If ffmpeg_args already specify an output playlist, replace any m3u8 token with absolute path
                 replaced = False
                 for i, token in enumerate(ffmpeg_cmd):
@@ -172,7 +182,8 @@ class SharedTranscodingProcess:
 
                 if not replaced:
                     # Remove any pipe outputs which are inappropriate for file-based HLS output
-                    ffmpeg_cmd = [t for t in ffmpeg_cmd if not (isinstance(t, str) and t.startswith('pipe:'))]
+                    ffmpeg_cmd = [t for t in ffmpeg_cmd if not (
+                        isinstance(t, str) and t.startswith('pipe:'))]
                     # Append absolute playlist path as the intended HLS output
                     ffmpeg_cmd.append(playlist_path)
 
@@ -205,7 +216,8 @@ class SharedTranscodingProcess:
                     self._broadcast_loop())
             else:
                 # In HLS mode, start a small watcher task to update last_chunk_time
-                self._broadcaster_task = asyncio.create_task(self._hls_watch_loop())
+                self._broadcaster_task = asyncio.create_task(
+                    self._hls_watch_loop())
 
             return True
 
@@ -418,7 +430,7 @@ class SharedTranscodingProcess:
                 f"FFmpeg process for stream {self.stream_id} is None but status is running")
             self.status = "failed"
             return False
-        
+
         # Check if no output for too long (indicates stuck process)
         if time.time() - self.last_chunk_time > self.output_timeout:
             logger.warning(
@@ -477,15 +489,19 @@ class SharedTranscodingProcess:
             # Try to remove the directory itself
             try:
                 os.rmdir(self.hls_dir)
-                logger.info(f"Cleaned up HLS directory for {self.stream_id}: removed {removed_count}/{file_count} files")
+                logger.info(
+                    f"Cleaned up HLS directory for {self.stream_id}: removed {removed_count}/{file_count} files")
             except OSError as e:
                 # Directory not empty or other error
-                logger.warning(f"Failed to remove HLS directory {self.hls_dir}: {e} ({failed_count} files failed to delete)")
+                logger.warning(
+                    f"Failed to remove HLS directory {self.hls_dir}: {e} ({failed_count} files failed to delete)")
             except Exception as e:
-                logger.error(f"Unexpected error removing HLS directory {self.hls_dir}: {e}")
+                logger.error(
+                    f"Unexpected error removing HLS directory {self.hls_dir}: {e}")
 
         except Exception as e:
-            logger.error(f"Error cleaning up HLS directory for {self.stream_id}: {e}")
+            logger.error(
+                f"Error cleaning up HLS directory for {self.stream_id}: {e}")
 
 
 class PooledStreamManager:
@@ -516,8 +532,11 @@ class PooledStreamManager:
         self.stream_key_to_id: Dict[str, str] = {}
 
         # Configuration
-        self.cleanup_interval = int(getattr(settings, 'CLEANUP_INTERVAL', 60))      # seconds - how often to run cleanup loop
-        self.heartbeat_interval = int(getattr(settings, 'HEARTBEAT_INTERVAL', 30))  # seconds - Redis worker heartbeat
+        # seconds - how often to run cleanup loop
+        self.cleanup_interval = int(getattr(settings, 'CLEANUP_INTERVAL', 60))
+        # seconds - Redis worker heartbeat
+        self.heartbeat_interval = int(
+            getattr(settings, 'HEARTBEAT_INTERVAL', 30))
         # seconds - fallback timeout for streams with no clients
         self.stream_timeout = int(getattr(settings, 'STREAM_TIMEOUT', 300))
         # Default 30 seconds - timeout for inactive clients
@@ -527,12 +546,14 @@ class PooledStreamManager:
         # How often to scan filesystem for stale HLS dirs (seconds)
         self.hls_gc_interval = int(getattr(settings, 'HLS_GC_INTERVAL', 600))
         # Age threshold for removing HLS dirs (seconds)
-        self.hls_gc_age_threshold = int(getattr(settings, 'HLS_GC_AGE_THRESHOLD', 60 * 60))
+        self.hls_gc_age_threshold = int(
+            getattr(settings, 'HLS_GC_AGE_THRESHOLD', 60 * 60))
         # Track last time GC ran so we can respect hls_gc_interval cadence
         self._last_hls_gc_run = 0
         # Base directory for HLS per-stream output. If settings.HLS_TEMP_DIR is not set,
         # fall back to the system tempdir used by tempfile.gettempdir()
-        self.hls_base_dir = getattr(settings, 'HLS_TEMP_DIR', None) or tempfile.gettempdir()
+        self.hls_base_dir = getattr(
+            settings, 'HLS_TEMP_DIR', None) or tempfile.gettempdir()
 
         # Tasks
         self._cleanup_task: Optional[asyncio.Task] = None
@@ -673,7 +694,7 @@ class PooledStreamManager:
     async def _cleanup_local_process(self, stream_key: str, emit_event: bool = False):
         """
         Clean up a specific local process.
-        
+
         Args:
             stream_key: The key identifying the transcoding process
             emit_event: Whether to emit stream_stopped event (default: False)
@@ -758,7 +779,8 @@ class PooledStreamManager:
         """
         try:
             # Use configured HLS base dir (may be system tempdir by default)
-            tmpdir = getattr(self, 'hls_base_dir', None) or tempfile.gettempdir()
+            tmpdir = getattr(self, 'hls_base_dir',
+                             None) or tempfile.gettempdir()
             prefix = "m3u_proxy_hls_"
             now = time.time()
 
@@ -772,7 +794,8 @@ class PooledStreamManager:
             try:
                 entries = os.listdir(tmpdir)
             except Exception as e:
-                logger.warning(f"Failed to list HLS temp directory {tmpdir}: {e}")
+                logger.warning(
+                    f"Failed to list HLS temp directory {tmpdir}: {e}")
                 entries = []
 
             removed = 0
@@ -804,7 +827,8 @@ class PooledStreamManager:
                         skipped_not_empty += 1
                         continue
                 except Exception as e:
-                    logger.warning(f"Failed to check contents of {full_path}: {e}")
+                    logger.warning(
+                        f"Failed to check contents of {full_path}: {e}")
                     continue
 
                 # Fix #3: Check age to avoid deleting recently-created directories
@@ -819,14 +843,18 @@ class PooledStreamManager:
                 if age > self.hls_gc_age_threshold:
                     # Directory is empty and old enough - safe to remove
                     try:
-                        os.rmdir(full_path)  # Use rmdir instead of rmtree for safety (only works on empty dirs)
+                        # Use rmdir instead of rmtree for safety (only works on empty dirs)
+                        os.rmdir(full_path)
                         removed += 1
-                        logger.info(f"Removed empty stale HLS dir: {full_path} (age: {int(age)}s)")
+                        logger.info(
+                            f"Removed empty stale HLS dir: {full_path} (age: {int(age)}s)")
                     except OSError as e:
                         # Directory not empty or permission error
-                        logger.warning(f"Failed to remove HLS dir {full_path}: {e}")
+                        logger.warning(
+                            f"Failed to remove HLS dir {full_path}: {e}")
                     except Exception as e:
-                        logger.error(f"Unexpected error removing HLS dir {full_path}: {e}")
+                        logger.error(
+                            f"Unexpected error removing HLS dir {full_path}: {e}")
                 else:
                     skipped_too_young += 1
 

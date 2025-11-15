@@ -60,58 +60,52 @@ def detect_https_from_headers(request: Request) -> bool:
 
     Returns True if HTTPS is detected, False otherwise.
     """
-    # 🔍 DEBUG: Log ALL headers received by m3u-proxy
-    logger.warning("=" * 80)
-    logger.warning("🔍 DEBUG: ALL HEADERS RECEIVED BY m3u-proxy:")
-    for header_name, header_value in request.headers.items():
-        logger.warning(f"  {header_name}: {header_value}")
-    logger.warning("=" * 80)
+    # Debug logging (disabled by default - enable if needed for troubleshooting)
+    # logger.debug("=" * 80)
+    # logger.debug("🔍 DEBUG: ALL HEADERS RECEIVED BY m3u-proxy:")
+    # for header_name, header_value in request.headers.items():
+    #     logger.debug(f"  {header_name}: {header_value}")
+    # logger.debug("=" * 80)
 
     # Check X-Forwarded-Proto (most common - NGINX, Caddy, Traefik, NPM)
     forwarded_proto = request.headers.get("x-forwarded-proto")
-    logger.warning(f"🔍 X-Forwarded-Proto = '{forwarded_proto}'")
     if forwarded_proto and forwarded_proto.lower() == "https":
-        logger.warning("✅ Detected HTTPS via X-Forwarded-Proto: https")
+        logger.debug("✅ Detected HTTPS via X-Forwarded-Proto: https")
         return True
 
     # Check X-Forwarded-Scheme (NGINX Proxy Manager, some reverse proxies)
     # NPM sets this correctly even when X-Forwarded-Proto is wrong
     forwarded_scheme = request.headers.get("x-forwarded-scheme")
-    logger.warning(f"🔍 X-Forwarded-Scheme = '{forwarded_scheme}'")
     if forwarded_scheme and forwarded_scheme.lower() == "https":
-        logger.warning("✅ Detected HTTPS via X-Forwarded-Scheme: https")
+        logger.debug("✅ Detected HTTPS via X-Forwarded-Scheme: https")
         return True
 
     # Check X-Forwarded-Ssl (Cloudflare, some load balancers)
     forwarded_ssl = request.headers.get("x-forwarded-ssl")
-    logger.warning(f"🔍 X-Forwarded-Ssl = '{forwarded_ssl}'")
     if forwarded_ssl == "on":
-        logger.warning("✅ Detected HTTPS via X-Forwarded-Ssl: on")
+        logger.debug("✅ Detected HTTPS via X-Forwarded-Ssl: on")
         return True
 
     # Check Front-End-Https (Microsoft IIS, Azure)
     frontend_https = request.headers.get("front-end-https")
-    logger.warning(f"🔍 Front-End-Https = '{frontend_https}'")
     if frontend_https == "on":
-        logger.warning("✅ Detected HTTPS via Front-End-Https: on")
+        logger.debug("✅ Detected HTTPS via Front-End-Https: on")
         return True
 
     # Check Forwarded header (RFC 7239 standard)
     forwarded = request.headers.get("forwarded")
-    logger.warning(f"🔍 Forwarded = '{forwarded}'")
     if forwarded and "proto=https" in forwarded.lower():
-        logger.warning("✅ Detected HTTPS via Forwarded header (RFC 7239)")
+        logger.debug("✅ Detected HTTPS via Forwarded header (RFC 7239)")
         return True
 
     # Check X-Forwarded-Port (if 443, assume HTTPS)
     forwarded_port = request.headers.get("x-forwarded-port")
-    logger.warning(f"🔍 X-Forwarded-Port = '{forwarded_port}'")
     if forwarded_port == "443":
-        logger.warning("✅ Detected HTTPS via X-Forwarded-Port: 443")
+        logger.debug("✅ Detected HTTPS via X-Forwarded-Port: 443")
         return True
 
     # No HTTPS detected
-    logger.warning("❌ NO HTTPS DETECTED - Defaulting to HTTP")
+    logger.debug("No HTTPS headers detected - using HTTP")
     return False
 
 

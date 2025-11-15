@@ -752,7 +752,8 @@ async def get_hls_playlist(
 
             # ✅ UNIVERSAL FIX: Auto-detect HTTPS from reverse proxy headers
             # This works with ALL major reverse proxies without requiring user configuration
-            if detect_https_from_headers(request):
+            https_detected = detect_https_from_headers(request)
+            if https_detected:
                 scheme = "https"
 
             # Preserve hostname and path. If PUBLIC_URL provided an explicit port, use it;
@@ -766,11 +767,22 @@ async def get_hls_playlist(
             if root_path and path.startswith(root_path):
                 path = path[len(root_path):]
 
+            # ✅ FIX: When HTTPS is detected via reverse proxy headers, don't add internal port
+            # The reverse proxy handles the external port (443 for HTTPS, 80 for HTTP)
+            # Only use the internal port (8085) when:
+            # 1. PUBLIC_URL explicitly includes a port, OR
+            # 2. No reverse proxy is detected (direct access)
             if url_port:
+                # PUBLIC_URL explicitly includes a port - respect it
                 netloc = f"{host}:{url_port}"
-            elif port:
+            elif https_detected:
+                # HTTPS detected via reverse proxy - use hostname only (standard port 443)
+                netloc = host
+            elif port and port != 80:
+                # HTTP direct access with non-standard port - include port
                 netloc = f"{host}:{port}"
             else:
+                # HTTP with standard port 80 or no port specified
                 netloc = host
 
             # Combine scheme, netloc, and any path from PUBLIC_URL (preserve sub-paths)

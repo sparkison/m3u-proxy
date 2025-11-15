@@ -47,6 +47,50 @@ def is_direct_stream(url: str) -> bool:
     return url.lower().endswith(('.ts', '.mp4', '.mkv', '.webm', '.avi'))
 
 
+def detect_https_from_headers(request: Request) -> bool:
+    """
+    Universal HTTPS detection from reverse proxy headers.
+
+    Works with all major reverse proxies:
+    - NGINX, Caddy, Traefik, Apache (X-Forwarded-Proto)
+    - Cloudflare, AWS ELB (X-Forwarded-Ssl)
+    - Microsoft IIS, Azure (Front-End-Https)
+    - RFC 7239 compliant proxies (Forwarded header)
+    - NGINX Proxy Manager, Tailscale, Headscale, Netbird, etc.
+
+    Returns True if HTTPS is detected, False otherwise.
+    """
+    # Check X-Forwarded-Proto (most common - NGINX, Caddy, Traefik, NPM)
+    forwarded_proto = request.headers.get("x-forwarded-proto")
+    if forwarded_proto and forwarded_proto.lower() == "https":
+        logger.debug("Detected HTTPS via X-Forwarded-Proto: https")
+        return True
+
+    # Check X-Forwarded-Ssl (Cloudflare, some load balancers)
+    if request.headers.get("x-forwarded-ssl") == "on":
+        logger.debug("Detected HTTPS via X-Forwarded-Ssl: on")
+        return True
+
+    # Check Front-End-Https (Microsoft IIS, Azure)
+    if request.headers.get("front-end-https") == "on":
+        logger.debug("Detected HTTPS via Front-End-Https: on")
+        return True
+
+    # Check Forwarded header (RFC 7239 standard)
+    forwarded = request.headers.get("forwarded")
+    if forwarded and "proto=https" in forwarded.lower():
+        logger.debug("Detected HTTPS via Forwarded header (RFC 7239)")
+        return True
+
+    # Check X-Forwarded-Port (if 443, assume HTTPS)
+    if request.headers.get("x-forwarded-port") == "443":
+        logger.debug("Detected HTTPS via X-Forwarded-Port: 443")
+        return True
+
+    # No HTTPS detected
+    return False
+
+
 def validate_url(url: str) -> str:
     """Validate URL format and security"""
     if not url or not url.strip():
@@ -688,12 +732,10 @@ async def get_hls_playlist(
             parsed = urlparse(public_with_scheme)
             scheme = parsed.scheme or 'http'
 
-            # ✅ FIX: Respect X-Forwarded-Proto header from reverse proxy (for SSL/TLS termination)
-            # This allows m3u-proxy to detect HTTPS when behind a reverse proxy with SSL
-            forwarded_proto = request.headers.get("x-forwarded-proto")
-            if forwarded_proto and forwarded_proto.lower() in ('http', 'https'):
-                scheme = forwarded_proto.lower()
-                logger.debug(f"Using X-Forwarded-Proto: {scheme} for HLS playlist URLs")
+            # ✅ UNIVERSAL FIX: Auto-detect HTTPS from reverse proxy headers
+            # This works with ALL major reverse proxies without requiring user configuration
+            if detect_https_from_headers(request):
+                scheme = "https"
 
             # Preserve hostname and path. If PUBLIC_URL provided an explicit port, use it;
             # otherwise fall back to settings.PORT when available.

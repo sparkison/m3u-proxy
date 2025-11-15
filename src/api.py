@@ -74,6 +74,14 @@ def detect_https_from_headers(request: Request) -> bool:
         logger.warning("✅ Detected HTTPS via X-Forwarded-Proto: https")
         return True
 
+    # Check X-Forwarded-Scheme (NGINX Proxy Manager, some reverse proxies)
+    # NPM sets this correctly even when X-Forwarded-Proto is wrong
+    forwarded_scheme = request.headers.get("x-forwarded-scheme")
+    logger.warning(f"🔍 X-Forwarded-Scheme = '{forwarded_scheme}'")
+    if forwarded_scheme and forwarded_scheme.lower() == "https":
+        logger.warning("✅ Detected HTTPS via X-Forwarded-Scheme: https")
+        return True
+
     # Check X-Forwarded-Ssl (Cloudflare, some load balancers)
     forwarded_ssl = request.headers.get("x-forwarded-ssl")
     logger.warning(f"🔍 X-Forwarded-Ssl = '{forwarded_ssl}'")

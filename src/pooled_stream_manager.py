@@ -166,7 +166,6 @@ class SharedTranscodingProcess:
                     has_hls_segment_type = any('-hls_segment_type' in str(arg) for arg in ffmpeg_cmd)
                     has_g = any(str(arg) == '-g' for arg in ffmpeg_cmd)
                     has_sc_threshold = any('-sc_threshold' in str(arg) for arg in ffmpeg_cmd)
-                    has_force_key_frames = any('-force_key_frames' in str(arg) for arg in ffmpeg_cmd)
 
                     # Only add LL-HLS options if they're not already present
                     ll_hls_options = []
@@ -198,10 +197,6 @@ class SharedTranscodingProcess:
 
                     if not has_sc_threshold:
                         ll_hls_options.extend(['-sc_threshold', '0'])
-
-                    if not has_force_key_frames:
-                        segment_duration = int(os.getenv('LL_HLS_SEGMENT_DURATION', '2'))
-                        ll_hls_options.extend(['-force_key_frames', f'expr:gte(t,n_forced*{segment_duration})'])
 
                     # Insert LL-HLS options before the output file
                     # Find the last occurrence of an option flag (starts with -)

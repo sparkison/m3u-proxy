@@ -16,9 +16,6 @@ RUN echo "@edge https://dl-cdn.alpinelinux.org/alpine/edge/main" >> /etc/apk/rep
     py3-pip \
     py3-virtualenv
 
-# Create symlink for python command
-RUN ln -s /usr/bin/python3 /usr/bin/python
-
 # Set working directory
 WORKDIR /app
 

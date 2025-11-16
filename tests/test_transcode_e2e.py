@@ -94,4 +94,5 @@ segment2.ts
     assert playlist_resp.status_code == 200, playlist_resp.text
     assert "#EXTM3U" in playlist_resp.text
     # Ensure that the content was processed (segment proxy URLs should exist)
-    assert "segment.ts?url=" in playlist_resp.text or "segment1.ts" in playlist_resp.text
+    # Note: Changed from 'segment.ts?url=' to 'segment?url=' to match actual API endpoint
+    assert "segment?url=" in playlist_resp.text or "segment1.ts" in playlist_resp.text

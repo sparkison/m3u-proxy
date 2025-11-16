@@ -141,6 +141,10 @@ class SharedTranscodingProcess:
                             ["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "2"])
                         # Disable extension checking to allow extensionless segment URLs
                         processed_args.extend(["-extension_picky", "false"])
+                        # Reduce input probing to speed up stream start and prevent buffering
+                        processed_args.extend(["-probesize", "32768", "-analyzeduration", "1000000"])
+                        # Add real-time flag to prevent FFmpeg from reading ahead
+                        processed_args.extend(["-re"])
                     # Add -i flag and use self.url as the input
                     processed_args.append(arg)
                     # Use current URL (updated during failover)

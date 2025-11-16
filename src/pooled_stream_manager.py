@@ -149,6 +149,26 @@ class SharedTranscodingProcess:
                     processed_args.append(arg)
                     # Use current URL (updated during failover)
                     processed_args.append(self.url)
+
+                    # Add stream mapping if transcoding (not copy mode)
+                    # Check if this is a transcoding profile (has -c:v or -c:a that's not 'copy')
+                    is_transcoding = False
+                    for j, cmd_arg in enumerate(self.ffmpeg_args):
+                        if cmd_arg in ['-c:v', '-c:a'] and j + 1 < len(self.ffmpeg_args):
+                            if self.ffmpeg_args[j + 1] not in ['copy', 'Copy']:
+                                is_transcoding = True
+                                break
+
+                    # Only add stream mapping for transcoding profiles
+                    if is_transcoding:
+                        # Check if user already specified -map
+                        has_map = any(str(a) == '-map' for a in self.ffmpeg_args)
+                        if not has_map:
+                            # Map all video and audio streams
+                            # The '?' makes audio optional - won't fail if no audio exists
+                            processed_args.extend(['-map', '0:v:0', '-map', '0:a:0?'])
+                            logger.debug(f"Added stream mapping for transcoding profile: -map 0:v:0 -map 0:a:0?")
+
                     i += 2  # Skip the old URL in ffmpeg_args
                 else:
                     processed_args.append(arg)

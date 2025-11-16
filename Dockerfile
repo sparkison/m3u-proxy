@@ -1,17 +1,21 @@
-FROM linuxserver/ffmpeg:7.1.1
+FROM alpine:3.21.3
 
-# Install Python and system dependencies
-RUN apt-get update && apt-get install -y \
-    # Add common utilities
+# Add Alpine edge repository for FFmpeg 8.0
+RUN echo "@edge https://dl-cdn.alpinelinux.org/alpine/edge/community" >> /etc/apk/repositories
+
+# Install FFmpeg 8.0 and system dependencies
+RUN apk update && apk --no-cache add \
+    # FFmpeg 8.0 from Alpine edge
+    ffmpeg@edge \
+    # Common utilities
     pciutils \
     wget \
     nano \
+    curl \
     # Python dependencies
     python3 \
-    python3-pip \
-    python3-venv \
-    curl \
-    && rm -rf /var/lib/apt/lists/*
+    py3-pip \
+    py3-virtualenv
 
 # Create symlink for python command
 RUN ln -s /usr/bin/python3 /usr/bin/python
@@ -21,7 +25,8 @@ WORKDIR /app
 
 # Copy requirements and install Python dependencies
 COPY requirements.txt .
-RUN python3 -m pip install --no-cache-dir -r requirements.txt --break-system-packages
+RUN python3 -m venv /app/venv && \
+    /app/venv/bin/pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
 COPY src/ ./src/

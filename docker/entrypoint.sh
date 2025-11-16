@@ -45,7 +45,7 @@ fi
 
 # Start the Python application
 echo "🚀 Starting m3u-proxy application..."
-python3 main.py &
+/app/venv/bin/python main.py &
 app_pid=$!
 echo "✅ m3u-proxy started with PID $app_pid"
 pids+=("$app_pid")

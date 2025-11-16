@@ -139,7 +139,7 @@ class SharedTranscodingProcess:
                         # Enable following HTTP redirects for HLS streams
                         processed_args.extend(
                             ["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "2"])
-                        # Disable extension checking to allow extensionless segment URLs (FFmpeg 7 only, removed in FFmpeg 8)
+                        # Disable extension checking to allow extensionless segment URLs
                         processed_args.extend(["-extension_picky", "false"])
                     # Add -i flag and use self.url as the input
                     processed_args.append(arg)

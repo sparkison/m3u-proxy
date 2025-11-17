@@ -59,7 +59,7 @@ def detect_https_from_headers(request: Request) -> bool:
     - NGINX Proxy Manager, Tailscale, Headscale, Netbird, etc.
 
     Returns True if HTTPS is detected, False otherwise.
-    
+
     IMPORTANT: Only trusts forwarded headers if the request came through a reverse proxy.
     If the client connects directly (no X-Forwarded-For), use the actual request scheme.
     """
@@ -73,17 +73,18 @@ def detect_https_from_headers(request: Request) -> bool:
     # First check: Is this a direct connection or through a reverse proxy?
     # If X-Forwarded-For is NOT present, the client connected directly to us
     has_forwarded_for = request.headers.get("x-forwarded-for") is not None
-    
+
     if not has_forwarded_for:
         # Direct connection - use the actual request scheme, ignore forwarded headers
         # These headers might be set by a previous layer but don't represent THIS connection
         actual_scheme = request.url.scheme
         is_https = actual_scheme == "https"
-        logger.debug(f"🔌 Direct connection detected (no X-Forwarded-For) - using actual scheme: {actual_scheme}")
+        logger.debug(
+            f"🔌 Direct connection detected (no X-Forwarded-For) - using actual scheme: {actual_scheme}")
         return is_https
 
     # Request came through a reverse proxy - trust the forwarded headers
-    
+
     # Check X-Forwarded-Proto (most common - NGINX, Caddy, Traefik, NPM)
     forwarded_proto = request.headers.get("x-forwarded-proto")
     if forwarded_proto and forwarded_proto.lower() == "https":
@@ -205,7 +206,8 @@ class StreamCreateRequest(BaseModel):
     user_agent: Optional[str] = None
     metadata: Optional[dict] = None
     headers: Optional[Dict[str, str]] = None
-    strict_live_ts: Optional[bool] = None  # Enable Strict Live TS Mode for this stream
+    # Enable Strict Live TS Mode for this stream
+    strict_live_ts: Optional[bool] = None
 
     @field_validator('url')
     @classmethod
@@ -364,7 +366,7 @@ def get_client_info(request: Request):
     elif request.client:
         # Fallback to direct connection IP
         ip_address = request.client.host
-    
+
     return {
         "user_agent": request.headers.get("user-agent") or "unknown",
         "ip_address": ip_address
@@ -799,7 +801,8 @@ async def get_hls_playlist(
 
         if public_url:
             # If PUBLIC_URL includes a scheme, respect it. Otherwise assume http.
-            public_with_scheme = public_url if public_url.startswith(('http://', 'https://')) else f"http://{public_url}"
+            public_with_scheme = public_url if public_url.startswith(
+                ('http://', 'https://')) else f"http://{public_url}"
             parsed = urlparse(public_with_scheme)
             scheme = parsed.scheme or 'http'
 
@@ -867,7 +870,7 @@ async def get_hls_playlist(
         # Check if this is a transcoded stream for logging purposes
         stream_info = stream_manager.streams.get(stream_id)
         stream_type = "transcoded HLS" if stream_info and stream_info.is_transcoded else "direct HLS"
-        
+
         logger.info(
             f"Serving {stream_type} playlist to client {client_id} for stream {stream_id}")
 
@@ -1069,7 +1072,7 @@ async def head_direct_stream(
         None, description="Client ID (auto-generated if not provided)")
 ):
     """Handle HEAD requests for direct streams (needed for MP4 duration/seeking)
-    
+
     In Strict Live TS Mode, this returns quickly without upstream hits for live TS streams.
     """
     try:
@@ -1091,7 +1094,7 @@ async def head_direct_stream(
         if strict_mode_enabled and stream_info.is_live_continuous:
             logger.info(
                 f"STRICT MODE: HEAD request for live TS stream {stream_id} - returning quick response without upstream hit")
-            
+
             response_headers = {
                 "Content-Type": content_type,
                 "Accept-Ranges": "none",  # Live streams don't support ranges
@@ -1104,7 +1107,7 @@ async def head_direct_stream(
                 "Access-Control-Expose-Headers": "*",
                 "Connection": "keep-alive"
             }
-            
+
             # Do NOT include Content-Length for live streams
             return Response(
                 content=None,
@@ -1454,10 +1457,10 @@ async def trigger_failover(stream_id: str):
             raise HTTPException(status_code=404, detail="Stream not found")
 
         stream_info = stream_manager.streams[stream_id]
-        
+
         if not stream_info.failover_urls:
             raise HTTPException(
-                status_code=400, 
+                status_code=400,
                 detail="No failover URLs configured for this stream"
             )
 

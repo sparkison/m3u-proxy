@@ -143,8 +143,14 @@ class SharedTranscodingProcess:
                         processed_args.extend(["-extension_picky", "false"])
                         # Reduce input probing to speed up stream start and prevent buffering
                         processed_args.extend(["-probesize", "32768", "-analyzeduration", "1000000"])
-                        # Add real-time flag to prevent FFmpeg from reading ahead
-                        processed_args.extend(["-re"])
+                        # NOTE: Do NOT add -re flag for HLS input when output is also HLS
+                        # The -re flag causes VBV underflow with HLS muxer because:
+                        # 1. HLS input is already real-time
+                        # 2. HLS muxer buffers segments before writing
+                        # 3. -re + HLS buffering = double throttling = encoder can't maintain CBR
+                        # Only add -re for non-HLS output formats (MPEG-TS, etc.)
+                        if self.mode != 'hls':
+                            processed_args.extend(["-re"])
                     # Add -i flag and use self.url as the input
                     processed_args.append(arg)
                     # Use current URL (updated during failover)

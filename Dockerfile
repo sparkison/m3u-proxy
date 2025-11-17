@@ -1,4 +1,4 @@
-FROM linuxserver/ffmpeg:7.1.1
+FROM linuxserver/ffmpeg:latest
 
 # Install Python and system dependencies
 RUN apt-get update && apt-get install -y \

@@ -59,6 +59,9 @@ def detect_https_from_headers(request: Request) -> bool:
     - NGINX Proxy Manager, Tailscale, Headscale, Netbird, etc.
 
     Returns True if HTTPS is detected, False otherwise.
+    
+    IMPORTANT: Only trusts forwarded headers if the request came through a reverse proxy.
+    If the client connects directly (no X-Forwarded-For), use the actual request scheme.
     """
     # Debug logging (disabled by default - enable if needed for troubleshooting)
     # logger.debug("=" * 80)
@@ -67,6 +70,20 @@ def detect_https_from_headers(request: Request) -> bool:
     #     logger.debug(f"  {header_name}: {header_value}")
     # logger.debug("=" * 80)
 
+    # First check: Is this a direct connection or through a reverse proxy?
+    # If X-Forwarded-For is NOT present, the client connected directly to us
+    has_forwarded_for = request.headers.get("x-forwarded-for") is not None
+    
+    if not has_forwarded_for:
+        # Direct connection - use the actual request scheme, ignore forwarded headers
+        # These headers might be set by a previous layer but don't represent THIS connection
+        actual_scheme = request.url.scheme
+        is_https = actual_scheme == "https"
+        logger.debug(f"🔌 Direct connection detected (no X-Forwarded-For) - using actual scheme: {actual_scheme}")
+        return is_https
+
+    # Request came through a reverse proxy - trust the forwarded headers
+    
     # Check X-Forwarded-Proto (most common - NGINX, Caddy, Traefik, NPM)
     forwarded_proto = request.headers.get("x-forwarded-proto")
     if forwarded_proto and forwarded_proto.lower() == "https":

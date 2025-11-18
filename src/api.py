@@ -5,6 +5,7 @@ from contextlib import asynccontextmanager
 import logging
 import uuid
 import hashlib
+import subprocess
 from urllib.parse import unquote, urlparse
 from typing import Optional, List, Dict
 from pydantic import BaseModel, field_validator, ValidationError
@@ -21,6 +22,25 @@ from hwaccel import hw_accel
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+def get_ffmpeg_version() -> Optional[str]:
+    """Get the ffmpeg version string"""
+    try:
+        result = subprocess.run(
+            ['ffmpeg', '-version'],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        if result.returncode == 0:
+            # Extract the version from first line (e.g., "ffmpeg version 4.4.2")
+            first_line = result.stdout.split('\n')[0]
+            return first_line.strip()
+        return None
+    except (subprocess.TimeoutExpired, FileNotFoundError, Exception) as e:
+        logger.warning(f"Failed to get ffmpeg version: {e}")
+        return None
 
 
 def get_content_type(url: str) -> str:
@@ -438,6 +458,7 @@ async def get_info():
     # Build the info response
     info = {
         "version": VERSION,
+        "ffmpeg_version": get_ffmpeg_version(),
         "hardware_acceleration": {
             "enabled": hw_accel.is_available(),
             "type": hw_accel.get_type(),

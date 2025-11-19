@@ -1111,6 +1111,30 @@ class StreamManager:
                             raise HTTPException(
                                 status_code=500, detail="Failed to get a valid transcoding process")
 
+                    # Wait briefly to allow FFmpeg to start and stderr monitor to detect immediate input errors
+                    # This is especially important for connection errors (DNS failures, 404s, etc.)
+                    await asyncio.sleep(0.5)
+                    
+                    # Check if the process failed due to input errors (detected by stderr monitor)
+                    if hasattr(shared_process, 'status') and shared_process.status == "input_failed":
+                        if stream_info.failover_urls and failover_count < max_failovers:
+                            logger.warning(
+                                f"Transcoding process failed due to input error, attempting failover")
+                            # Clean up failed process
+                            if self.pooled_manager:
+                                try:
+                                    await self.pooled_manager.force_stop_stream(stream_key)
+                                except Exception:
+                                    pass
+                            await self._try_update_failover_url(stream_id, "transcode_input_error")
+                            failover_count += 1
+                            continue
+                        else:
+                            raise HTTPException(
+                                status_code=503,
+                                detail="Transcoding process failed due to input error"
+                            )
+
                     # Verify the process is actually running
                     if shared_process.process.returncode is not None:
                         if stream_info.failover_urls and failover_count < max_failovers:
@@ -1141,6 +1165,27 @@ class StreamManager:
                             logger.info(
                                 f"Transcoded streaming cancelled for client {client_id} by external request")
                             return
+
+                        # Check if the transcoding process failed due to input error during streaming
+                        if hasattr(shared_process, 'status') and shared_process.status == "input_failed":
+                            if stream_info.failover_urls and failover_count < max_failovers:
+                                logger.warning(
+                                    f"Transcoding process encountered input error during streaming, triggering failover")
+                                # Clean up current connection
+                                if client_id and stream_key and self.pooled_manager:
+                                    try:
+                                        await self.pooled_manager.remove_client_from_stream(client_id)
+                                        await self.pooled_manager.force_stop_stream(stream_key)
+                                    except Exception as e:
+                                        logger.warning(f"Error cleaning up failed stream: {e}")
+                                stream_key = None
+                                await self._try_update_failover_url(stream_id, "transcode_runtime_input_error")
+                                failover_count += 1
+                                break
+                            else:
+                                logger.error(
+                                    f"Transcoding failed due to input error and no failover available")
+                                return
 
                         # Check for failover event
                         if stream_info.failover_event.is_set():
@@ -1498,47 +1543,68 @@ class StreamManager:
                 logger.error(
                     f"Error retrieving transcoded playlist from pooled manager: {e}")
 
-        try:
-            logger.info(f"Fetching HLS playlist from: {current_url}")
-            headers = {'User-Agent': stream_info.user_agent}
-            headers.update(stream_info.headers)
-            response = await self.http_client.get(current_url, headers=headers)
-            response.raise_for_status()
+        # Try to fetch the playlist with automatic failover support
+        max_attempts = len(stream_info.failover_urls) + 1 if stream_info.failover_urls else 1
+        attempt = 0
+        last_error = None
 
-            content = response.text
-            final_url = str(response.url)
-            stream_info.final_playlist_url = final_url
+        while attempt < max_attempts:
+            try:
+                logger.info(f"Fetching HLS playlist from: {current_url} (attempt {attempt + 1}/{max_attempts})")
+                headers = {'User-Agent': stream_info.user_agent}
+                headers.update(stream_info.headers)
+                response = await self.http_client.get(current_url, headers=headers)
+                response.raise_for_status()
 
-            parsed_url = urlparse(final_url)
-            base_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
-            if parsed_url.path:
-                path_parts = parsed_url.path.rsplit('/', 1)
-                if len(path_parts) > 1:
-                    base_url += path_parts[0] + '/'
+                content = response.text
+                final_url = str(response.url)
+                stream_info.final_playlist_url = final_url
+
+                parsed_url = urlparse(final_url)
+                base_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
+                if parsed_url.path:
+                    path_parts = parsed_url.path.rsplit('/', 1)
+                    if len(path_parts) > 1:
+                        base_url += path_parts[0] + '/'
+                    else:
+                        base_url += '/'
                 else:
                     base_url += '/'
-            else:
-                base_url += '/'
 
-            # Pass stream_id as parent for variant playlists, unless this is already a variant
-            parent_id = stream_id if not stream_info.is_variant_stream else stream_info.parent_stream_id
-            processor = M3U8Processor(
-                base_proxy_url, client_id, stream_info.user_agent, final_url, parent_stream_id=parent_id)
-            processed_content = processor.process_playlist(
-                content, base_proxy_url, base_url)
+                # Pass stream_id as parent for variant playlists, unless this is already a variant
+                parent_id = stream_id if not stream_info.is_variant_stream else stream_info.parent_stream_id
+                processor = M3U8Processor(
+                    base_proxy_url, client_id, stream_info.user_agent, final_url, parent_stream_id=parent_id)
+                processed_content = processor.process_playlist(
+                    content, base_proxy_url, base_url)
 
-            stream_info.last_access = datetime.now(timezone.utc)
-            if client_id in self.clients:
-                self.clients[client_id].last_access = datetime.now(
-                    timezone.utc)
+                stream_info.last_access = datetime.now(timezone.utc)
+                if client_id in self.clients:
+                    self.clients[client_id].last_access = datetime.now(
+                        timezone.utc)
 
-            return processed_content
+                return processed_content
 
-        except Exception as e:
-            logger.error(
-                f"Error fetching playlist for stream {stream_id}: {e}")
-            stream_info.error_count += 1
-            return None
+            except Exception as e:
+                last_error = e
+                logger.error(
+                    f"Error fetching playlist for stream {stream_id}: {e}")
+                stream_info.error_count += 1
+                
+                # Try failover if available and not the last attempt
+                if stream_info.failover_urls and attempt < max_attempts - 1:
+                    logger.info(f"Attempting failover for playlist fetch (attempt {attempt + 1}/{max_attempts})")
+                    failover_success = await self._try_update_failover_url(stream_id, f"playlist_fetch_error_{type(e).__name__}")
+                    if failover_success:
+                        current_url = stream_info.current_url
+                        attempt += 1
+                        continue
+                
+                # No failover available or failover failed
+                attempt += 1
+                if attempt >= max_attempts:
+                    logger.error(f"Failed to fetch playlist after {max_attempts} attempts. Last error: {last_error}")
+                    return None
 
     async def proxy_hls_segment(
         self,

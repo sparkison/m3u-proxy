@@ -338,13 +338,13 @@ class SharedTranscodingProcess:
             logger.debug(f"HLS watch loop ended for {self.stream_id}: {e}")
 
     async def _log_stderr(self):
-        """Log FFmpeg stderr output and monitor for write errors"""
+        """Log FFmpeg stderr output and monitor for write errors and input failures"""
         if not self.process or not self.process.stderr:
             return
 
         try:
-            # Fix #8: Monitor FFmpeg stderr for write errors
-            error_patterns = [
+            # Monitor FFmpeg stderr for various error conditions
+            write_error_patterns = [
                 'no space left on device',
                 'permission denied',
                 'i/o error',
@@ -352,6 +352,20 @@ class SharedTranscodingProcess:
                 'cannot write',
                 'failed to open',
                 'error writing',
+            ]
+
+            # Input/connection error patterns that should trigger failover
+            input_error_patterns = [
+                'error opening input',
+                'failed to resolve hostname',
+                'connection refused',
+                'connection timed out',
+                'input/output error',
+                'server returned 4',  # Matches 403, 404, etc.
+                'server returned 5',  # Matches 500, 502, 503, etc.
+                'invalid data found',
+                'protocol not found',
+                'end of file',
             ]
 
             while self.process and self.process.returncode is None:
@@ -364,15 +378,26 @@ class SharedTranscodingProcess:
                     # Log FFmpeg output (you could parse stats here)
                     logger.debug(f"FFmpeg [{self.stream_id}]: {line_str}")
 
-                    # Fix #8: Check for write errors
                     line_lower = line_str.lower()
-                    for pattern in error_patterns:
+
+                    # Check for write errors
+                    for pattern in write_error_patterns:
                         if pattern in line_lower:
                             logger.error(
                                 f"FFmpeg write error detected for {self.stream_id}: {line_str}"
                             )
                             # Mark stream as failed to trigger cleanup
                             self.status = "failed"
+                            break
+
+                    # Check for input/connection errors that should trigger failover
+                    for pattern in input_error_patterns:
+                        if pattern in line_lower:
+                            logger.error(
+                                f"FFmpeg input error detected for {self.stream_id}: {line_str}"
+                            )
+                            # Mark stream as failed due to input error
+                            self.status = "input_failed"
                             break
 
         except Exception as e:

@@ -8,6 +8,7 @@ services:
     volumes:
       - /tmp/m3u-proxy-streams:/tmp/m3u-proxy-streams
       - ./logs:/app/logs
+      - ./static:/app/static
       - ./.env:/app/.env
     environment:
       - PYTHONPATH=/app

@@ -28,6 +28,9 @@ COPY src/ ./src/
 COPY main.py .
 COPY .env.example .env
 
+# Copy static files (logo and favicon)
+COPY static/ ./static/
+
 # Copy Docker scripts
 COPY docker/ ./docker/
 

@@ -1,6 +1,8 @@
 from fastapi import FastAPI, HTTPException, Query, Response, Request, Depends, Header
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, HTMLResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.openapi.docs import get_swagger_ui_html
 from contextlib import asynccontextmanager
 import logging
 import uuid
@@ -10,6 +12,7 @@ from urllib.parse import unquote, urlparse
 from typing import Optional, List, Dict
 from pydantic import BaseModel, field_validator, ValidationError
 from datetime import datetime, timezone
+import os
 
 from stream_manager import StreamManager
 from events import EventManager
@@ -85,7 +88,7 @@ def detect_https_from_headers(request: Request) -> bool:
     """
     # Debug logging (disabled by default - enable if needed for troubleshooting)
     # logger.debug("=" * 80)
-    # logger.debug("🔍 DEBUG: ALL HEADERS RECEIVED BY m3u-proxy:")
+    # logger.debug("🔍 DEBUG: ALL HEADERS RECEIVED BY m3u proxy:")
     # for header_name, header_value in request.headers.items():
     #     logger.debug(f"  {header_name}: {header_value}")
     # logger.debug("=" * 80)
@@ -324,7 +327,7 @@ event_manager = EventManager()
 async def lifespan(app: FastAPI):
     """Lifespan context manager for startup and shutdown events"""
     # Startup
-    logger.info("m3u-proxy starting up...")
+    logger.info("m3u proxy starting up...")
     await event_manager.start()
 
     # Connect event manager to stream manager
@@ -344,23 +347,34 @@ async def lifespan(app: FastAPI):
     yield
 
     # Shutdown
-    logger.info("m3u-proxy shutting down...")
+    logger.info("m3u proxy shutting down...")
     await stream_manager.stop()
     await event_manager.stop()
 
 
 app = FastAPI(
-    title="m3u-proxy",
+    title="m3u proxy",
     version=VERSION,
     description="Advanced IPTV streaming proxy with client management, stats, and failover support",
     lifespan=lifespan,
     root_path=settings.ROOT_PATH if hasattr(settings, 'ROOT_PATH') else "",
-    docs_url=settings.DOCS_URL if hasattr(settings, 'DOCS_URL') else "/docs",
+    docs_url=None,  # We'll create a minimal custom docs with logo/favicon
+    # docs_url=settings.DOCS_URL if hasattr(settings, 'DOCS_URL') else "/docs",
     redoc_url=settings.REDOC_URL if hasattr(
         settings, 'REDOC_URL') else "/redoc",
     openapi_url=settings.OPENAPI_URL if hasattr(
         settings, 'OPENAPI_URL') else "/openapi.json",
 )
+
+# Mount static files for logo and favicon
+# Get the parent directory of src/ to access root-level static files
+static_path = os.path.join(os.path.dirname(
+    os.path.dirname(os.path.abspath(__file__))), "static")
+# If static directory doesn't exist in the expected location, try the actual root
+if not os.path.exists(static_path):
+    static_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+app.mount("/static", StaticFiles(directory=static_path), name="static")
 
 # Configure CORS to allow all origins for streaming compatibility
 app.add_middleware(
@@ -371,6 +385,71 @@ app.add_middleware(
     allow_headers=["*"],  # Allow all headers
     expose_headers=["*"],  # Expose all headers to the client
 )
+
+
+# Minimal custom Swagger UI with logo and favicon
+@app.get("/docs", include_in_schema=False)
+async def custom_swagger_ui_html():
+    """Minimal custom Swagger UI with logo and favicon"""
+    return HTMLResponse(f"""
+<!DOCTYPE html>
+<html>
+<head>
+    <title>{app.title}</title>
+    <link rel="icon" type="image/svg+xml" href="{app.root_path}/static/favicon.svg">
+    <link rel="icon" type="image/png" href="{app.root_path}/static/favicon.png">
+    <link rel="shortcut icon" href="{app.root_path}/static/favicon.ico">
+    <link rel="stylesheet" type="text/css" href="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui.css">
+    <style>
+        .topbar {{ display: none; }}
+        .swagger-ui .info .title {{ display: flex; align-items: center; gap: 15px; }}
+        .custom-logo {{ height: 45px; width: auto; }}
+    </style>
+</head>
+<body>
+    <div id="swagger-ui"></div>
+    <script src="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui-bundle.js"></script>
+    <script>
+    const ui = SwaggerUIBundle({{
+        url: '{app.root_path}{app.openapi_url}',
+        dom_id: '#swagger-ui',
+        deepLinking: true,
+        showExtensions: true,
+        showCommonExtensions: true,
+        presets: [
+            SwaggerUIBundle.presets.apis,
+            SwaggerUIBundle.SwaggerUIStandalonePreset
+        ],
+        layout: "BaseLayout",
+        onComplete: function() {{
+            const title = document.querySelector('.info .title');
+            if (title && !document.querySelector('.custom-logo')) {{
+                const logo = document.createElement('img');
+                logo.src = '{app.root_path}/static/logo.svg';
+                logo.alt = '{app.title}';
+                logo.className = 'custom-logo';
+                title.insertBefore(logo, title.firstChild);
+            }}
+        }}
+    }});
+    </script>
+</body>
+</html>
+    """)
+
+
+# Serve favicon directly at root for browsers
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon():
+    """Serve favicon for browsers"""
+    favicon_path = os.path.join(static_path, "favicon.ico")
+    if os.path.exists(favicon_path):
+        return FileResponse(favicon_path)
+    # Fallback to SVG if ICO doesn't exist
+    favicon_svg = os.path.join(static_path, "favicon.svg")
+    if os.path.exists(favicon_svg):
+        return FileResponse(favicon_svg, media_type="image/svg+xml")
+    raise HTTPException(status_code=404, detail="Favicon not found")
 
 
 def get_client_info(request: Request):
@@ -438,7 +517,7 @@ async def root():
     proxy_stats = stats["proxy_stats"]
     return {
         "status": "running",
-        "message": "m3u-proxy is running",
+        "message": "m3u proxy is running",
         "version": VERSION,
         "uptime": proxy_stats["uptime_seconds"],
         "stats": proxy_stats
@@ -448,7 +527,7 @@ async def root():
 @app.get("/info", dependencies=[Depends(verify_token)])
 async def get_info():
     """
-    Get comprehensive information about the m3u-proxy server configuration and capabilities.
+    Get comprehensive information about the m3u proxy server configuration and capabilities.
     Includes hardware acceleration status, Redis pooling, transcoding profiles, and other details.
     """
     redis_config = get_redis_config()

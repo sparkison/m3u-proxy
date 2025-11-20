@@ -1,4 +1,4 @@
-# m3u-proxy
+# m3u proxy
 
 A high-performance HTTP proxy server for IPTV content with **true live proxying**, per-client connection management, and seamless failover support. Built with FastAPI and optimized for efficiency.
 

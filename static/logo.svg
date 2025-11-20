@@ -2,8 +2,8 @@
 <svg id="Layer_1" data-name="Layer 1" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 221.19 221.19">
   <defs>
     <linearGradient id="linear-gradient" x1="16.04" y1="162.24" x2="189.09" y2="67.7" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#ff2056"/>
-      <stop offset=".37" stop-color="#b3509f"/>
+      <stop offset="0" stop-color="#22c55e"/>
+      <stop offset=".37" stop-color="#10b981"/>
       <stop offset=".81" stop-color="#4f39f6"/>
     </linearGradient>
   </defs>

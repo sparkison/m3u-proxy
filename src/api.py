@@ -372,9 +372,25 @@ static_path = os.path.join(os.path.dirname(
     os.path.dirname(os.path.abspath(__file__))), "static")
 # If static directory doesn't exist in the expected location, try the actual root
 if not os.path.exists(static_path):
-    static_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    # Fallback to /app/static for Docker or current working directory
+    static_path = os.path.join(os.getcwd(), "static")
+    if not os.path.exists(static_path):
+        # Last resort: try parent directory
+        static_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-app.mount("/static", StaticFiles(directory=static_path), name="static")
+# Verify static path exists and log it
+if os.path.exists(static_path):
+    logger.info(f"✅ Static files directory found: {static_path}")
+    # List files in static directory for debugging
+    try:
+        static_files = os.listdir(static_path)
+        logger.info(f"📁 Static files available: {', '.join(static_files)}")
+    except Exception as e:
+        logger.warning(f"Could not list static directory: {e}")
+else:
+    logger.error(f"❌ Static files directory NOT found at: {static_path}")
+    logger.error(f"Current working directory: {os.getcwd()}")
+    logger.error(f"Script directory: {os.path.dirname(os.path.abspath(__file__))}")
 
 # Configure CORS to allow all origins for streaming compatibility
 app.add_middleware(
@@ -436,6 +452,25 @@ async def custom_swagger_ui_html():
 </body>
 </html>
     """)
+
+
+# Serve static files explicitly (works with root_path)
+@app.get("/static/{filename:path}", include_in_schema=False)
+async def serve_static_file(filename: str):
+    """Serve static files like logo and favicon"""
+    file_path = os.path.join(static_path, filename)
+    if os.path.exists(file_path) and os.path.isfile(file_path):
+        # Determine media type based on extension
+        if filename.endswith('.svg'):
+            media_type = 'image/svg+xml'
+        elif filename.endswith('.png'):
+            media_type = 'image/png'
+        elif filename.endswith('.ico'):
+            media_type = 'image/x-icon'
+        else:
+            media_type = None
+        return FileResponse(file_path, media_type=media_type)
+    raise HTTPException(status_code=404, detail=f"Static file not found: {filename}")
 
 
 # Serve favicon directly at root for browsers

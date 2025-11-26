@@ -49,7 +49,8 @@ def get_ffmpeg_version() -> Optional[str]:
 def get_content_type(url: str) -> str:
     """Determine content type based on URL extension"""
     url_lower = url.lower()
-    if url_lower.endswith('.ts'):
+    # profile=pass is set by the TVHeadend "Pass" Profile. Maybe needs more tuning if the Source doesnt deliver MPEG-TS
+    if url_lower.endswith('.ts') or url_lower.endswith('?profile=pass'):
         return 'video/mp2t'
     elif url_lower.endswith('.m3u8'):
         return 'application/vnd.apple.mpegurl'

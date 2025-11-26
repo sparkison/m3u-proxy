@@ -954,7 +954,8 @@ class StreamManager:
             await self.cleanup_client(client_id)
 
         # Determine content type
-        if current_url.endswith('.ts') or '/live/' in current_url:
+        # Add `or current_url.endswith('?profile=pass')` to handle TVHeadend passthrough URLs
+        if current_url.endswith('.ts') or '/live/' in current_url or current_url.endswith('?profile=pass'):
             content_type = "video/mp2t"
         elif current_url.endswith('.mp4'):
             content_type = "video/mp4"

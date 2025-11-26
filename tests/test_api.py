@@ -21,7 +21,7 @@ class TestHelperFunctions:
         assert get_content_type("video.mkv") == "video/x-matroska"
         assert get_content_type("video.webm") == "video/webm"
         assert get_content_type("video.avi") == "video/x-msvideo"
-        assert get_content_type("unknown.xyz") == "application/octet-stream"
+        assert get_content_type("unknown.xyz") == "video/mp2t"
 
     def test_is_direct_stream(self):
         assert is_direct_stream("stream.ts") is True

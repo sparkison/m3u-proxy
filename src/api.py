@@ -65,7 +65,7 @@ def get_content_type(url: str) -> str:
 
 def is_direct_stream(url: str) -> bool:
     """Check if URL is a direct stream (not HLS playlist)"""
-    return url.lower().endswith(('.ts', '.mp4', '.mkv', '.webm', '.avi'))
+    return url.lower().endswith(('.ts', '.mp4', '.mkv', '.webm', '.avi', '?profile=pass')) or '/live/' in url
 
 
 def detect_https_from_headers(request: Request) -> bool:

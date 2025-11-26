@@ -49,7 +49,9 @@ def get_ffmpeg_version() -> Optional[str]:
 def get_content_type(url: str) -> str:
     """Determine content type based on URL extension"""
     url_lower = url.lower()
-    if url_lower.endswith('.m3u8'):
+    if url_lower.endswith(('.ts', '?profile=pass')):
+        return 'video/mp2t'
+    elif url_lower.endswith('.m3u8'):
         return 'application/vnd.apple.mpegurl'
     elif url_lower.endswith('.mp4'):
         return 'video/mp4'
@@ -60,7 +62,7 @@ def get_content_type(url: str) -> str:
     elif url_lower.endswith('.avi'):
         return 'video/x-msvideo'
     else:
-        return 'video/mp2t' # Default to MPEG-TS for unknown types (and .ts)
+        return 'application/octet-stream'
 
 
 def is_direct_stream(url: str) -> bool:

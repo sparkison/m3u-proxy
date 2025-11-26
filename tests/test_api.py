@@ -15,13 +15,14 @@ class TestHelperFunctions:
 
     def test_get_content_type(self):
         assert get_content_type("test.ts") == "video/mp2t"
+        assert get_content_type("test?profile=pass") == "video/mp2t"
         assert get_content_type(
             "playlist.m3u8") == "application/vnd.apple.mpegurl"
         assert get_content_type("video.mp4") == "video/mp4"
         assert get_content_type("video.mkv") == "video/x-matroska"
         assert get_content_type("video.webm") == "video/webm"
         assert get_content_type("video.avi") == "video/x-msvideo"
-        assert get_content_type("unknown.xyz") == "video/mp2t"
+        assert get_content_type("unknown.xyz") == "application/octet-stream"
 
     def test_is_direct_stream(self):
         assert is_direct_stream("stream.ts") is True

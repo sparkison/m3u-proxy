@@ -928,72 +928,26 @@ async def get_hls_playlist(
             logger.debug(
                 f"Reusing existing client {client_id} for stream {stream_id}")
 
-        # Build base URL for this stream using settings.PUBLIC_URL (optional) and settings.PORT
-        # PUBLIC_URL may be an IP, domain, or include a scheme (http/https) and/or port.
-        public_url = getattr(settings, 'PUBLIC_URL', None)
-        port = getattr(settings, 'PORT', None) or 8085
+        # Build base URL for playlist rewriting using RELATIVE URLs
+        # This eliminates the need for PUBLIC_URL and works with ANY reverse proxy setup.
+        # The client's browser will automatically resolve relative URLs using the same
+        # host/scheme they used to access this endpoint.
+        #
+        # For example:
+        #   - User accesses: https://example.com/m3u-proxy/hls/stream_id/playlist.m3u8
+        #   - Relative URL: /m3u-proxy/hls/stream_id/segment?url=...
+        #   - Browser resolves to: https://example.com/m3u-proxy/hls/stream_id/segment?url=...
+        #
+        # This works for:
+        #   - Direct access (http://localhost:8085/...)
+        #   - NGINX reverse proxy (https://example.com/m3u-proxy/...)
+        #   - Any reverse proxy (Caddy, Traefik, AWS ELB, etc.)
+        #   - VPN/Tailscale access (https://host.vpn.ts.net/m3u-proxy/...)
         root_path = getattr(settings, 'ROOT_PATH', '')
-
-        if public_url:
-            # If PUBLIC_URL includes a scheme, respect it. Otherwise assume http.
-            public_with_scheme = public_url if public_url.startswith(
-                ('http://', 'https://')) else f"http://{public_url}"
-            parsed = urlparse(public_with_scheme)
-            scheme = parsed.scheme or 'http'
-
-            # ✅ UNIVERSAL FIX: Auto-detect HTTPS from reverse proxy headers
-            # This works with ALL major reverse proxies without requiring user configuration
-            https_detected = detect_https_from_headers(request)
-            if https_detected:
-                scheme = "https"
-
-            # Detect if request is coming through ANY reverse proxy (HTTP or HTTPS)
-            reverse_proxy_detected = detect_reverse_proxy(request)
-
-            # Preserve hostname and path. If PUBLIC_URL provided an explicit port, use it;
-            # otherwise fall back to settings.PORT when available.
-            host = parsed.hostname or ''
-            url_port = parsed.port
-            path = parsed.path or ''
-
-            # If ROOT_PATH is already included in the PUBLIC_URL path, remove it to prevent duplication
-            # We'll add it back later to ensure it's always present in the final URL
-            if root_path and path.startswith(root_path):
-                path = path[len(root_path):]
-
-            # ✅ FIX: When reverse proxy is detected, don't add internal port
-            # The reverse proxy handles the external port (443 for HTTPS, 80 for HTTP)
-            # Only use the internal port (8085) when:
-            # 1. PUBLIC_URL explicitly includes a port, OR
-            # 2. No reverse proxy is detected (direct access)
-            if url_port:
-                # PUBLIC_URL explicitly includes a port - respect it
-                netloc = f"{host}:{url_port}"
-            elif reverse_proxy_detected:
-                # Reverse proxy detected (HTTP or HTTPS) - use hostname only
-                # The reverse proxy handles the external port mapping
-                netloc = host
-            elif port and port != 80:
-                # Direct access with non-standard port - include port
-                netloc = f"{host}:{port}"
-            else:
-                # Direct access with standard port 80 or no port specified
-                netloc = host
-
-            # Combine scheme, netloc, and any path from PUBLIC_URL (preserve sub-paths)
-            base = f"{scheme}://{netloc}{path.rstrip('/')}"
-
-            # Add ROOT_PATH back to ensure segment URLs include the correct prefix for NGINX routing
-            if root_path:
-                base = f"{base}{root_path}"
-        else:
-            # Default to localhost with configured port (or 8085)
-            base = f"http://localhost:{port}"
-            # Add ROOT_PATH if configured
-            if root_path:
-                base = f"{base}{root_path}"
-
-        base_proxy_url = f"{base.rstrip('/')}/hls/{stream_id}"
+        
+        # Use relative URLs (just the path, no scheme/host)
+        # This automatically works with whatever host/scheme the client used
+        base_proxy_url = f"{root_path}/hls/{stream_id}"
 
         # Get processed playlist content (works for both direct HLS and transcoded HLS)
         content = await stream_manager.get_playlist_content(stream_id, client_id, base_proxy_url)
@@ -1637,9 +1591,14 @@ async def health_check():
     try:
         stats = stream_manager.get_stats()
         proxy_stats = stats["proxy_stats"]
+        # Note: PUBLIC_URL is now deprecated in favor of relative URLs.
+        # The proxy returns null if not configured (which is now the norm).
+
+        # Get the host accessing this endpoint from request headers and use as the public URL
+        
         return {
             "status": "healthy",
-            "public_url": settings.PUBLIC_URL,
+            "root_path": getattr(settings, 'ROOT_PATH', '/m3u-proxy'),
             "version": VERSION,
             "uptime_seconds": proxy_stats["uptime_seconds"],
             "active_streams": proxy_stats["active_streams"],

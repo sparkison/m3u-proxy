@@ -200,7 +200,6 @@ class StreamManager:
                 connect=settings.DEFAULT_CONNECTION_TIMEOUT, 
                 read=300.0,   
                 write=3600.0,  
-                
                 pool=10.0
             ),
             follow_redirects=True,

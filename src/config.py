@@ -43,6 +43,13 @@ class Settings(BaseSettings):
     DEFAULT_BACKOFF_FACTOR: float = 1.5
     DEFAULT_HEALTH_CHECK_INTERVAL: float = 300.0
 
+    # HTTP Client Timeout Configuration for Streaming
+    # VOD (Video On Demand) timeout - allows clients to pause content for extended periods
+    VOD_READ_TIMEOUT: float = 300.0  # 5 minutes - allows upstream CDN stalls/re-buffering
+    VOD_WRITE_TIMEOUT: float = 3600.0  # 1 hour - allows client pause without losing session
+    # Live TV timeout - emphasizes keeping connection alive during client buffering
+    LIVE_TV_WRITE_TIMEOUT: float = 1800.0  # 30 minutes - safety net while supporting client backpressure
+
     # Additional configuration from .env file
     DEFAULT_RETRY_ATTEMPTS: int = 3
     DEFAULT_RETRY_DELAY: int = 5

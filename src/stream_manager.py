@@ -195,12 +195,16 @@ class StreamManager:
             logger.info("Connection pooling disabled")
 
         # Optimized HTTP clients with connection pooling
+        # VOD Client: Handles Video On Demand streams with extended timeouts
+        # - read: Tolerates upstream CDN stalls and re-buffering up to 5 minutes
+        # - write: Allows clients to pause content for up to 1 hour without losing session
+        # - pool: Standard pool timeout to prevent connection exhaustion
         self.http_client = httpx.AsyncClient(
             timeout=httpx.Timeout(
-                connect=settings.DEFAULT_CONNECTION_TIMEOUT, 
-                read=300.0,   
-                write=3600.0,  
-                pool=10.0
+                connect=settings.DEFAULT_CONNECTION_TIMEOUT,  # Fail fast if upstream is down
+                read=settings.VOD_READ_TIMEOUT,  # Allow upstream stalls/CDN delays
+                write=settings.VOD_WRITE_TIMEOUT,  # Allow extended client pause periods
+                pool=10.0  # Standard pool timeout
             ),
             follow_redirects=True,
             max_redirects=10,
@@ -211,12 +215,19 @@ class StreamManager:
             )
         )
 
+        # Live TV Client: Handles live continuous streams with client backpressure tolerance
+        # - connect: Default (fail fast on upstream unavailability)
+        # - read: Default (upstream should be live, data constantly flowing)
+        # - write: Extended timeout to handle client buffer fills without dropping connection
+        #          Clients may pause reading when their buffer is full; we wait up to 30 minutes
+        #          for them to drain, balancing against resource exhaustion (vs infinite timeout)
+        # - pool: Standard pool timeout to prevent connection exhaustion
         self.live_stream_client = httpx.AsyncClient(
             timeout=httpx.Timeout(
-                connect=settings.DEFAULT_CONNECTION_TIMEOUT,
-                read=settings.DEFAULT_READ_TIMEOUT,
-                write=7200.0,
-                pool=10.0
+                connect=settings.DEFAULT_CONNECTION_TIMEOUT,  # Fail fast if upstream is down
+                read=settings.DEFAULT_READ_TIMEOUT,  # Live data should flow continuously
+                write=settings.LIVE_TV_WRITE_TIMEOUT,  # Support client backpressure/buffering
+                pool=10.0  # Standard pool timeout
             ),
             follow_redirects=True,
             max_redirects=10,

@@ -50,6 +50,14 @@ class Settings(BaseSettings):
     # Live TV timeout - emphasizes keeping connection alive during client buffering
     LIVE_TV_WRITE_TIMEOUT: float = 1800.0  # 30 minutes - safety net while supporting client backpressure
 
+    # Connection Idle Monitoring - detect and alert on long-held connections that may be resource leaks
+    # Alert threshold for connections held idle (warning log when exceeded)
+    CONNECTION_IDLE_ALERT_THRESHOLD: int = 600  # 10 minutes - emit WARNING when connection idle exceeds this
+    # Alert threshold for very long-held connections (error log)
+    CONNECTION_IDLE_ERROR_THRESHOLD: int = 1800  # 30 minutes - emit ERROR when connection idle exceeds this
+    # Enable connection idle monitoring (can be disabled for high-throughput scenarios)
+    ENABLE_CONNECTION_IDLE_MONITORING: bool = True
+
     # Additional configuration from .env file
     DEFAULT_RETRY_ATTEMPTS: int = 3
     DEFAULT_RETRY_DELAY: int = 5

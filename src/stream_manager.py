@@ -36,6 +36,11 @@ class ClientInfo:
     bytes_served: int = 0
     segments_served: int = 0
     is_connected: bool = True
+    # Connection idle tracking - for monitoring long-held connections
+    last_data_time: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    # Alert flag to prevent duplicate warnings
+    idle_warning_logged: bool = False
+    idle_error_logged: bool = False
 
 
 @dataclass
@@ -739,6 +744,11 @@ class StreamManager:
                         bytes_served += len(chunk)
                         chunk_count += 1
 
+                        # Update idle tracking every chunk (important for idle detection accuracy)
+                        # This ensures we accurately detect when data is flowing vs stuck
+                        if client_id in self.clients:
+                            self.clients[client_id].last_data_time = datetime.now(timezone.utc)
+
                         # Update stats periodically (every 10 chunks = ~320KB)
                         if chunk_count % 10 == 0:
                             # Calculate delta since last update
@@ -1245,13 +1255,14 @@ class StreamManager:
                         yield chunk
                         bytes_served += len(chunk)
 
-                        # Update client activity
+                        # Update client activity and idle tracking
                         if self.pooled_manager:
                             self.pooled_manager.update_client_activity(
                                 client_id)
                         if client_id in self.clients:
-                            self.clients[client_id].last_access = datetime.now(
-                                timezone.utc)
+                            now = datetime.now(timezone.utc)
+                            self.clients[client_id].last_access = now
+                            self.clients[client_id].last_data_time = now  # Track transcoded stream data flow
                             self.clients[client_id].bytes_served += len(chunk)
 
                         # Update stream-level stats (for bandwidth tracking)
@@ -1547,8 +1558,9 @@ class StreamManager:
 
                         stream_info.last_access = datetime.now(timezone.utc)
                         if client_id in self.clients:
-                            self.clients[client_id].last_access = datetime.now(
-                                timezone.utc)
+                            now = datetime.now(timezone.utc)
+                            self.clients[client_id].last_access = now
+                            self.clients[client_id].last_data_time = now  # Playlist fetch is also data activity
 
                         return processed_content
 
@@ -1597,8 +1609,9 @@ class StreamManager:
 
                 stream_info.last_access = datetime.now(timezone.utc)
                 if client_id in self.clients:
-                    self.clients[client_id].last_access = datetime.now(
-                        timezone.utc)
+                    now = datetime.now(timezone.utc)
+                    self.clients[client_id].last_access = now
+                    self.clients[client_id].last_data_time = now  # Playlist fetch is also data activity
 
                 return processed_content
 
@@ -1675,10 +1688,11 @@ class StreamManager:
 
                     # Success - update stats and exit
                     if client_id in self.clients:
+                        now = datetime.now(timezone.utc)
                         self.clients[client_id].bytes_served += bytes_served
                         self.clients[client_id].segments_served += 1
-                        self.clients[client_id].last_access = datetime.now(
-                            timezone.utc)
+                        self.clients[client_id].last_access = now
+                        self.clients[client_id].last_data_time = now  # Track that data is actively flowing
 
                     if stream_id in self.streams:
                         self.streams[stream_id].total_bytes_served += bytes_served
@@ -1850,6 +1864,8 @@ class StreamManager:
             try:
                 await self._cleanup_inactive_clients()
                 await self._cleanup_inactive_streams()
+                if settings.ENABLE_CONNECTION_IDLE_MONITORING:
+                    await self._monitor_connection_idle_time()
                 await asyncio.sleep(30)
             except asyncio.CancelledError:
                 break
@@ -1913,6 +1929,70 @@ class StreamManager:
                 if stream_id in self.stream_clients:
                     del self.stream_clients[stream_id]
                 self._stats.active_streams -= 1
+
+    async def _monitor_connection_idle_time(self):
+        """Monitor long-held idle connections and emit alerts for potential resource leaks.
+        
+        Tracks connections that have been idle (no data flowing) for extended periods.
+        This helps detect stuck connections or resource exhaustion scenarios.
+        """
+        current_time = datetime.now(timezone.utc)
+
+        for client_id, client_info in list(self.clients.items()):
+            if not client_info.is_connected:
+                continue
+
+            idle_seconds = (current_time - client_info.last_data_time).total_seconds()
+
+            # ERROR threshold: Very long idle time (30+ minutes)
+            if idle_seconds > settings.CONNECTION_IDLE_ERROR_THRESHOLD:
+                if not client_info.idle_error_logged:
+                    logger.error(
+                        f"Connection resource leak warning: client {client_id} "
+                        f"(stream={client_info.stream_id}, ip={client_info.ip_address}) "
+                        f"idle for {idle_seconds:.0f}s (threshold={settings.CONNECTION_IDLE_ERROR_THRESHOLD}s). "
+                        f"Bytes served: {client_info.bytes_served}, "
+                        f"Connection age: {(current_time - client_info.created_at).total_seconds():.0f}s"
+                    )
+                    client_info.idle_error_logged = True
+                    # Emit event for external monitoring systems
+                    await self._emit_event("CONNECTION_IDLE_ERROR", client_info.stream_id or "unknown", {
+                        "client_id": client_id,
+                        "idle_seconds": idle_seconds,
+                        "threshold_seconds": settings.CONNECTION_IDLE_ERROR_THRESHOLD,
+                        "ip_address": client_info.ip_address,
+                        "bytes_served": client_info.bytes_served
+                    })
+
+            # WARNING threshold: Moderately long idle time (10+ minutes)
+            elif idle_seconds > settings.CONNECTION_IDLE_ALERT_THRESHOLD:
+                if not client_info.idle_warning_logged:
+                    logger.warning(
+                        f"Connection idle warning: client {client_id} "
+                        f"(stream={client_info.stream_id}, ip={client_info.ip_address}) "
+                        f"idle for {idle_seconds:.0f}s (threshold={settings.CONNECTION_IDLE_ALERT_THRESHOLD}s). "
+                        f"Bytes served: {client_info.bytes_served}, "
+                        f"Connection age: {(current_time - client_info.created_at).total_seconds():.0f}s"
+                    )
+                    client_info.idle_warning_logged = True
+                    # Emit event for external monitoring systems
+                    await self._emit_event("CONNECTION_IDLE_WARNING", client_info.stream_id or "unknown", {
+                        "client_id": client_id,
+                        "idle_seconds": idle_seconds,
+                        "threshold_seconds": settings.CONNECTION_IDLE_ALERT_THRESHOLD,
+                        "ip_address": client_info.ip_address,
+                        "bytes_served": client_info.bytes_served
+                    })
+            else:
+                # Connection is active again - reset warning flags if idle clears
+                if idle_seconds < (settings.CONNECTION_IDLE_ALERT_THRESHOLD * 0.5):
+                    if client_info.idle_warning_logged or client_info.idle_error_logged:
+                        logger.debug(
+                            f"Connection {client_id} recovered from idle state "
+                            f"(idle: {idle_seconds:.0f}s)"
+                        )
+                    client_info.idle_warning_logged = False
+                    client_info.idle_error_logged = False
 
     def get_stats(self) -> Dict:
         """Get comprehensive stats - aggregates variant stream stats into parent streams"""

@@ -196,7 +196,12 @@ class StreamManager:
 
         # Optimized HTTP clients with connection pooling
         self.http_client = httpx.AsyncClient(
-            timeout=settings.DEFAULT_CONNECTION_TIMEOUT,
+            timeout=httpx.Timeout(
+                connect=settings.DEFAULT_CONNECTION_TIMEOUT, 
+                read=300.0,   
+                write=3600.0,  
+                pool=10.0
+            ),
             follow_redirects=True,
             max_redirects=10,
             limits=httpx.Limits(
@@ -210,7 +215,7 @@ class StreamManager:
             timeout=httpx.Timeout(
                 connect=settings.DEFAULT_CONNECTION_TIMEOUT,
                 read=settings.DEFAULT_READ_TIMEOUT,
-                write=10.0,
+                write=7200.0,
                 pool=10.0
             ),
             follow_redirects=True,

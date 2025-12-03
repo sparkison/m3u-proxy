@@ -215,7 +215,7 @@ class StreamManager:
             timeout=httpx.Timeout(
                 connect=settings.DEFAULT_CONNECTION_TIMEOUT,
                 read=settings.DEFAULT_READ_TIMEOUT,
-                write=None,
+                write=7200.0,
                 pool=10.0
             ),
             follow_redirects=True,

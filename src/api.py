@@ -226,6 +226,7 @@ def validate_url(url: str) -> str:
 class StreamCreateRequest(BaseModel):
     url: str
     failover_urls: Optional[List[str]] = None
+    failover_resolver_url: Optional[str] = None
     user_agent: Optional[str] = None
     metadata: Optional[dict] = None
     headers: Optional[Dict[str, str]] = None
@@ -242,6 +243,13 @@ class StreamCreateRequest(BaseModel):
     def validate_failover_urls(cls, v):
         if v is not None:
             return [validate_url(url) for url in v]
+        return v
+
+    @field_validator('failover_resolver_url')
+    @classmethod
+    def validate_failover_resolver_url(cls, v):
+        if v is not None:
+            return validate_url(v)
         return v
 
     @field_validator('metadata')
@@ -266,6 +274,7 @@ class StreamCreateRequest(BaseModel):
 class TranscodeCreateRequest(BaseModel):
     url: str
     failover_urls: Optional[List[str]] = None
+    failover_resolver_url: Optional[str] = None
     user_agent: Optional[str] = None
     metadata: Optional[dict] = None
     profile: Optional[str] = None  # Profile name or custom template
@@ -282,6 +291,13 @@ class TranscodeCreateRequest(BaseModel):
     def validate_failover_urls(cls, v):
         if v is not None:
             return [validate_url(url) for url in v]
+        return v
+
+    @field_validator('failover_resolver_url')
+    @classmethod
+    def validate_failover_resolver_url(cls, v):
+        if v is not None:
+            return validate_url(v)
         return v
 
     @field_validator('metadata')
@@ -376,7 +392,8 @@ if not os.path.exists(static_path):
     static_path = os.path.join(os.getcwd(), "static")
     if not os.path.exists(static_path):
         # Last resort: try parent directory
-        static_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        static_path = os.path.dirname(
+            os.path.dirname(os.path.abspath(__file__)))
 
 # Verify static path exists and log it
 if os.path.exists(static_path):
@@ -390,7 +407,8 @@ if os.path.exists(static_path):
 else:
     logger.error(f"❌ Static files directory NOT found at: {static_path}")
     logger.error(f"Current working directory: {os.getcwd()}")
-    logger.error(f"Script directory: {os.path.dirname(os.path.abspath(__file__))}")
+    logger.error(
+        f"Script directory: {os.path.dirname(os.path.abspath(__file__))}")
 
 # Configure CORS to allow all origins for streaming compatibility
 app.add_middleware(
@@ -470,7 +488,8 @@ async def serve_static_file(filename: str):
         else:
             media_type = None
         return FileResponse(file_path, media_type=media_type)
-    raise HTTPException(status_code=404, detail=f"Static file not found: {filename}")
+    raise HTTPException(
+        status_code=404, detail=f"Static file not found: {filename}")
 
 
 # Serve favicon directly at root for browsers
@@ -652,6 +671,7 @@ async def create_stream(request: StreamCreateRequest):
         stream_id = await stream_manager.get_or_create_stream(
             request.url,
             request.failover_urls,
+            request.failover_resolver_url,
             request.user_agent,
             metadata=request.metadata,
             headers=request.headers,
@@ -763,6 +783,7 @@ async def create_transcode_stream(request: TranscodeCreateRequest):
         stream_id = await stream_manager.get_or_create_stream(
             request.url,
             request.failover_urls,
+            request.failover_resolver_url,
             request.user_agent,
             metadata=transcoding_metadata,
             is_transcoded=True,
@@ -944,7 +965,7 @@ async def get_hls_playlist(
         #   - Any reverse proxy (Caddy, Traefik, AWS ELB, etc.)
         #   - VPN/Tailscale access (https://host.vpn.ts.net/m3u-proxy/...)
         root_path = getattr(settings, 'ROOT_PATH', '')
-        
+
         # Use relative URLs (just the path, no scheme/host)
         # This automatically works with whatever host/scheme the client used
         base_proxy_url = f"{root_path}/hls/{stream_id}"
@@ -1547,14 +1568,17 @@ async def trigger_failover(stream_id: str):
 
         stream_info = stream_manager.streams[stream_id]
 
-        if not stream_info.failover_urls:
+        # Check if any failover mechanism is available
+        has_failovers = bool(
+            stream_info.failover_resolver_url or stream_info.failover_urls)
+        if not has_failovers:
             raise HTTPException(
                 status_code=400,
-                detail="No failover URLs configured for this stream"
+                detail="No failover mechanism configured for this stream (neither failover_urls nor failover_resolver_url)"
             )
 
         # Trigger failover which will:
-        # 1. Update current_url to next failover URL
+        # 1. Update current_url to next failover URL (via resolver or array)
         # 2. Signal all active clients via failover_event
         # 3. For transcoded streams, restart FFmpeg with new URL
         # 4. Emit FAILOVER_TRIGGERED event
@@ -1595,7 +1619,7 @@ async def health_check():
         # The proxy returns null if not configured (which is now the norm).
 
         # Get the host accessing this endpoint from request headers and use as the public URL
-        
+
         return {
             "status": "healthy",
             "root_path": getattr(settings, 'ROOT_PATH', '/m3u-proxy'),
@@ -1612,6 +1636,67 @@ async def health_check():
             "status": "error",
             "error": str(e)
         }, 500
+
+
+class TestConnectionRequest(BaseModel):
+    """Request model for testing connectivity to an external URL"""
+    url: str
+
+
+@app.post("/test-connection", dependencies=[Depends(verify_token)])
+async def test_url_connectivity(request: TestConnectionRequest):
+    """
+    Test connectivity to an external URL by calling it from the proxy to verify connectivity.
+    This is used to verify the proxy can reach external services for failover resolution.
+    """
+    import httpx
+
+    # Ensure URL doesn't have trailing slash
+    test_url = request.url.rstrip('/')
+
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            response = await client.get(test_url)
+
+            if response.status_code == 200:
+                return {
+                    "success": True,
+                    "message": f"Successfully connected to {test_url}",
+                    "status_code": response.status_code,
+                    "url_tested": test_url
+                }
+            else:
+                return {
+                    "success": False,
+                    "message": f"URL returned non-200 status code",
+                    "status_code": response.status_code,
+                    "url_tested": test_url
+                }
+    except httpx.ConnectError as e:
+        logger.warning(f"Connection error testing URL {test_url}: {e}")
+        return {
+            "success": False,
+            "message": f"Connection failed: Unable to connect to {request.url}",
+            "error": str(e),
+            "url_tested": test_url
+        }
+    except httpx.TimeoutException as e:
+        logger.warning(f"Timeout testing URL {test_url}: {e}")
+        return {
+            "success": False,
+            "message": f"Connection timed out after 10 seconds",
+            "error": str(e),
+            "url_tested": test_url
+        }
+    except Exception as e:
+        logger.error(f"Error testing URL {test_url}: {e}")
+        return {
+            "success": False,
+            "message": f"Error testing connection: {str(e)}",
+            "error": str(e),
+            "url_tested": test_url
+        }
+
 
 # Webhook Management Endpoints
 

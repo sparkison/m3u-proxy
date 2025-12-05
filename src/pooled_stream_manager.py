@@ -931,10 +931,17 @@ class PooledStreamManager:
         user_agent: Optional[str] = None,
         headers: Optional[Dict[str, str]] = None,
         stream_id: Optional[str] = None,
+        reuse_stream_key: Optional[str] = None,
     ) -> Tuple[str, SharedTranscodingProcess]:
-        """Get existing shared stream or create new one"""
+        """Get existing shared stream or create new one
+        
+        Args:
+            reuse_stream_key: If provided, reuse this stream key instead of generating a new one.
+                              This is useful for failover scenarios where we want to maintain the
+                              same stream key even though the URL has changed.
+        """
 
-        stream_key = self._generate_stream_key(url, profile)
+        stream_key = reuse_stream_key or self._generate_stream_key(url, profile)
 
         # Track the stream_id -> stream_key mapping for event emission
         if stream_id:
@@ -947,14 +954,21 @@ class PooledStreamManager:
             # Check if the process is still healthy before reusing it
             process.health_check()
 
-            # If process has failed or exited, clean it up and create a new one
-            if process.status == "failed" or (process.process and process.process.returncode is not None):
-                logger.warning(
-                    f"Existing process for stream {stream_key} is unhealthy, recreating...")
+            # Check if URL has changed (failover scenario) or if process has failed
+            url_changed = process.url != url
+            process_failed = process.status == "failed" or (process.process and process.process.returncode is not None)
+            
+            if url_changed or process_failed:
+                if url_changed:
+                    logger.info(
+                        f"Stream {stream_key} URL changed (failover), restarting with new URL: {url}")
+                else:
+                    logger.warning(
+                        f"Existing process for stream {stream_key} is unhealthy, recreating...")
                 await self._cleanup_local_process(stream_key)
-                # Process will be recreated below
+                # Process will be recreated below with new URL
             else:
-                # Process is healthy, reuse it
+                # Process is healthy and URL unchanged, reuse it
                 await process.add_client(client_id)
                 self.client_streams[client_id] = stream_key
                 return stream_key, process

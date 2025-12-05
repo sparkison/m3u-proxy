@@ -55,6 +55,7 @@ class StreamInfo:
     error_count: int = 0
     is_active: bool = True
     failover_urls: List[str] = field(default_factory=list)
+    failover_resolver_url: Optional[str] = None
     current_failover_index: int = 0
     current_url: Optional[str] = None
     final_playlist_url: Optional[str] = None
@@ -330,6 +331,7 @@ class StreamManager:
         self,
         stream_url: str,
         failover_urls: Optional[List[str]] = None,
+        failover_resolver_url: Optional[str] = None,
         user_agent: Optional[str] = None,
         parent_stream_id: Optional[str] = None,
         metadata: Optional[Dict[str, str]] = None,
@@ -343,7 +345,8 @@ class StreamManager:
 
         Args:
             stream_url: The URL of the stream
-            failover_urls: Optional list of failover URLs
+            failover_urls: Optional list of failover URLs (legacy)
+            failover_resolver_url: Optional callback URL for smart failover (preferred)
             user_agent: Optional user agent string
             parent_stream_id: Optional parent stream ID for variant playlists
             metadata: Optional custom key/value pairs for external identification
@@ -377,6 +380,7 @@ class StreamManager:
                 created_at=now,
                 last_access=now,
                 failover_urls=failover_urls or [],
+                failover_resolver_url=failover_resolver_url,
                 user_agent=user_agent,
                 is_hls=is_hls,
                 is_vod=is_vod,
@@ -1121,6 +1125,7 @@ class StreamManager:
                         user_agent=stream_info.user_agent,
                         headers=stream_info.headers,
                         stream_id=stream_id,
+                        reuse_stream_key=stream_info.transcode_stream_key,  # Reuse existing key if available
                     )
 
                     # Update the tracked stream key so future failovers can stop the correct process
@@ -1128,7 +1133,8 @@ class StreamManager:
 
                     if not shared_process or not shared_process.process or not shared_process.process.stdout:
                         # Try failover if available
-                        if stream_info.failover_urls and failover_count < max_failovers:
+                        has_failover = bool(stream_info.failover_resolver_url or stream_info.failover_urls)
+                        if has_failover and failover_count < max_failovers:
                             logger.warning(
                                 f"Failed to create transcoding process, attempting failover")
                             await self._try_update_failover_url(stream_id, "transcode_start_error")
@@ -1138,43 +1144,109 @@ class StreamManager:
                             raise HTTPException(
                                 status_code=500, detail="Failed to get a valid transcoding process")
 
-                    # Wait briefly to allow FFmpeg to start and stderr monitor to detect immediate input errors
+                    # Wait for FFmpeg to start and stderr monitor to detect input errors
+                    # Poll the status repeatedly to catch errors that occur during startup
                     # This is especially important for connection errors (DNS failures, 404s, etc.)
-                    await asyncio.sleep(0.5)
+                    max_wait_time = 2.0  # Wait up to 2 seconds
+                    check_interval = 0.1  # Check every 100ms
+                    elapsed = 0.0
                     
-                    # Check if the process failed due to input errors (detected by stderr monitor)
+                    while elapsed < max_wait_time:
+                        await asyncio.sleep(check_interval)
+                        elapsed += check_interval
+                        
+                        # Check if the process failed due to input errors (detected by stderr monitor)
+                        if hasattr(shared_process, 'status') and shared_process.status == "input_failed":
+                            has_failover = bool(stream_info.failover_resolver_url or stream_info.failover_urls)
+                            if has_failover and failover_count < max_failovers:
+                                logger.warning(
+                                    f"Transcoding process failed due to input error before streaming (detected after {elapsed:.1f}s), attempting failover")
+                                # Clean up failed process
+                                if self.pooled_manager:
+                                    try:
+                                        await self.pooled_manager.force_stop_stream(stream_key)
+                                    except Exception:
+                                        pass
+                                stream_key = None
+                                await self._try_update_failover_url(stream_id, "transcode_input_error")
+                                failover_count += 1
+                                break  # Break out of wait loop to continue outer loop
+                            else:
+                                # No failover available - log error and return empty stream
+                                logger.error(
+                                    f"Transcoding process failed due to input error and no failover available for stream {stream_id}")
+                                return
+                        
+                        # Check if process has exited early
+                        if shared_process.process.returncode is not None:
+                            has_failover = bool(stream_info.failover_resolver_url or stream_info.failover_urls)
+                            if has_failover and failover_count < max_failovers:
+                                logger.warning(
+                                    f"Transcoding process exited before streaming (detected after {elapsed:.1f}s), attempting failover")
+                                # Clean up failed process
+                                if self.pooled_manager and stream_key:
+                                    try:
+                                        await self.pooled_manager.force_stop_stream(stream_key)
+                                    except Exception:
+                                        pass
+                                stream_key = None
+                                await self._try_update_failover_url(stream_id, "transcode_process_exited")
+                                failover_count += 1
+                                break  # Break out of wait loop to continue outer loop
+                            else:
+                                logger.error(
+                                    f"Transcoding process exited with code {shared_process.process.returncode} and no failover available for stream {stream_id}")
+                                return
+                        
+                        # If we have data in the queue, FFmpeg is producing output - safe to start streaming
+                        client_queue = shared_process.client_queues.get(client_id)
+                        if client_queue and not client_queue.empty():
+                            logger.info(f"FFmpeg process producing data after {elapsed:.1f}s, starting stream")
+                            break
+                    
+                    # Check one final time after the wait loop before proceeding
+                    # (in case we timed out without detecting the issue)
                     if hasattr(shared_process, 'status') and shared_process.status == "input_failed":
-                        if stream_info.failover_urls and failover_count < max_failovers:
+                        has_failover = bool(stream_info.failover_resolver_url or stream_info.failover_urls)
+                        if has_failover and failover_count < max_failovers:
                             logger.warning(
-                                f"Transcoding process failed due to input error, attempting failover")
-                            # Clean up failed process
+                                f"Transcoding process failed due to input error (final check), attempting failover")
                             if self.pooled_manager:
                                 try:
                                     await self.pooled_manager.force_stop_stream(stream_key)
                                 except Exception:
                                     pass
+                            stream_key = None
                             await self._try_update_failover_url(stream_id, "transcode_input_error")
                             failover_count += 1
                             continue
                         else:
-                            raise HTTPException(
-                                status_code=503,
-                                detail="Transcoding process failed due to input error"
-                            )
+                            logger.error(
+                                f"Transcoding process failed due to input error and no failover available for stream {stream_id}")
+                            return
 
-                    # Verify the process is actually running
+                    # Verify the process is actually running (final check)
                     if shared_process.process.returncode is not None:
-                        if stream_info.failover_urls and failover_count < max_failovers:
+                        has_failover = bool(stream_info.failover_resolver_url or stream_info.failover_urls)
+                        if has_failover and failover_count < max_failovers:
                             logger.warning(
-                                f"Transcoding process exited, attempting failover")
+                                f"Transcoding process exited before streaming, attempting failover")
+                            # Clean up failed process
+                            if self.pooled_manager and stream_key:
+                                try:
+                                    await self.pooled_manager.force_stop_stream(stream_key)
+                                except Exception:
+                                    pass
+                            stream_key = None
                             await self._try_update_failover_url(stream_id, "transcode_process_exited")
                             failover_count += 1
                             continue
                         else:
-                            raise HTTPException(
-                                status_code=500,
-                                detail=f"Transcoding process has exited with code {shared_process.process.returncode}"
-                            )
+                            # No failover available - log error and return empty stream
+                            # Cannot raise HTTPException here as response may have already started
+                            logger.error(
+                                f"Transcoding process exited with code {shared_process.process.returncode} and no failover available for stream {stream_id}")
+                            return
 
                     logger.info(
                         f"Streaming from FFmpeg process PID {shared_process.process.pid} for client {client_id}")
@@ -1195,7 +1267,8 @@ class StreamManager:
 
                         # Check if the transcoding process failed due to input error during streaming
                         if hasattr(shared_process, 'status') and shared_process.status == "input_failed":
-                            if stream_info.failover_urls and failover_count < max_failovers:
+                            has_failover = bool(stream_info.failover_resolver_url or stream_info.failover_urls)
+                            if has_failover and failover_count < max_failovers:
                                 logger.warning(
                                     f"Transcoding process encountered input error during streaming, triggering failover")
                                 # Clean up current connection
@@ -1489,7 +1562,23 @@ class StreamManager:
             return None
 
         stream_info = self.streams[stream_id]
-        current_url = stream_info.current_url or stream_info.original_url
+
+        # IMPORTANT: Check if this is a variant stream whose parent has failed over
+        # If the parent's current_url differs from its original_url, the parent has switched
+        # to a different provider. This variant's URL points to the OLD provider.
+        # We need to fetch the NEW master playlist and extract the corresponding variant
+        if stream_info.is_variant_stream and stream_info.parent_stream_id:
+            parent_info = self.streams.get(stream_info.parent_stream_id)
+            if parent_info and parent_info.current_url != parent_info.original_url:
+                logger.info(
+                    f"Variant stream {stream_id} is stale after parent failover - "
+                    f"using parent's current URL: {parent_info.current_url}"
+                )
+                # Use the parent's current URL as this variant's URL
+                # The parent URL should be the master playlist after failover
+                stream_info.current_url = parent_info.current_url
+                # Also update original_url so future checks work correctly
+                stream_info.original_url = parent_info.current_url
 
         # If this stream is a transcoded HLS, try to get playlist from the pooled manager
         if stream_info.is_transcoded and self.pooled_manager:
@@ -1503,12 +1592,36 @@ class StreamManager:
                     user_agent=stream_info.user_agent,
                     headers=stream_info.headers,
                     stream_id=stream_id,
+                    reuse_stream_key=stream_info.transcode_stream_key,  # Reuse existing key if available
                 )
                 # Record the stream key for later mapping
                 stream_info.transcode_stream_key = stream_key
 
                 # If the shared process is HLS-mode, read its playlist file directly
                 if hasattr(shared_process, 'mode') and getattr(shared_process, 'mode') == 'hls':
+                    # Check immediately if FFmpeg has already failed with input error
+                    if hasattr(shared_process, 'status') and shared_process.status == "input_failed":
+                        logger.warning(
+                            f"HLS FFmpeg process failed with input error for stream {stream_id}, attempting failover immediately")
+                        # Clean up failed process
+                        if self.pooled_manager:
+                            try:
+                                await self.pooled_manager.force_stop_stream(stream_key)
+                            except Exception as e:
+                                logger.debug(f"Error cleaning up failed stream {stream_key}: {e}")
+                        # Attempt failover
+                        has_failover = bool(stream_info.failover_resolver_url or stream_info.failover_urls)
+                        if has_failover:
+                            logger.info(f"Attempting failover for stream {stream_id}")
+                            failover_success = await self._try_update_failover_url(stream_id, "hls_input_error")
+                            if failover_success:
+                                # Failover successful, retry the stream fetch with new URL
+                                logger.info(f"HLS failover successful for stream {stream_id}, retrying with new URL")
+                                return await self.get_playlist_content(stream_id, client_id, base_proxy_url)
+                        # No failover available or failover failed
+                        logger.error(f"HLS input error for stream {stream_id} and no failover available or failover failed")
+                        return None
+                    
                     # Wait briefly for FFmpeg to produce the initial playlist if it's not yet present.
                     playlist_text = await shared_process.read_playlist()
                     waited = 0.0
@@ -1516,12 +1629,59 @@ class StreamManager:
                     # Allow configurable wait time via settings.HLS_WAIT_TIME (seconds)
                     max_wait = float(getattr(settings, 'HLS_WAIT_TIME', 10))
                     while not playlist_text and waited < max_wait and shared_process.process and shared_process.process.returncode is None:
+                        # Check if FFmpeg failed due to input error during the wait
+                        if hasattr(shared_process, 'status') and shared_process.status == "input_failed":
+                            logger.warning(
+                                f"HLS FFmpeg process detected input error during playlist generation for stream {stream_id}, attempting failover")
+                            # Clean up failed process
+                            if self.pooled_manager:
+                                try:
+                                    await self.pooled_manager.force_stop_stream(stream_key)
+                                except Exception as e:
+                                    logger.debug(f"Error cleaning up failed stream {stream_key}: {e}")
+                            # Attempt failover
+                            has_failover = bool(stream_info.failover_resolver_url or stream_info.failover_urls)
+                            if has_failover:
+                                logger.info(f"Attempting failover for stream {stream_id}")
+                                failover_success = await self._try_update_failover_url(stream_id, "hls_input_error")
+                                if failover_success:
+                                    # Failover successful, retry the stream fetch with new URL
+                                    logger.info(f"HLS failover successful for stream {stream_id}, retrying with new URL")
+                                    return await self.get_playlist_content(stream_id, client_id, base_proxy_url)
+                            # No failover available or failover failed
+                            logger.error(f"HLS input error for stream {stream_id} and no failover available or failover failed")
+                            return None
+                        
                         await asyncio.sleep(poll_interval)
                         waited += poll_interval
                         playlist_text = await shared_process.read_playlist()
 
-                    # If playlist still not available after waiting, consider the transcoder failed
+                    # If playlist still not available after waiting, check if it was due to FFmpeg error
                     if not playlist_text:
+                        # First, check if FFmpeg failed with an input error
+                        if hasattr(shared_process, 'status') and shared_process.status == "input_failed":
+                            logger.warning(
+                                f"HLS FFmpeg process detected input error for stream {stream_id}, attempting failover")
+                            # Clean up failed process
+                            if self.pooled_manager:
+                                try:
+                                    await self.pooled_manager.force_stop_stream(stream_key)
+                                except Exception as e:
+                                    logger.debug(f"Error cleaning up failed stream {stream_key}: {e}")
+                            # Attempt failover
+                            has_failover = bool(stream_info.failover_resolver_url or stream_info.failover_urls)
+                            if has_failover:
+                                logger.info(f"Attempting failover for stream {stream_id}")
+                                failover_success = await self._try_update_failover_url(stream_id, "hls_input_error")
+                                if failover_success:
+                                    # Failover successful, retry the stream fetch with new URL
+                                    logger.info(f"HLS failover successful for stream {stream_id}, retrying with new URL")
+                                    return await self.get_playlist_content(stream_id, client_id, base_proxy_url)
+                            # No failover available or failover failed
+                            logger.error(f"HLS input error for stream {stream_id} and no failover available or failover failed")
+                            return None
+                        
+                        # No input error detected, it's just a timeout
                         logger.warning(
                             f"HLS playlist not produced within {max_wait}s for stream {stream_id}; cleaning up transcoder")
                         try:
@@ -1573,12 +1733,16 @@ class StreamManager:
                     f"Error retrieving transcoded playlist from pooled manager: {e}")
 
         # Try to fetch the playlist with automatic failover support
-        max_attempts = len(stream_info.failover_urls) + 1 if stream_info.failover_urls else 1
+        has_failovers = bool(stream_info.failover_resolver_url or stream_info.failover_urls)
+        # For legacy failover_urls, we can count the attempts; for resolver, allow reasonable retries
+        max_attempts = len(stream_info.failover_urls) + 1 if stream_info.failover_urls else (10 if stream_info.failover_resolver_url else 1)
         attempt = 0
         last_error = None
 
         while attempt < max_attempts:
             try:
+                # Always read current URL from stream_info to pick up manual failover changes
+                current_url = stream_info.current_url or stream_info.original_url
                 logger.info(f"Fetching HLS playlist from: {current_url} (attempt {attempt + 1}/{max_attempts})")
                 headers = {'User-Agent': stream_info.user_agent}
                 headers.update(stream_info.headers)
@@ -1622,11 +1786,12 @@ class StreamManager:
                 stream_info.error_count += 1
                 
                 # Try failover if available and not the last attempt
-                if stream_info.failover_urls and attempt < max_attempts - 1:
+                has_failovers = bool(stream_info.failover_resolver_url or stream_info.failover_urls)
+                if has_failovers and attempt < max_attempts - 1:
                     logger.info(f"Attempting failover for playlist fetch (attempt {attempt + 1}/{max_attempts})")
                     failover_success = await self._try_update_failover_url(stream_id, f"playlist_fetch_error_{type(e).__name__}")
                     if failover_success:
-                        current_url = stream_info.current_url
+                        # current_url will be read from stream_info at the start of the next loop iteration
                         attempt += 1
                         continue
                 
@@ -1793,6 +1958,72 @@ class StreamManager:
             logger.warning(f"Health check failed for stream {stream_id}: {e}")
             return False
 
+    async def _resolve_next_failover_url(self, stream_id: str) -> Optional[str]:
+        """Resolve the next failover URL using either resolver callback or static list
+        
+        Prioritizes failover_resolver_url over failover_urls for maximum flexibility.
+        
+        Args:
+            stream_id: The stream ID to get failover URL for
+            
+        Returns:
+            Next failover URL or None if no more failovers available
+        """
+        if stream_id not in self.streams:
+            return None
+            
+        stream_info = self.streams[stream_id]
+        
+        # Try resolver-based failover first (preferred method)
+        if stream_info.failover_resolver_url:
+            logger.info(f"Using failover resolver callback for stream {stream_id}")
+            try:
+                # Call the resolver endpoint with current URL and metadata
+                payload = {
+                    'current_url': stream_info.current_url,
+                    'metadata': stream_info.metadata,
+                    'current_failover_index': stream_info.current_failover_index
+                }
+                
+                async with httpx.AsyncClient(timeout=10) as client:
+                    response = await client.post(
+                        stream_info.failover_resolver_url,
+                        json=payload
+                    )
+                
+                if not response.is_success:
+                    logger.warning(
+                        f"Failover resolver returned {response.status_code} for stream {stream_id}")
+                    return None
+                    
+                data = response.json()
+                next_url = data.get('next_url')
+                
+                if next_url:
+                    logger.info(f"Failover resolver returned URL: {next_url}")
+                    stream_info.current_failover_index += 1
+                    return next_url
+                else:
+                    logger.info(
+                        f"No viable failover URL available from resolver for stream {stream_id}")
+                    return None
+                    
+            except Exception as e:
+                logger.error(
+                    f"Error calling failover resolver for stream {stream_id}: {e}")
+                return None
+        
+        # Fall back to static failover URLs list
+        if stream_info.failover_urls:
+            next_index = (stream_info.current_failover_index + 1) % len(stream_info.failover_urls)
+            next_url = stream_info.failover_urls[next_index]
+            stream_info.current_failover_index = next_index
+            logger.info(f"Using static failover URL #{next_index}: {next_url}")
+            return next_url
+        
+        # No failover mechanism available
+        return None
+
     async def _try_update_failover_url(self, stream_id: str, reason: str = "manual") -> bool:
         """Update to next failover URL and signal all clients to reconnect
 
@@ -1807,17 +2038,24 @@ class StreamManager:
             return False
 
         stream_info = self.streams[stream_id]
-        if not stream_info.failover_urls:
+        
+        # Check if any failover mechanism is available
+        has_failovers = bool(stream_info.failover_resolver_url or stream_info.failover_urls)
+        if not has_failovers:
             logger.warning(
-                f"No failover URLs available for stream {stream_id}")
+                f"No failover mechanism available for stream {stream_id}")
             return False
 
-        # Update to next failover URL
-        next_index = (stream_info.current_failover_index +
-                      1) % len(stream_info.failover_urls)
+        # Resolve the next failover URL using the preferred method
         old_url = stream_info.current_url
-        stream_info.current_url = stream_info.failover_urls[next_index]
-        stream_info.current_failover_index = next_index
+        next_url = await self._resolve_next_failover_url(stream_id)
+        
+        if not next_url:
+            logger.warning(f"No more failover URLs available for stream {stream_id}")
+            return False
+        
+        # Update stream info
+        stream_info.current_url = next_url
         stream_info.failover_attempts += 1
         stream_info.last_failover_time = datetime.now(timezone.utc)
 
@@ -1846,7 +2084,7 @@ class StreamManager:
         await self._emit_event("FAILOVER_TRIGGERED", stream_id, {
             "old_url": old_url,
             "new_url": stream_info.current_url,
-            "failover_index": next_index,
+            "failover_index": stream_info.current_failover_index,
             "attempt_number": stream_info.failover_attempts,
             "reason": reason,
             "client_count": len(stream_info.connected_clients)
@@ -1918,6 +2156,15 @@ class StreamManager:
         for stream_id in inactive_streams:
             if stream_id in self.streams:
                 logger.info(f"Cleaning up inactive stream: {stream_id}")
+
+                # Stop any transcoding processes for this stream
+                stream_info = self.streams[stream_id]
+                if stream_info.is_transcoded and stream_info.transcode_stream_key and self.pooled_manager:
+                    try:
+                        logger.info(f"Stopping transcoding process for inactive stream: {stream_info.transcode_stream_key}")
+                        await self.pooled_manager.force_stop_stream(stream_info.transcode_stream_key)
+                    except Exception as e:
+                        logger.warning(f"Error stopping transcoding process during cleanup: {e}")
 
                 # Emit stream_stopped event before removing the stream
                 await self._emit_event("STREAM_STOPPED", stream_id, {

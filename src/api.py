@@ -520,9 +520,13 @@ def get_client_info(request: Request):
         # Fallback to direct connection IP
         ip_address = request.client.host
 
+    # Extract username from query parameter (set by m3u-editor for auth tracking)
+    username = request.query_params.get("username")
+
     return {
         "user_agent": request.headers.get("user-agent") or "unknown",
-        "ip_address": ip_address
+        "ip_address": ip_address,
+        "username": username
     }
 
 
@@ -931,7 +935,8 @@ async def get_hls_playlist(
                 client_id,
                 stream_id,
                 user_agent=client_info_data["user_agent"],
-                ip_address=client_info_data["ip_address"]
+                ip_address=client_info_data["ip_address"],
+                username=client_info_data.get("username")
             )
 
             # Emit client connected event
@@ -941,7 +946,8 @@ async def get_hls_playlist(
                 data={
                     "client_id": client_id,
                     "user_agent": client_info_data["user_agent"],
-                    "ip_address": client_info_data["ip_address"]
+                    "ip_address": client_info_data["ip_address"],
+                    "username": client_info_data.get("username")
                 }
             )
             await event_manager.emit_event(event)
@@ -1054,7 +1060,8 @@ async def get_hls_segment(
             client_id,
             stream_id,  # Use the parent HLS stream ID
             user_agent=client_info_data["user_agent"],
-            ip_address=client_info_data["ip_address"]
+            ip_address=client_info_data["ip_address"],
+            username=client_info_data.get("username")
         )
 
         # For HLS segments, we need to fetch the segment directly without creating a separate stream
@@ -1125,10 +1132,11 @@ async def get_direct_stream(
                 client_id,
                 stream_id,
                 user_agent=client_info_data["user_agent"],
-                ip_address=client_info_data["ip_address"]
+                ip_address=client_info_data["ip_address"],
+                username=client_info_data.get("username")
             )
             logger.info(
-                f"Registered client {client_id} for stream {stream_id}")
+                f"Registered client {client_id} for stream {stream_id}" + (f" (username: {client_info_data.get('username')})" if client_info_data.get('username') else ""))
         else:
             logger.debug(
                 f"Reusing existing client {client_id} for stream {stream_id}")

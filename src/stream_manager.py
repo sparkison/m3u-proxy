@@ -32,6 +32,7 @@ class ClientInfo:
     last_access: datetime
     user_agent: Optional[str] = None
     ip_address: Optional[str] = None
+    username: Optional[str] = None  # Username for tracking auth (from m3u-editor)
     stream_id: Optional[str] = None
     bytes_served: int = 0
     segments_served: int = 0
@@ -415,7 +416,8 @@ class StreamManager:
         client_id: str,
         stream_id: str,
         user_agent: Optional[str] = None,
-        ip_address: Optional[str] = None
+        ip_address: Optional[str] = None,
+        username: Optional[str] = None
     ) -> ClientInfo:
         """Register a client for a stream
 
@@ -439,11 +441,12 @@ class StreamManager:
                 last_access=now,
                 user_agent=user_agent,
                 ip_address=ip_address,
+                username=username,
                 stream_id=effective_stream_id
             )
             self._stats.total_clients += 1
             self._stats.active_clients += 1
-            logger.info(f"Registered new client: {client_id}")
+            logger.info(f"Registered new client: {client_id}" + (f" (username: {username})" if username else ""))
 
         if effective_stream_id in self.stream_clients:
             self.stream_clients[effective_stream_id].add(client_id)
@@ -455,11 +458,15 @@ class StreamManager:
         client_info.last_access = now
         client_info.stream_id = effective_stream_id
         client_info.is_connected = True
+        # Update username if provided (may be set on subsequent requests)
+        if username:
+            client_info.username = username
 
         await self._emit_event("CLIENT_CONNECTED", effective_stream_id, {
             "client_id": client_id,
             "user_agent": user_agent,
             "ip_address": ip_address,
+            "username": username,
             "stream_client_count": len(self.stream_clients[effective_stream_id]) if effective_stream_id in self.stream_clients else 0
         })
 
@@ -2343,6 +2350,7 @@ class StreamManager:
                     "stream_id": client.stream_id,
                     "user_agent": client.user_agent,
                     "ip_address": client.ip_address,
+                    "username": client.username,
                     "bytes_served": client.bytes_served,
                     "segments_served": client.segments_served,
                     "created_at": client.created_at.isoformat(),

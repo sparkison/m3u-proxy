@@ -520,8 +520,8 @@ def get_client_info(request: Request):
         # Fallback to direct connection IP
         ip_address = request.client.host
 
-    # Extract username from query parameter (set by m3u-editor for auth tracking)
-    username = request.query_params.get("username")
+    # Get username from X-Username header (set by m3u-editor for auth tracking)
+    username = request.headers.get("x-username")
 
     return {
         "user_agent": request.headers.get("user-agent") or "unknown",

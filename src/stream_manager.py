@@ -95,6 +95,11 @@ class StreamInfo:
     strict_live_ts: bool = False
     # Circuit breaker - track bad upstream endpoints temporarily
     upstream_marked_bad_until: Optional[datetime] = None
+    # Bitrate monitoring - track bytes and detect degraded streams
+    bitrate_check_start_time: Optional[float] = None
+    bitrate_bytes_window: int = 0
+    low_bitrate_count: int = 0
+    bitrate_monitoring_started: bool = False
 
 
 @dataclass
@@ -558,7 +563,8 @@ class StreamManager:
             if datetime.now(timezone.utc) < stream_info.upstream_marked_bad_until:
                 logger.warning(
                     f"Stream {stream_id} upstream marked as bad until {stream_info.upstream_marked_bad_until}, attempting immediate failover")
-                if stream_info.failover_urls:
+                has_failover = bool(stream_info.failover_resolver_url or stream_info.failover_urls)
+                if has_failover:
                     await self._try_update_failover_url(stream_id, "circuit_breaker_bad_upstream")
                     current_url = stream_info.current_url or stream_info.original_url
                     # Clear the bad marker since we switched to a new upstream
@@ -755,6 +761,75 @@ class StreamManager:
                         bytes_served += len(chunk)
                         chunk_count += 1
 
+                        # Bitrate monitoring - detect degraded streams
+                        if settings.ENABLE_BITRATE_MONITORING and stream_info:
+                            current_time = asyncio.get_event_loop().time()
+                            
+                            # Grace period - don't monitor during initial buffering
+                            if not stream_info.bitrate_monitoring_started:
+                                if stream_info.bitrate_check_start_time is None:
+                                    stream_info.bitrate_check_start_time = current_time
+                                elif current_time - stream_info.bitrate_check_start_time >= settings.BITRATE_MONITORING_GRACE_PERIOD:
+                                    # Grace period over, start real monitoring
+                                    stream_info.bitrate_monitoring_started = True
+                                    stream_info.bitrate_check_start_time = current_time
+                                    stream_info.bitrate_bytes_window = 0
+                            else:
+                                # Add bytes to current window
+                                stream_info.bitrate_bytes_window += len(chunk)
+                                
+                                # Check if interval elapsed
+                                elapsed = current_time - (stream_info.bitrate_check_start_time or current_time)
+                                if elapsed >= settings.BITRATE_CHECK_INTERVAL:
+                                    # Calculate bitrate in bytes/second
+                                    bitrate = stream_info.bitrate_bytes_window / elapsed if elapsed > 0 else 0
+                                    
+                                    if bitrate < settings.MIN_BITRATE_THRESHOLD:
+                                        stream_info.low_bitrate_count += 1
+                                        logger.warning(
+                                            f"Low bitrate detected for stream {stream_id}: "
+                                            f"{bitrate:.0f} B/s ({bitrate * 8 / 1000:.0f} Kbps), "
+                                            f"threshold: {settings.MIN_BITRATE_THRESHOLD * 8 / 1000:.0f} Kbps, "
+                                            f"count: {stream_info.low_bitrate_count}/{settings.BITRATE_FAILOVER_THRESHOLD}"
+                                        )
+                                        
+                                        # Trigger failover if threshold exceeded
+                                        if stream_info.low_bitrate_count >= settings.BITRATE_FAILOVER_THRESHOLD:
+                                            has_failover = bool(stream_info.failover_resolver_url or stream_info.failover_urls)
+                                            if has_failover and failover_count < max_failovers:
+                                                logger.error(
+                                                    f"Bitrate consistently below threshold for stream {stream_id}, "
+                                                    f"triggering failover (attempt {failover_count + 1}/{max_failovers})"
+                                                )
+                                                await self._try_update_failover_url(stream_id, "low_bitrate")
+                                                # Reset bitrate monitoring for new connection
+                                                stream_info.low_bitrate_count = 0
+                                                stream_info.bitrate_monitoring_started = False
+                                                stream_info.bitrate_check_start_time = None
+                                                stream_info.bitrate_bytes_window = 0
+                                                failover_count += 1
+                                                # Close current connection
+                                                if stream_context is not None:
+                                                    try:
+                                                        await stream_context.__aexit__(None, None, None)
+                                                    except Exception:
+                                                        pass
+                                                stream_context = None
+                                                response = None
+                                                break  # Reconnect with new URL
+                                    else:
+                                        # Good bitrate - reset counter
+                                        if stream_info.low_bitrate_count > 0:
+                                            logger.info(
+                                                f"Bitrate recovered for stream {stream_id}: "
+                                                f"{bitrate * 8 / 1000:.0f} Kbps, resetting low bitrate counter"
+                                            )
+                                        stream_info.low_bitrate_count = 0
+                                    
+                                    # Reset window for next interval
+                                    stream_info.bitrate_check_start_time = current_time
+                                    stream_info.bitrate_bytes_window = 0
+
                         # Update idle tracking every chunk (important for idle detection accuracy)
                         # This ensures we accurately detect when data is flowing vs stuck
                         if client_id in self.clients:
@@ -802,8 +877,9 @@ class StreamManager:
                             logger.warning(
                                 f"STRICT MODE: Marking upstream as bad for {cooldown_seconds}s until {stream_info.upstream_marked_bad_until}")
 
-                            # Try failover if available
-                            if stream_info.failover_urls and failover_count < max_failovers:
+                            # Try failover if available (check both resolver URL and static list)
+                            has_failover = bool(stream_info.failover_resolver_url or stream_info.failover_urls)
+                            if has_failover and failover_count < max_failovers:
                                 logger.info(
                                     f"STRICT MODE: Attempting failover due to circuit breaker")
                                 await self._try_update_failover_url(stream_id, "circuit_breaker_timeout")
@@ -839,8 +915,9 @@ class StreamManager:
                         f"ReadError for client {client_id}: {error_str} (bytes_served: {bytes_served}, chunk_count: {chunk_count})")
 
                     if bytes_served == 0:
-                        # No data was sent - try failover if available
-                        if stream_info.failover_urls and failover_count < max_failovers:
+                        # No data was sent - try failover if available (check both resolver URL and static list)
+                        has_failover = bool(stream_info.failover_resolver_url or stream_info.failover_urls)
+                        if has_failover and failover_count < max_failovers:
                             logger.info(
                                 f"Attempting automatic failover for client {client_id} (ReadError, no data)")
                             await self._try_update_failover_url(stream_id, "connection_error")
@@ -880,8 +957,9 @@ class StreamManager:
                     logger.warning(
                         f"Stream error for client {client_id}: {type(e).__name__}: {e}")
 
-                    # Try automatic failover
-                    if stream_info.failover_urls and failover_count < max_failovers:
+                    # Try automatic failover (check both resolver URL and static list)
+                    has_failover = bool(stream_info.failover_resolver_url or stream_info.failover_urls)
+                    if has_failover and failover_count < max_failovers:
                         logger.info(
                             f"Attempting automatic failover for client {client_id} (attempt {failover_count + 1}/{max_failovers})")
                         await self._try_update_failover_url(stream_id, f"stream_error_{type(e).__name__}")
@@ -900,7 +978,7 @@ class StreamManager:
                             "client_id": client_id,
                             "error": str(e),
                             "error_type": type(e).__name__,
-                            "no_failover": not stream_info.failover_urls
+                            "no_failover": not has_failover
                         })
                         break
 
@@ -937,8 +1015,9 @@ class StreamManager:
                         })
                         break
                     else:
-                        # Try failover for unknown errors too
-                        if stream_info.failover_urls and failover_count < max_failovers:
+                        # Try failover for unknown errors too (check both resolver URL and static list)
+                        has_failover = bool(stream_info.failover_resolver_url or stream_info.failover_urls)
+                        if has_failover and failover_count < max_failovers:
                             logger.info(
                                 f"Attempting automatic failover for client {client_id} (unknown error)")
                             await self._try_update_failover_url(stream_id, f"unknown_error_{type(e).__name__}")
@@ -1367,8 +1446,9 @@ class StreamManager:
                     logger.error(
                         f"Error during pooled transcoding for client {client_id}: {e}")
 
-                    # Try automatic failover
-                    if stream_info.failover_urls and failover_count < max_failovers:
+                    # Try automatic failover (check both resolver URL and static list)
+                    has_failover = bool(stream_info.failover_resolver_url or stream_info.failover_urls)
+                    if has_failover and failover_count < max_failovers:
                         logger.info(
                             f"Attempting automatic failover for transcoded stream (attempt {failover_count + 1}/{max_failovers})")
                         await self._try_update_failover_url(stream_id, f"transcode_error_{type(e).__name__}")
@@ -1495,16 +1575,20 @@ class StreamManager:
             return None
 
         stream_info = self.streams[stream_id]
-
-        if not stream_info.failover_urls:
+        
+        # Check if any failover mechanism is available
+        has_failover = bool(stream_info.failover_resolver_url or stream_info.failover_urls)
+        if not has_failover:
             logger.warning(
-                f"No failover URLs available for stream {stream_id}")
+                f"No failover mechanism available for stream {stream_id}")
             return None
 
-        # Try next failover URL
-        next_index = (stream_info.current_failover_index +
-                      1) % len(stream_info.failover_urls)
-        next_url = stream_info.failover_urls[next_index]
+        # Resolve next failover URL using the preferred method
+        next_url = await self._resolve_next_failover_url(stream_id)
+        
+        if not next_url:
+            logger.warning(f"No more failover URLs available for stream {stream_id}")
+            return None
 
         logger.info(
             f"Attempting failover for stream {stream_id} to: {next_url}")
@@ -1526,7 +1610,7 @@ class StreamManager:
             # Update stream info
             old_url = stream_info.current_url
             stream_info.current_url = next_url
-            stream_info.current_failover_index = next_index
+            # Note: current_failover_index is already incremented by _resolve_next_failover_url
             stream_info.failover_attempts += 1
             stream_info.last_failover_time = datetime.now(timezone.utc)
 
@@ -1535,7 +1619,7 @@ class StreamManager:
             await self._emit_event("FAILOVER_TRIGGERED", stream_id, {
                 "old_url": old_url,
                 "new_url": next_url,
-                "failover_index": next_index,
+                "failover_index": stream_info.current_failover_index,
                 "attempt_number": stream_info.failover_attempts,
                 "reason": str(error),
                 "seamless": True
@@ -1549,7 +1633,15 @@ class StreamManager:
             stream_info.failover_attempts += 1
 
             # Try next failover URL recursively if available
-            if stream_info.failover_attempts < len(stream_info.failover_urls) * stream_info.max_retries:
+            # Calculate max attempts based on available failover mechanism
+            if stream_info.failover_urls:
+                max_attempts = len(stream_info.failover_urls) * stream_info.max_retries
+            elif stream_info.failover_resolver_url:
+                max_attempts = 10 * stream_info.max_retries  # Allow more attempts for resolver-based failover
+            else:
+                max_attempts = 0
+                
+            if stream_info.failover_attempts < max_attempts:
                 return await self._seamless_failover(stream_id, e)
 
             return None
@@ -1929,8 +2021,9 @@ class StreamManager:
                             (datetime.now(timezone.utc) - stream_info.last_health_check).total_seconds() >= stream_info.health_check_interval):
 
                         is_healthy = await self._health_check_stream(stream_id)
+                        has_failover = bool(stream_info.failover_resolver_url or stream_info.failover_urls)
 
-                        if not is_healthy and stream_info.failover_urls:
+                        if not is_healthy and has_failover:
                             logger.warning(
                                 f"Stream {stream_id} failed health check, triggering failover")
                             # Trigger failover which will signal all clients to reconnect

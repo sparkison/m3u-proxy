@@ -104,6 +104,21 @@ class Settings(BaseSettings):
     # Maximum chunk wait time in seconds for pre-buffer (to avoid infinite wait)
     STRICT_LIVE_TS_PREBUFFER_TIMEOUT: int = 10
 
+    # Bitrate Quality Monitoring - detect slow/degraded streams and trigger failover
+    # Enable bitrate monitoring for automatic failover on degraded streams
+    ENABLE_BITRATE_MONITORING: bool = False
+    # Minimum expected bitrate in bytes per second (default: 500 Kbps = 62500 bytes/sec)
+    # Streams consistently below this threshold will trigger failover
+    MIN_BITRATE_THRESHOLD: int = 62500
+    # How often to check bitrate (in seconds) - measurement window
+    BITRATE_CHECK_INTERVAL: float = 5.0
+    # Number of consecutive low-bitrate checks before triggering failover
+    # This prevents failover on brief network hiccups
+    BITRATE_FAILOVER_THRESHOLD: int = 3
+    # Grace period (seconds) at stream start before bitrate monitoring kicks in
+    # Allows for initial buffering/connection establishment
+    BITRATE_MONITORING_GRACE_PERIOD: float = 10.0
+
     # Model configuration
     model_config = SettingsConfigDict(
         env_file=".env",

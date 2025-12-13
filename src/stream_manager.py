@@ -95,6 +95,11 @@ class StreamInfo:
     strict_live_ts: bool = False
     # Circuit breaker - track bad upstream endpoints temporarily
     upstream_marked_bad_until: Optional[datetime] = None
+    # Bitrate monitoring - track bytes and detect degraded streams
+    bitrate_check_start_time: Optional[float] = None
+    bitrate_bytes_window: int = 0
+    low_bitrate_count: int = 0
+    bitrate_monitoring_started: bool = False
 
 
 @dataclass
@@ -755,6 +760,75 @@ class StreamManager:
                         yield chunk
                         bytes_served += len(chunk)
                         chunk_count += 1
+
+                        # Bitrate monitoring - detect degraded streams
+                        if settings.ENABLE_BITRATE_MONITORING and stream_info:
+                            current_time = asyncio.get_event_loop().time()
+                            
+                            # Grace period - don't monitor during initial buffering
+                            if not stream_info.bitrate_monitoring_started:
+                                if stream_info.bitrate_check_start_time is None:
+                                    stream_info.bitrate_check_start_time = current_time
+                                elif current_time - stream_info.bitrate_check_start_time >= settings.BITRATE_MONITORING_GRACE_PERIOD:
+                                    # Grace period over, start real monitoring
+                                    stream_info.bitrate_monitoring_started = True
+                                    stream_info.bitrate_check_start_time = current_time
+                                    stream_info.bitrate_bytes_window = 0
+                            else:
+                                # Add bytes to current window
+                                stream_info.bitrate_bytes_window += len(chunk)
+                                
+                                # Check if interval elapsed
+                                elapsed = current_time - (stream_info.bitrate_check_start_time or current_time)
+                                if elapsed >= settings.BITRATE_CHECK_INTERVAL:
+                                    # Calculate bitrate in bytes/second
+                                    bitrate = stream_info.bitrate_bytes_window / elapsed if elapsed > 0 else 0
+                                    
+                                    if bitrate < settings.MIN_BITRATE_THRESHOLD:
+                                        stream_info.low_bitrate_count += 1
+                                        logger.warning(
+                                            f"Low bitrate detected for stream {stream_id}: "
+                                            f"{bitrate:.0f} B/s ({bitrate * 8 / 1000:.0f} Kbps), "
+                                            f"threshold: {settings.MIN_BITRATE_THRESHOLD * 8 / 1000:.0f} Kbps, "
+                                            f"count: {stream_info.low_bitrate_count}/{settings.BITRATE_FAILOVER_THRESHOLD}"
+                                        )
+                                        
+                                        # Trigger failover if threshold exceeded
+                                        if stream_info.low_bitrate_count >= settings.BITRATE_FAILOVER_THRESHOLD:
+                                            has_failover = bool(stream_info.failover_resolver_url or stream_info.failover_urls)
+                                            if has_failover and failover_count < max_failovers:
+                                                logger.error(
+                                                    f"Bitrate consistently below threshold for stream {stream_id}, "
+                                                    f"triggering failover (attempt {failover_count + 1}/{max_failovers})"
+                                                )
+                                                await self._try_update_failover_url(stream_id, "low_bitrate")
+                                                # Reset bitrate monitoring for new connection
+                                                stream_info.low_bitrate_count = 0
+                                                stream_info.bitrate_monitoring_started = False
+                                                stream_info.bitrate_check_start_time = None
+                                                stream_info.bitrate_bytes_window = 0
+                                                failover_count += 1
+                                                # Close current connection
+                                                if stream_context is not None:
+                                                    try:
+                                                        await stream_context.__aexit__(None, None, None)
+                                                    except Exception:
+                                                        pass
+                                                stream_context = None
+                                                response = None
+                                                break  # Reconnect with new URL
+                                    else:
+                                        # Good bitrate - reset counter
+                                        if stream_info.low_bitrate_count > 0:
+                                            logger.info(
+                                                f"Bitrate recovered for stream {stream_id}: "
+                                                f"{bitrate * 8 / 1000:.0f} Kbps, resetting low bitrate counter"
+                                            )
+                                        stream_info.low_bitrate_count = 0
+                                    
+                                    # Reset window for next interval
+                                    stream_info.bitrate_check_start_time = current_time
+                                    stream_info.bitrate_bytes_window = 0
 
                         # Update idle tracking every chunk (important for idle detection accuracy)
                         # This ensures we accurately detect when data is flowing vs stuck

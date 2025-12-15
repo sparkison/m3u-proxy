@@ -154,12 +154,29 @@ curl "http://localhost:8085/stats/detailed" \
       "original_url": "http://primary.com/stream",
       "current_url": "http://backup1.com/stream",
       "has_failover": true,
+      "failover_urls": [
+        "http://backup1.com/stream",
+        "http://backup2.com/stream"
+      ],
+      "failover_resolver_url": "http://m3u-editor:36400/api/failover",
+      "current_failover_index": 1,
       "failover_attempts": 2,
       "last_failover_time": "2025-11-05T10:30:00Z"
     }
   ]
 }
 ```
+
+### Stream Failover Fields Reference
+
+| Field | Type | Description |
+|:------|:-----|:------------|
+| `has_failover` | boolean | True if failover URLs or resolver configured |
+| `failover_urls` | array | List of configured backup URLs |
+| `failover_resolver_url` | string/null | Dynamic resolver URL for failover |
+| `current_failover_index` | integer | Index of currently active URL (0=primary) |
+| `failover_attempts` | integer | Total number of failover attempts |
+| `last_failover_time` | string/null | ISO timestamp of last failover event |
 
 ## Player Integration
 

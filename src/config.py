@@ -2,7 +2,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from typing import Optional
 
 # Application version
-VERSION = "0.2.38"
+VERSION = "0.2.39"
 
 
 class Settings(BaseSettings):
@@ -45,16 +45,21 @@ class Settings(BaseSettings):
 
     # HTTP Client Timeout Configuration for Streaming
     # VOD (Video On Demand) timeout - allows clients to pause content for extended periods
-    VOD_READ_TIMEOUT: float = 300.0  # 5 minutes - allows upstream CDN stalls/re-buffering
-    VOD_WRITE_TIMEOUT: float = 3600.0  # 1 hour - allows client pause without losing session
+    # 5 minutes - allows upstream CDN stalls/re-buffering
+    VOD_READ_TIMEOUT: float = 300.0
+    # 1 hour - allows client pause without losing session
+    VOD_WRITE_TIMEOUT: float = 3600.0
     # Live TV timeout - emphasizes keeping connection alive during client buffering
-    LIVE_TV_WRITE_TIMEOUT: float = 1800.0  # 30 minutes - safety net while supporting client backpressure
+    # 30 minutes - safety net while supporting client backpressure
+    LIVE_TV_WRITE_TIMEOUT: float = 1800.0
 
     # Connection Idle Monitoring - detect and alert on long-held connections that may be resource leaks
     # Alert threshold for connections held idle (warning log when exceeded)
-    CONNECTION_IDLE_ALERT_THRESHOLD: int = 600  # 10 minutes - emit WARNING when connection idle exceeds this
+    # 10 minutes - emit WARNING when connection idle exceeds this
+    CONNECTION_IDLE_ALERT_THRESHOLD: int = 600
     # Alert threshold for very long-held connections (error log)
-    CONNECTION_IDLE_ERROR_THRESHOLD: int = 1800  # 30 minutes - emit ERROR when connection idle exceeds this
+    # 30 minutes - emit ERROR when connection idle exceeds this
+    CONNECTION_IDLE_ERROR_THRESHOLD: int = 1800
     # Enable connection idle monitoring (can be disabled for high-throughput scenarios)
     ENABLE_CONNECTION_IDLE_MONITORING: bool = True
 

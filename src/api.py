@@ -1567,6 +1567,91 @@ async def delete_stream(stream_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.delete("/streams/by-metadata", dependencies=[Depends(verify_token)])
+async def delete_streams_by_metadata(
+    field: str = Query(..., description="Metadata field to filter by"),
+    value: str = Query(..., description="Value to match"),
+    exclude_channel_id: Optional[str] = Query(None, description="Channel ID to exclude from deletion (keep this stream)")
+):
+    """
+    Delete all streams matching a specific metadata field/value.
+    
+    This is useful for connection limit management:
+    - When switching channels on a limited connection playlist, stop the old stream first
+    - Pass exclude_channel_id to keep the new stream you're about to create
+    
+    Common use cases:
+    - Stop all streams for a playlist: field=playlist_uuid, value=<uuid>
+    - Stop all streams for a specific type: field=type, value=channel|episode
+    """
+    try:
+        deleted_streams = []
+        skipped_streams = []
+        
+        # Find all streams that match the metadata criteria
+        for stream_id, stream_info in list(stream_manager.streams.items()):
+            metadata = stream_info.metadata or {}
+            
+            # Check if this stream matches the filter criteria
+            if field in metadata and str(metadata[field]) == str(value):
+                # Check if this stream should be excluded (e.g., keeping the new channel)
+                if exclude_channel_id and metadata.get('id') == str(exclude_channel_id):
+                    skipped_streams.append({
+                        "stream_id": stream_id,
+                        "reason": "excluded_by_channel_id"
+                    })
+                    continue
+                
+                # Delete this stream
+                logger.info(f"Deleting stream {stream_id} matching {field}={value}")
+                
+                # For transcoded streams, force stop the FFmpeg process immediately
+                if stream_info.is_transcoded and stream_manager.pooled_manager:
+                    try:
+                        stream_key = stream_manager.pooled_manager._generate_stream_key(
+                            stream_info.current_url or stream_info.original_url,
+                            stream_info.transcode_profile or "default"
+                        )
+                        await stream_manager.pooled_manager.force_stop_stream(stream_key)
+                    except Exception as e:
+                        logger.warning(f"Error stopping transcoding for stream {stream_id}: {e}")
+
+                # Clean up all clients for this stream
+                if stream_id in stream_manager.stream_clients:
+                    client_ids = list(stream_manager.stream_clients[stream_id])
+                    for client_id in client_ids:
+                        await stream_manager.cleanup_client(client_id)
+
+                # Emit stream_stopped event
+                await stream_manager._emit_event("STREAM_STOPPED", stream_id, {
+                    "reason": "metadata_filter_deletion",
+                    "filter_field": field,
+                    "filter_value": value,
+                    "was_transcoded": stream_info.is_transcoded
+                })
+
+                # Remove stream
+                if stream_id in stream_manager.streams:
+                    del stream_manager.streams[stream_id]
+                if stream_id in stream_manager.stream_clients:
+                    del stream_manager.stream_clients[stream_id]
+                
+                stream_manager._stats.active_streams -= 1
+                deleted_streams.append(stream_id)
+
+        return {
+            "message": f"Deleted {len(deleted_streams)} stream(s) matching {field}={value}",
+            "deleted_streams": deleted_streams,
+            "skipped_streams": skipped_streams,
+            "deleted_count": len(deleted_streams)
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error deleting streams by metadata: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/streams/{stream_id}/failover", dependencies=[Depends(verify_token)])
 async def trigger_failover(stream_id: str):
     """Manually trigger failover for a stream - will seamlessly switch all active clients to the next failover URL"""

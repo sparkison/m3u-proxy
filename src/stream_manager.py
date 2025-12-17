@@ -322,8 +322,8 @@ class StreamManager:
         if url_lower.endswith('.m3u8'):
             return (True, False, False)
 
-        # VOD detection (typically non-.ts video files)
-        if url_lower.endswith(('.mp4', '.mkv', '.webm', '.avi')):
+        # VOD/Timeshift detection - these should NOT use strict mode
+        if url_lower.endswith(('.mp4', '.mkv', '.webm', '.avi')) or '/timeshift/' in url_lower or '/movie/' in url_lower or '/series/' in url_lower:
             return (False, True, False)
 
         # Live continuous stream (.ts or live path)
@@ -556,10 +556,12 @@ class StreamManager:
         self.client_cancel_events[client_id] = cancel_event
 
         # Determine if strict mode is enabled (global or per-stream)
-        strict_mode_enabled = settings.STRICT_LIVE_TS or stream_info.strict_live_ts
+        # NEVER apply strict mode to VOD/timeshift content - it needs more time to start
+        strict_mode_enabled = (settings.STRICT_LIVE_TS or stream_info.strict_live_ts) and not stream_info.is_vod
 
         # Check circuit breaker - if upstream marked as bad, try failover immediately
-        if strict_mode_enabled and stream_info.upstream_marked_bad_until:
+        # Skip for VOD/timeshift since it's provider-specific
+        if strict_mode_enabled and stream_info.upstream_marked_bad_until and not stream_info.is_vod:
             if datetime.now(timezone.utc) < stream_info.upstream_marked_bad_until:
                 logger.warning(
                     f"Stream {stream_id} upstream marked as bad until {stream_info.upstream_marked_bad_until}, attempting immediate failover")
@@ -794,9 +796,10 @@ class StreamManager:
                                         )
                                         
                                         # Trigger failover if threshold exceeded
+                                        # Skip failover for VOD/timeshift since it's provider-specific
                                         if stream_info.low_bitrate_count >= settings.BITRATE_FAILOVER_THRESHOLD:
                                             has_failover = bool(stream_info.failover_resolver_url or stream_info.failover_urls)
-                                            if has_failover and failover_count < max_failovers:
+                                            if has_failover and failover_count < max_failovers and not stream_info.is_vod:
                                                 logger.error(
                                                     f"Bitrate consistently below threshold for stream {stream_id}, "
                                                     f"triggering failover (attempt {failover_count + 1}/{max_failovers})"
@@ -865,7 +868,8 @@ class StreamManager:
                                 f"Client {client_id}: {chunk_count} chunks, {bytes_served:,} bytes served")
 
                     # Check circuit breaker after loop exits (if strict mode enabled)
-                    if strict_mode_enabled and circuit_breaker_timeout > 0:
+                    # Skip for VOD/timeshift since failover doesn't make sense for provider-specific content
+                    if strict_mode_enabled and circuit_breaker_timeout > 0 and not stream_info.is_vod:
                         time_since_last_chunk = asyncio.get_event_loop().time() - last_chunk_time
                         if time_since_last_chunk > circuit_breaker_timeout:
                             logger.error(
@@ -916,8 +920,9 @@ class StreamManager:
 
                     if bytes_served == 0:
                         # No data was sent - try failover if available (check both resolver URL and static list)
+                        # Skip failover for VOD/timeshift since it's provider-specific
                         has_failover = bool(stream_info.failover_resolver_url or stream_info.failover_urls)
-                        if has_failover and failover_count < max_failovers:
+                        if has_failover and failover_count < max_failovers and not stream_info.is_vod:
                             logger.info(
                                 f"Attempting automatic failover for client {client_id} (ReadError, no data)")
                             await self._try_update_failover_url(stream_id, "connection_error")
@@ -958,8 +963,9 @@ class StreamManager:
                         f"Stream error for client {client_id}: {type(e).__name__}: {e}")
 
                     # Try automatic failover (check both resolver URL and static list)
+                    # Skip failover for VOD/timeshift since it's provider-specific
                     has_failover = bool(stream_info.failover_resolver_url or stream_info.failover_urls)
-                    if has_failover and failover_count < max_failovers:
+                    if has_failover and failover_count < max_failovers and not stream_info.is_vod:
                         logger.info(
                             f"Attempting automatic failover for client {client_id} (attempt {failover_count + 1}/{max_failovers})")
                         await self._try_update_failover_url(stream_id, f"stream_error_{type(e).__name__}")
@@ -1016,8 +1022,9 @@ class StreamManager:
                         break
                     else:
                         # Try failover for unknown errors too (check both resolver URL and static list)
+                        # Skip failover for VOD/timeshift since it's provider-specific
                         has_failover = bool(stream_info.failover_resolver_url or stream_info.failover_urls)
-                        if has_failover and failover_count < max_failovers:
+                        if has_failover and failover_count < max_failovers and not stream_info.is_vod:
                             logger.info(
                                 f"Attempting automatic failover for client {client_id} (unknown error)")
                             await self._try_update_failover_url(stream_id, f"unknown_error_{type(e).__name__}")

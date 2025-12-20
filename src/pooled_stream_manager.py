@@ -368,13 +368,32 @@ class SharedTranscodingProcess:
                 'end of file',
             ]
 
+            # Read stderr in small chunks and buffer lines ourselves to avoid
+            # asyncio.StreamReader's LimitOverrunError when ffmpeg writes very
+            # long lines without a newline (which results in the message
+            # "Separator is not found, and chunk exceed the limit"). This keeps
+            # the stderr reader alive instead of letting an exception kill the
+            # task and potentially lead to the stream being cleaned up later.
+            buf = b""
+            CHUNK_SIZE = 4096
+            MAX_BUFFER = 10 * 1024 * 1024  # 10 MB
+
             while self.process and self.process.returncode is None:
-                line = await self.process.stderr.readline()
-                if not line:
+                # Read a small chunk from stderr; this will never raise
+                # LimitOverrunError because we are not using readline/readuntil.
+                chunk = await self.process.stderr.read(CHUNK_SIZE)
+                if not chunk:
                     break
 
-                line_str = line.decode('utf-8', errors='ignore').strip()
-                if line_str:
+                buf += chunk
+
+                # Split on newline and process full lines
+                while b"\n" in buf:
+                    line, buf = buf.split(b"\n", 1)
+                    line_str = line.decode('utf-8', errors='ignore').strip()
+                    if not line_str:
+                        continue
+
                     # Log FFmpeg output (you could parse stats here)
                     logger.debug(f"FFmpeg [{self.stream_id}]: {line_str}")
 
@@ -399,6 +418,13 @@ class SharedTranscodingProcess:
                             # Mark stream as failed due to input error
                             self.status = "input_failed"
                             break
+
+                # Safety: prevent the buffer from growing without bound
+                if len(buf) > MAX_BUFFER:
+                    logger.warning(
+                        f"Stderr buffer exceeded {MAX_BUFFER} bytes for {self.stream_id}, truncating"
+                    )
+                    buf = b""
 
         except Exception as e:
             logger.error(

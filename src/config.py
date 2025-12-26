@@ -73,6 +73,7 @@ class Settings(BaseSettings):
     REDIS_HOST: str = "localhost"
     REDIS_SERVER_PORT: int = 6379
     REDIS_DB: int = 0
+    REDIS_PASSWORD: Optional[str] = None
     REDIS_ENABLED: bool = False
     ENABLE_TRANSCODING_POOLING: bool = True
     MAX_CLIENTS_PER_SHARED_STREAM: int = 10

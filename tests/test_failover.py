@@ -315,9 +315,10 @@ class TestFFmpegErrorPatterns:
         mock_process = Mock()
         mock_stderr = AsyncMock()
 
-        # Simulate FFmpeg stderr output with input error
+        # Simulate FFmpeg stderr output with input error as chunked reads
         error_line = b"Error opening input file http://example.com/stream.m3u8: Input/output error\n"
-        mock_stderr.readline = AsyncMock(side_effect=[error_line, b""])
+        # _log_stderr reads chunks via read(CHUNK_SIZE) and buffers/splits on newlines
+        mock_stderr.read = AsyncMock(side_effect=[error_line, b""])
 
         mock_process.stderr = mock_stderr
         mock_process.returncode = None

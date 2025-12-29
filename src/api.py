@@ -343,7 +343,7 @@ event_manager = EventManager()
 async def lifespan(app: FastAPI):
     """Lifespan context manager for startup and shutdown events"""
     # Startup
-    logger.info("m3u proxy starting up...")
+    logger.info("⚡️ m3u proxy starting up...")
     await event_manager.start()
 
     # Connect event manager to stream manager
@@ -397,13 +397,11 @@ if not os.path.exists(static_path):
 
 # Verify static path exists and log it
 if os.path.exists(static_path):
-    logger.info(f"✅ Static files directory found: {static_path}")
-    # List files in static directory for debugging
     try:
         static_files = os.listdir(static_path)
-        logger.info(f"📁 Static files available: {', '.join(static_files)}")
+        logger.info(f"Static files directory found")
     except Exception as e:
-        logger.warning(f"Could not list static directory: {e}")
+        logger.warning(f"❌ Could not list static directory: {e}")
 else:
     logger.error(f"❌ Static files directory NOT found at: {static_path}")
     logger.error(f"Current working directory: {os.getcwd()}")
@@ -1572,36 +1570,37 @@ async def delete_stream(stream_id: str):
 async def delete_oldest_stream_by_metadata(
     field: str = Query(..., description="Metadata field to filter by"),
     value: str = Query(..., description="Value to match"),
-    exclude_channel_id: Optional[str] = Query(None, description="Channel ID to exclude from deletion (keep this stream)")
+    exclude_channel_id: Optional[str] = Query(
+        None, description="Channel ID to exclude from deletion (keep this stream)")
 ):
     """
     Delete the OLDEST stream matching a specific metadata field/value.
-    
+
     This is useful for connection limit management with "latest wins" behavior:
     - When a playlist reaches its connection limit, stop the oldest stream to make room
     - This allows instant channel switching for single-connection providers
-    
+
     Only deletes ONE stream (the oldest), unlike /streams/by-metadata which deletes all matches.
     """
     try:
         oldest_stream_id = None
         oldest_created_at = None
-        
+
         # Find the oldest stream that matches the metadata criteria
         for stream_id, stream_info in stream_manager.streams.items():
             metadata = stream_info.metadata or {}
-            
+
             # Check if this stream matches the filter criteria
             if field in metadata and str(metadata[field]) == str(value):
                 # Check if this stream should be excluded
                 if exclude_channel_id and str(metadata.get('id')) == str(exclude_channel_id):
                     continue
-                
+
                 # Track the oldest stream
                 if oldest_created_at is None or stream_info.created_at < oldest_created_at:
                     oldest_stream_id = stream_id
                     oldest_created_at = stream_info.created_at
-        
+
         # If no matching stream found
         if oldest_stream_id is None:
             return {
@@ -1609,11 +1608,12 @@ async def delete_oldest_stream_by_metadata(
                 "deleted_stream": None,
                 "deleted_count": 0
             }
-        
+
         # Delete the oldest stream
         stream_info = stream_manager.streams[oldest_stream_id]
-        logger.info(f"Deleting oldest stream {oldest_stream_id} (created at {oldest_created_at}) matching {field}={value}")
-        
+        logger.info(
+            f"Deleting oldest stream {oldest_stream_id} (created at {oldest_created_at}) matching {field}={value}")
+
         # For transcoded streams, force stop the FFmpeg process immediately
         if stream_info.is_transcoded and stream_manager.pooled_manager:
             try:
@@ -1623,7 +1623,8 @@ async def delete_oldest_stream_by_metadata(
                 )
                 await stream_manager.pooled_manager.force_stop_stream(stream_key)
             except Exception as e:
-                logger.warning(f"Error stopping transcoding for stream {oldest_stream_id}: {e}")
+                logger.warning(
+                    f"Error stopping transcoding for stream {oldest_stream_id}: {e}")
 
         # Clean up all clients for this stream
         if oldest_stream_id in stream_manager.stream_clients:
@@ -1645,7 +1646,7 @@ async def delete_oldest_stream_by_metadata(
             del stream_manager.streams[oldest_stream_id]
         if oldest_stream_id in stream_manager.stream_clients:
             del stream_manager.stream_clients[oldest_stream_id]
-        
+
         stream_manager._stats.active_streams -= 1
 
         return {
@@ -1665,15 +1666,16 @@ async def delete_oldest_stream_by_metadata(
 async def delete_streams_by_metadata(
     field: str = Query(..., description="Metadata field to filter by"),
     value: str = Query(..., description="Value to match"),
-    exclude_channel_id: Optional[str] = Query(None, description="Channel ID to exclude from deletion (keep this stream)")
+    exclude_channel_id: Optional[str] = Query(
+        None, description="Channel ID to exclude from deletion (keep this stream)")
 ):
     """
     Delete all streams matching a specific metadata field/value.
-    
+
     This is useful for connection limit management:
     - When switching channels on a limited connection playlist, stop the old stream first
     - Pass exclude_channel_id to keep the new stream you're about to create
-    
+
     Common use cases:
     - Stop all streams for a playlist: field=playlist_uuid, value=<uuid>
     - Stop all streams for a specific type: field=type, value=channel|episode
@@ -1681,11 +1683,11 @@ async def delete_streams_by_metadata(
     try:
         deleted_streams = []
         skipped_streams = []
-        
+
         # Find all streams that match the metadata criteria
         for stream_id, stream_info in list(stream_manager.streams.items()):
             metadata = stream_info.metadata or {}
-            
+
             # Check if this stream matches the filter criteria
             if field in metadata and str(metadata[field]) == str(value):
                 # Check if this stream should be excluded (e.g., keeping the new channel)
@@ -1695,10 +1697,11 @@ async def delete_streams_by_metadata(
                         "reason": "excluded_by_channel_id"
                     })
                     continue
-                
+
                 # Delete this stream
-                logger.info(f"Deleting stream {stream_id} matching {field}={value}")
-                
+                logger.info(
+                    f"Deleting stream {stream_id} matching {field}={value}")
+
                 # For transcoded streams, force stop the FFmpeg process immediately
                 if stream_info.is_transcoded and stream_manager.pooled_manager:
                     try:
@@ -1708,7 +1711,8 @@ async def delete_streams_by_metadata(
                         )
                         await stream_manager.pooled_manager.force_stop_stream(stream_key)
                     except Exception as e:
-                        logger.warning(f"Error stopping transcoding for stream {stream_id}: {e}")
+                        logger.warning(
+                            f"Error stopping transcoding for stream {stream_id}: {e}")
 
                 # Clean up all clients for this stream
                 if stream_id in stream_manager.stream_clients:
@@ -1729,7 +1733,7 @@ async def delete_streams_by_metadata(
                     del stream_manager.streams[stream_id]
                 if stream_id in stream_manager.stream_clients:
                     del stream_manager.stream_clients[stream_id]
-                
+
                 stream_manager._stats.active_streams -= 1
                 deleted_streams.append(stream_id)
 

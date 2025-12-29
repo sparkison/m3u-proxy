@@ -657,6 +657,9 @@ class StreamManager:
                     # Get the stream context manager
                     stream_context = client_to_use.stream(
                         'GET', active_url, headers=headers, follow_redirects=True)
+                    # If the client returned a coroutine (test stub), await it to get the context manager
+                    if asyncio.iscoroutine(stream_context):
+                        stream_context = await stream_context
                     # Enter the context to get the response object
                     response = await stream_context.__aenter__()
 
@@ -695,10 +698,17 @@ class StreamManager:
                         prebuffer_timeout = settings.STRICT_LIVE_TS_PREBUFFER_TIMEOUT
                         prebuffer_size = 0
                         prebuffer_chunks = 0
+                        # Use per-chunk timeout to avoid blocking indefinitely when upstream stalls
+                        chunk_timeout = settings.LIVE_CHUNK_TIMEOUT_SECONDS if hasattr(settings, 'LIVE_CHUNK_TIMEOUT_SECONDS') else 5.0
 
                         # Pre-buffer by reading from the iterator until we reach target
-                        try:
-                            async for chunk in stream_iterator:
+                        while True:
+                            try:
+                                if chunk_timeout and chunk_timeout > 0:
+                                    chunk = await asyncio.wait_for(stream_iterator.__anext__(), timeout=chunk_timeout)
+                                else:
+                                    chunk = await stream_iterator.__anext__()
+
                                 # Yield immediately - no separate storage needed
                                 yield chunk
                                 bytes_served += len(chunk)
@@ -709,7 +719,7 @@ class StreamManager:
                                 # Update last chunk time for circuit breaker
                                 last_chunk_time = asyncio.get_event_loop().time()
 
-                                # Check timeout
+                                # Check timeout for prebuffer overall
                                 if asyncio.get_event_loop().time() - prebuffer_start > prebuffer_timeout:
                                     logger.warning(
                                         f"STRICT MODE: Pre-buffer timeout after {prebuffer_timeout}s, proceeding with {prebuffer_size} bytes")
@@ -720,9 +730,15 @@ class StreamManager:
                                     logger.info(
                                         f"STRICT MODE: Pre-buffer complete: {prebuffer_size} bytes in {prebuffer_chunks} chunks")
                                     break
-                        except asyncio.TimeoutError:
-                            logger.warning(
-                                f"STRICT MODE: Pre-buffer read timeout, proceeding with {prebuffer_size} bytes")
+
+                            except asyncio.TimeoutError:
+                                logger.warning(
+                                    f"STRICT MODE: Pre-buffer chunk timeout ({chunk_timeout}s), proceeding with {prebuffer_size} bytes")
+                                break
+                            except StopAsyncIteration:
+                                # Upstream closed during pre-buffer; exit prebuffer loop
+                                logger.info("STRICT MODE: Upstream closed during pre-buffer")
+                                break
 
                         logger.info(
                             f"STRICT MODE: Emitted pre-buffer, now streaming live for client {client_id}")
@@ -732,7 +748,45 @@ class StreamManager:
                     circuit_breaker_timeout = settings.STRICT_LIVE_TS_CIRCUIT_BREAKER_TIMEOUT if strict_mode_enabled else 0
 
                     # Continue streaming from where pre-buffer left off (or from start if no pre-buffer)
-                    async for chunk in stream_iterator:
+                    while True:
+                        try:
+                            # Read next chunk with a per-chunk timeout to detect silent stalls
+                            chunk_timeout = settings.LIVE_CHUNK_TIMEOUT_SECONDS if hasattr(settings, 'LIVE_CHUNK_TIMEOUT_SECONDS') else 5.0
+                            if chunk_timeout and chunk_timeout > 0:
+                                try:
+                                    chunk = await asyncio.wait_for(stream_iterator.__anext__(), timeout=chunk_timeout)
+                                except asyncio.TimeoutError:
+                                    # No data received within chunk timeout - attempt failover if possible
+                                    logger.warning(
+                                        f"No data received for {chunk_timeout}s from upstream for stream {stream_id}, client {client_id}")
+                                    has_failover = bool(stream_info.failover_resolver_url or stream_info.failover_urls)
+                                    if has_failover and failover_count < max_failovers and not stream_info.is_vod:
+                                        logger.info(
+                                            f"Attempting failover due to chunk timeout for client {client_id} (attempt {failover_count + 1}/{max_failovers})")
+                                        await self._try_update_failover_url(stream_id, "chunk_timeout")
+                                        # Reset and reconnect
+                                        failover_count += 1
+                                        if stream_context is not None:
+                                            try:
+                                                await stream_context.__aexit__(None, None, None)
+                                            except Exception:
+                                                pass
+                                        stream_context = None
+                                        response = None
+                                        break  # Reconnect with new URL
+                                    else:
+                                        await self._emit_event("STREAM_FAILED", stream_id, {
+                                            "client_id": client_id,
+                                            "error": f"No data received for {chunk_timeout}s",
+                                            "error_type": "chunk_timeout",
+                                            "no_failover": not has_failover
+                                        })
+                                        # Terminate streaming for this client
+                                        return
+                            else:
+                                chunk = await stream_iterator.__anext__()
+                        except StopAsyncIteration:
+                            break
                         # Update last chunk time
                         last_chunk_time = asyncio.get_event_loop().time()
 

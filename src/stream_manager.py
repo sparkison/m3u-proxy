@@ -965,51 +965,50 @@ class StreamManager:
                     # else: failover event was set, continue to next iteration
 
                 except httpx.ReadError as e:
-                    # ReadError often means client disconnected or provider closed connection
-                    # This is especially common with Range requests on live streams
-                    # MUST be caught before NetworkError since ReadError is a subclass
+                    # ReadError often means client disconnected OR provider closed connection mid-stream.
+                    # We should attempt to reconnect/failover even if data has already been sent.
                     error_str = str(e) if str(e) else "<empty ReadError>"
                     logger.info(
                         f"ReadError for client {client_id}: {error_str} (bytes_served: {bytes_served}, chunk_count: {chunk_count})")
 
-                    if bytes_served == 0:
-                        # No data was sent - try failover if available (check both resolver URL and static list)
-                        # Skip failover for VOD/timeshift since it's provider-specific
-                        has_failover = bool(stream_info.failover_resolver_url or stream_info.failover_urls)
-                        if has_failover and failover_count < max_failovers and not stream_info.is_vod:
-                            logger.info(
-                                f"Attempting automatic failover for client {client_id} (ReadError, no data)")
-                            await self._try_update_failover_url(stream_id, "connection_error")
-                            failover_count += 1
-                            # Clean up current connection
-                            if stream_context is not None:
-                                try:
-                                    await stream_context.__aexit__(None, None, None)
-                                except Exception:
-                                    pass
-                            stream_context = None
-                            response = None
-                            continue  # Retry with failover URL
-                        else:
+                    # Always try to failover on ReadError, regardless of whether data was sent
+                    has_failover = bool(
+                        stream_info.failover_resolver_url or stream_info.failover_urls)
+                    if has_failover and failover_count < max_failovers and not stream_info.is_vod:
+                        log_message = "no data sent" if bytes_served == 0 else "mid-stream"
+                        logger.info(
+                            f"Attempting automatic failover for client {client_id} (ReadError, {log_message})")
+                        await self._try_update_failover_url(stream_id, "connection_error_read")
+                        failover_count += 1
+                        # Clean up current connection
+                        if stream_context is not None:
+                            try:
+                                await stream_context.__aexit__(None, None, None)
+                            except Exception:
+                                pass
+                        stream_context = None
+                        response = None
+                        continue  # Retry with failover URL
+                    else:
+                        # No failover available or max retries reached
+                        if bytes_served == 0:
                             logger.warning(
                                 f"Provider closed connection immediately for {client_id} - no failover available")
                             await self._emit_event("STREAM_FAILED", stream_id, {
                                 "client_id": client_id,
-                                "error": "Provider closed connection immediately (may not support Range requests)",
+                                "error": "Provider closed connection immediately",
                                 "error_type": "ReadError",
                                 "bytes_served": 0
                             })
-                            break
-                    else:
-                        # Some data was sent - likely client disconnection during streaming
-                        logger.info(
-                            f"Client {client_id} likely disconnected during streaming")
-                        await self._emit_event("CLIENT_DISCONNECTED", stream_id, {
-                            "client_id": client_id,
-                            "bytes_served": bytes_served,
-                            "chunks_served": chunk_count,
-                            "reason": "read_error_during_stream"
-                        })
+                        else:
+                            logger.info(
+                                f"Client {client_id} disconnected mid-stream (ReadError) and no failover available")
+                            await self._emit_event("CLIENT_DISCONNECTED", stream_id, {
+                                "client_id": client_id,
+                                "bytes_served": bytes_served,
+                                "chunks_served": chunk_count,
+                                "reason": "read_error_during_stream_no_failover"
+                            })
                         break
 
                 except (httpx.TimeoutException, httpx.NetworkError, httpx.HTTPError) as e:

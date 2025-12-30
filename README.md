@@ -67,7 +67,7 @@ services:
       # Server Configuration
       - M3U_PROXY_HOST=0.0.0.0
       - M3U_PROXY_PORT=8085
-      - LOG_LEVEL=INFO
+      - LOG_LEVEL=INFO # Set to DEBUG for verbose logs
       
       # Base path (default: /m3u-proxy for m3u-editor integration)
       # Set to empty string if not using reverse proxy: ROOT_PATH=

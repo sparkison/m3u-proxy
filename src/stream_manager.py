@@ -1195,9 +1195,11 @@ class StreamManager:
                 f"Returning 206 Partial Content with range: {provider_content_range}")
             if provider_content_length:
                 headers["Content-Length"] = provider_content_length
-        elif provider_content_length and not (strict_mode_enabled and stream_info.is_live_continuous):
-            # Only include Content-Length for non-live or non-strict streams
-            headers["Content-Length"] = provider_content_length
+        # IMPORTANT: Do NOT set Content-Length for streams that can be cancelled mid-flight
+        # Setting Content-Length causes "Response content shorter than Content-Length" errors
+        # when cancel_event is triggered and the generator stops early.
+        # Only set Content-Length for range requests (206) where it's required for seeking.
+        # For live streams and regular streams, omit Content-Length to allow clean cancellation.
 
         # Create new generator that yields the first chunk then continues with the rest
         async def generate_with_first_chunk():

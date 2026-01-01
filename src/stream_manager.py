@@ -33,13 +33,15 @@ class ClientInfo:
     last_access: datetime
     user_agent: Optional[str] = None
     ip_address: Optional[str] = None
-    username: Optional[str] = None  # Username for tracking auth (from m3u-editor)
+    # Username for tracking auth (from m3u-editor)
+    username: Optional[str] = None
     stream_id: Optional[str] = None
     bytes_served: int = 0
     segments_served: int = 0
     is_connected: bool = True
     # Connection idle tracking - for monitoring long-held connections
-    last_data_time: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    last_data_time: datetime = field(
+        default_factory=lambda: datetime.now(timezone.utc))
     # Alert flag to prevent duplicate warnings
     idle_warning_logged: bool = False
     idle_error_logged: bool = False
@@ -452,7 +454,8 @@ class StreamManager:
             )
             self._stats.total_clients += 1
             self._stats.active_clients += 1
-            logger.info(f"Registered new client: {client_id}" + (f" (username: {username})" if username else ""))
+            logger.info(
+                f"Registered new client: {client_id}" + (f" (username: {username})" if username else ""))
 
         if effective_stream_id in self.stream_clients:
             self.stream_clients[effective_stream_id].add(client_id)
@@ -558,7 +561,8 @@ class StreamManager:
 
         # Determine if strict mode is enabled (global or per-stream)
         # NEVER apply strict mode to VOD/timeshift content - it needs more time to start
-        strict_mode_enabled = (settings.STRICT_LIVE_TS or stream_info.strict_live_ts) and not stream_info.is_vod
+        strict_mode_enabled = (
+            settings.STRICT_LIVE_TS or stream_info.strict_live_ts) and not stream_info.is_vod
 
         # Check circuit breaker - if upstream marked as bad, try failover immediately
         # Skip for VOD/timeshift since it's provider-specific
@@ -566,7 +570,8 @@ class StreamManager:
             if datetime.now(timezone.utc) < stream_info.upstream_marked_bad_until:
                 logger.warning(
                     f"Stream {stream_id} upstream marked as bad until {stream_info.upstream_marked_bad_until}, attempting immediate failover")
-                has_failover = bool(stream_info.failover_resolver_url or stream_info.failover_urls)
+                has_failover = bool(
+                    stream_info.failover_resolver_url or stream_info.failover_urls)
                 if has_failover:
                     await self._try_update_failover_url(stream_id, "circuit_breaker_bad_upstream")
                     current_url = stream_info.current_url or stream_info.original_url
@@ -589,7 +594,7 @@ class StreamManager:
         provider_status_code = None
         provider_content_range = None
         provider_content_length = None
-        
+
         # Parse Range start byte (needed for VOD upstream reconnection)
         range_start = 0
         if range_header:
@@ -656,10 +661,12 @@ class StreamManager:
                             # VOD stream, not in strict mode - honor range request
                             if resume_from_byte is not None:
                                 headers['Range'] = f"bytes={resume_from_byte}-"
-                                logger.info(f"Resuming VOD upstream from byte {resume_from_byte}")
+                                logger.info(
+                                    f"Resuming VOD upstream from byte {resume_from_byte}")
                             else:
                                 headers['Range'] = range_header
-                                logger.info(f"Including Range header for VOD stream: {range_header}")
+                                logger.info(
+                                    f"Including Range header for VOD stream: {range_header}")
 
                     # Select appropriate HTTP client
                     client_to_use = self.live_stream_client if stream_info.is_live_continuous else self.http_client
@@ -713,7 +720,8 @@ class StreamManager:
                         prebuffer_size = 0
                         prebuffer_chunks = 0
                         # Use per-chunk timeout to avoid blocking indefinitely when upstream stalls
-                        chunk_timeout = settings.LIVE_CHUNK_TIMEOUT_SECONDS if hasattr(settings, 'LIVE_CHUNK_TIMEOUT_SECONDS') else 5.0
+                        chunk_timeout = settings.LIVE_CHUNK_TIMEOUT_SECONDS if hasattr(
+                            settings, 'LIVE_CHUNK_TIMEOUT_SECONDS') else 5.0
 
                         # Pre-buffer by reading from the iterator until we reach target
                         while True:
@@ -751,7 +759,8 @@ class StreamManager:
                                 break
                             except StopAsyncIteration:
                                 # Upstream closed during pre-buffer; exit prebuffer loop
-                                logger.info("STRICT MODE: Upstream closed during pre-buffer")
+                                logger.info(
+                                    "STRICT MODE: Upstream closed during pre-buffer")
                                 break
 
                         logger.info(
@@ -765,7 +774,8 @@ class StreamManager:
                     while True:
                         try:
                             # Read next chunk with a per-chunk timeout to detect silent stalls
-                            chunk_timeout = settings.LIVE_CHUNK_TIMEOUT_SECONDS if hasattr(settings, 'LIVE_CHUNK_TIMEOUT_SECONDS') else 5.0
+                            chunk_timeout = settings.LIVE_CHUNK_TIMEOUT_SECONDS if hasattr(
+                                settings, 'LIVE_CHUNK_TIMEOUT_SECONDS') else 5.0
                             if chunk_timeout and chunk_timeout > 0:
                                 try:
                                     chunk = await asyncio.wait_for(stream_iterator.__anext__(), timeout=chunk_timeout)
@@ -773,7 +783,8 @@ class StreamManager:
                                     # No data received within chunk timeout - attempt failover if possible
                                     logger.warning(
                                         f"No data received for {chunk_timeout}s from upstream for stream {stream_id}, client {client_id}")
-                                    has_failover = bool(stream_info.failover_resolver_url or stream_info.failover_urls)
+                                    has_failover = bool(
+                                        stream_info.failover_resolver_url or stream_info.failover_urls)
                                     if has_failover and failover_count < max_failovers and not stream_info.is_vod:
                                         logger.info(
                                             f"Attempting failover due to chunk timeout for client {client_id} (attempt {failover_count + 1}/{max_failovers})")
@@ -852,7 +863,7 @@ class StreamManager:
                         # Bitrate monitoring - detect degraded streams
                         if settings.ENABLE_BITRATE_MONITORING and stream_info:
                             current_time = asyncio.get_event_loop().time()
-                            
+
                             # Grace period - don't monitor during initial buffering
                             if not stream_info.bitrate_monitoring_started:
                                 if stream_info.bitrate_check_start_time is None:
@@ -865,13 +876,14 @@ class StreamManager:
                             else:
                                 # Add bytes to current window
                                 stream_info.bitrate_bytes_window += len(chunk)
-                                
+
                                 # Check if interval elapsed
-                                elapsed = current_time - (stream_info.bitrate_check_start_time or current_time)
+                                elapsed = current_time - \
+                                    (stream_info.bitrate_check_start_time or current_time)
                                 if elapsed >= settings.BITRATE_CHECK_INTERVAL:
                                     # Calculate bitrate in bytes/second
                                     bitrate = stream_info.bitrate_bytes_window / elapsed if elapsed > 0 else 0
-                                    
+
                                     if bitrate < settings.MIN_BITRATE_THRESHOLD:
                                         stream_info.low_bitrate_count += 1
                                         logger.warning(
@@ -880,11 +892,12 @@ class StreamManager:
                                             f"threshold: {settings.MIN_BITRATE_THRESHOLD * 8 / 1000:.0f} Kbps, "
                                             f"count: {stream_info.low_bitrate_count}/{settings.BITRATE_FAILOVER_THRESHOLD}"
                                         )
-                                        
+
                                         # Trigger failover if threshold exceeded
                                         # Skip failover for VOD/timeshift since it's provider-specific
                                         if stream_info.low_bitrate_count >= settings.BITRATE_FAILOVER_THRESHOLD:
-                                            has_failover = bool(stream_info.failover_resolver_url or stream_info.failover_urls)
+                                            has_failover = bool(
+                                                stream_info.failover_resolver_url or stream_info.failover_urls)
                                             if has_failover and failover_count < max_failovers and not stream_info.is_vod:
                                                 logger.error(
                                                     f"Bitrate consistently below threshold for stream {stream_id}, "
@@ -914,7 +927,7 @@ class StreamManager:
                                                 f"{bitrate * 8 / 1000:.0f} Kbps, resetting low bitrate counter"
                                             )
                                         stream_info.low_bitrate_count = 0
-                                    
+
                                     # Reset window for next interval
                                     stream_info.bitrate_check_start_time = current_time
                                     stream_info.bitrate_bytes_window = 0
@@ -922,7 +935,8 @@ class StreamManager:
                         # Update idle tracking every chunk (important for idle detection accuracy)
                         # This ensures we accurately detect when data is flowing vs stuck
                         if client_id in self.clients:
-                            self.clients[client_id].last_data_time = datetime.now(timezone.utc)
+                            self.clients[client_id].last_data_time = datetime.now(
+                                timezone.utc)
 
                         # Update stats periodically (every 10 chunks = ~320KB)
                         if chunk_count % 10 == 0:
@@ -968,7 +982,8 @@ class StreamManager:
                                 f"STRICT MODE: Marking upstream as bad for {cooldown_seconds}s until {stream_info.upstream_marked_bad_until}")
 
                             # Try failover if available (check both resolver URL and static list)
-                            has_failover = bool(stream_info.failover_resolver_url or stream_info.failover_urls)
+                            has_failover = bool(
+                                stream_info.failover_resolver_url or stream_info.failover_urls)
                             if has_failover and failover_count < max_failovers:
                                 logger.info(
                                     f"STRICT MODE: Attempting failover due to circuit breaker")
@@ -1007,7 +1022,8 @@ class StreamManager:
                     if bytes_served == 0:
                         # No data was sent - try failover if available (check both resolver URL and static list)
                         # Skip failover for VOD/timeshift since it's provider-specific
-                        has_failover = bool(stream_info.failover_resolver_url or stream_info.failover_urls)
+                        has_failover = bool(
+                            stream_info.failover_resolver_url or stream_info.failover_urls)
                         if has_failover and failover_count < max_failovers and not stream_info.is_vod:
                             logger.info(
                                 f"Attempting automatic failover for client {client_id} (ReadError, no data)")
@@ -1061,7 +1077,8 @@ class StreamManager:
 
                     # Try automatic failover (check both resolver URL and static list)
                     # Skip failover for VOD/timeshift since it's provider-specific
-                    has_failover = bool(stream_info.failover_resolver_url or stream_info.failover_urls)
+                    has_failover = bool(
+                        stream_info.failover_resolver_url or stream_info.failover_urls)
                     if has_failover and failover_count < max_failovers and not stream_info.is_vod:
                         logger.info(
                             f"Attempting automatic failover for client {client_id} (attempt {failover_count + 1}/{max_failovers})")
@@ -1137,7 +1154,8 @@ class StreamManager:
                     else:
                         # Try failover for unknown errors too (check both resolver URL and static list)
                         # Skip failover for VOD/timeshift since it's provider-specific
-                        has_failover = bool(stream_info.failover_resolver_url or stream_info.failover_urls)
+                        has_failover = bool(
+                            stream_info.failover_resolver_url or stream_info.failover_urls)
                         if has_failover and failover_count < max_failovers and not stream_info.is_vod:
                             logger.info(
                                 f"Attempting automatic failover for client {client_id} (unknown error)")
@@ -1253,7 +1271,7 @@ class StreamManager:
             headers["Content-Range"] = provider_content_range
             logger.info(
                 f"Returning 206 Partial Content with range: {provider_content_range}")
-            
+
         headers.pop("Content-Length", None)
 
         # Create new generator that yields the first chunk then continues with the rest
@@ -1329,7 +1347,8 @@ class StreamManager:
                         user_agent=stream_info.user_agent,
                         headers=stream_info.headers,
                         stream_id=stream_id,
-                        reuse_stream_key=stream_info.transcode_stream_key,  # Reuse existing key if available
+                        # Reuse existing key if available
+                        reuse_stream_key=stream_info.transcode_stream_key,
                     )
 
                     # Update the tracked stream key so future failovers can stop the correct process
@@ -1337,7 +1356,8 @@ class StreamManager:
 
                     if not shared_process or not shared_process.process or not shared_process.process.stdout:
                         # Try failover if available
-                        has_failover = bool(stream_info.failover_resolver_url or stream_info.failover_urls)
+                        has_failover = bool(
+                            stream_info.failover_resolver_url or stream_info.failover_urls)
                         if has_failover and failover_count < max_failovers:
                             logger.warning(
                                 f"Failed to create transcoding process, attempting failover")
@@ -1354,14 +1374,15 @@ class StreamManager:
                     max_wait_time = 2.0  # Wait up to 2 seconds
                     check_interval = 0.1  # Check every 100ms
                     elapsed = 0.0
-                    
+
                     while elapsed < max_wait_time:
                         await asyncio.sleep(check_interval)
                         elapsed += check_interval
-                        
+
                         # Check if the process failed due to input errors (detected by stderr monitor)
                         if hasattr(shared_process, 'status') and shared_process.status == "input_failed":
-                            has_failover = bool(stream_info.failover_resolver_url or stream_info.failover_urls)
+                            has_failover = bool(
+                                stream_info.failover_resolver_url or stream_info.failover_urls)
                             if has_failover and failover_count < max_failovers:
                                 logger.warning(
                                     f"Transcoding process failed due to input error before streaming (detected after {elapsed:.1f}s), attempting failover")
@@ -1380,10 +1401,11 @@ class StreamManager:
                                 logger.error(
                                     f"Transcoding process failed due to input error and no failover available for stream {stream_id}")
                                 return
-                        
+
                         # Check if process has exited early
                         if shared_process.process.returncode is not None:
-                            has_failover = bool(stream_info.failover_resolver_url or stream_info.failover_urls)
+                            has_failover = bool(
+                                stream_info.failover_resolver_url or stream_info.failover_urls)
                             if has_failover and failover_count < max_failovers:
                                 logger.warning(
                                     f"Transcoding process exited before streaming (detected after {elapsed:.1f}s), attempting failover")
@@ -1401,17 +1423,20 @@ class StreamManager:
                                 logger.error(
                                     f"Transcoding process exited with code {shared_process.process.returncode} and no failover available for stream {stream_id}")
                                 return
-                        
+
                         # If we have data in the queue, FFmpeg is producing output - safe to start streaming
-                        client_queue = shared_process.client_queues.get(client_id)
+                        client_queue = shared_process.client_queues.get(
+                            client_id)
                         if client_queue and not client_queue.empty():
-                            logger.info(f"FFmpeg process producing data after {elapsed:.1f}s, starting stream")
+                            logger.info(
+                                f"FFmpeg process producing data after {elapsed:.1f}s, starting stream")
                             break
-                    
+
                     # Check one final time after the wait loop before proceeding
                     # (in case we timed out without detecting the issue)
                     if hasattr(shared_process, 'status') and shared_process.status == "input_failed":
-                        has_failover = bool(stream_info.failover_resolver_url or stream_info.failover_urls)
+                        has_failover = bool(
+                            stream_info.failover_resolver_url or stream_info.failover_urls)
                         if has_failover and failover_count < max_failovers:
                             logger.warning(
                                 f"Transcoding process failed due to input error (final check), attempting failover")
@@ -1431,7 +1456,8 @@ class StreamManager:
 
                     # Verify the process is actually running (final check)
                     if shared_process.process.returncode is not None:
-                        has_failover = bool(stream_info.failover_resolver_url or stream_info.failover_urls)
+                        has_failover = bool(
+                            stream_info.failover_resolver_url or stream_info.failover_urls)
                         if has_failover and failover_count < max_failovers:
                             logger.warning(
                                 f"Transcoding process exited before streaming, attempting failover")
@@ -1471,7 +1497,8 @@ class StreamManager:
 
                         # Check if the transcoding process failed due to input error during streaming
                         if hasattr(shared_process, 'status') and shared_process.status == "input_failed":
-                            has_failover = bool(stream_info.failover_resolver_url or stream_info.failover_urls)
+                            has_failover = bool(
+                                stream_info.failover_resolver_url or stream_info.failover_urls)
                             if has_failover and failover_count < max_failovers:
                                 logger.warning(
                                     f"Transcoding process encountered input error during streaming, triggering failover")
@@ -1481,7 +1508,8 @@ class StreamManager:
                                         await self.pooled_manager.remove_client_from_stream(client_id)
                                         await self.pooled_manager.force_stop_stream(stream_key)
                                     except Exception as e:
-                                        logger.warning(f"Error cleaning up failed stream: {e}")
+                                        logger.warning(
+                                            f"Error cleaning up failed stream: {e}")
                                 stream_key = None
                                 await self._try_update_failover_url(stream_id, "transcode_runtime_input_error")
                                 failover_count += 1
@@ -1539,7 +1567,8 @@ class StreamManager:
                         if client_id in self.clients:
                             now = datetime.now(timezone.utc)
                             self.clients[client_id].last_access = now
-                            self.clients[client_id].last_data_time = now  # Track transcoded stream data flow
+                            # Track transcoded stream data flow
+                            self.clients[client_id].last_data_time = now
                             self.clients[client_id].bytes_served += len(chunk)
 
                         # Update stream-level stats (for bandwidth tracking)
@@ -1565,7 +1594,8 @@ class StreamManager:
                         f"Error during pooled transcoding for client {client_id}: {e}")
 
                     # Try automatic failover (check both resolver URL and static list)
-                    has_failover = bool(stream_info.failover_resolver_url or stream_info.failover_urls)
+                    has_failover = bool(
+                        stream_info.failover_resolver_url or stream_info.failover_urls)
                     if has_failover and failover_count < max_failovers:
                         logger.info(
                             f"Attempting automatic failover for transcoded stream (attempt {failover_count + 1}/{max_failovers})")
@@ -1693,9 +1723,10 @@ class StreamManager:
             return None
 
         stream_info = self.streams[stream_id]
-        
+
         # Check if any failover mechanism is available
-        has_failover = bool(stream_info.failover_resolver_url or stream_info.failover_urls)
+        has_failover = bool(
+            stream_info.failover_resolver_url or stream_info.failover_urls)
         if not has_failover:
             logger.warning(
                 f"No failover mechanism available for stream {stream_id}")
@@ -1703,9 +1734,10 @@ class StreamManager:
 
         # Resolve next failover URL using the preferred method
         next_url = await self._resolve_next_failover_url(stream_id)
-        
+
         if not next_url:
-            logger.warning(f"No more failover URLs available for stream {stream_id}")
+            logger.warning(
+                f"No more failover URLs available for stream {stream_id}")
             return None
 
         logger.info(
@@ -1753,12 +1785,14 @@ class StreamManager:
             # Try next failover URL recursively if available
             # Calculate max attempts based on available failover mechanism
             if stream_info.failover_urls:
-                max_attempts = len(stream_info.failover_urls) * stream_info.max_retries
+                max_attempts = len(stream_info.failover_urls) * \
+                    stream_info.max_retries
             elif stream_info.failover_resolver_url:
-                max_attempts = 10 * stream_info.max_retries  # Allow more attempts for resolver-based failover
+                # Allow more attempts for resolver-based failover
+                max_attempts = 10 * stream_info.max_retries
             else:
                 max_attempts = 0
-                
+
             if stream_info.failover_attempts < max_attempts:
                 return await self._seamless_failover(stream_id, e)
 
@@ -1809,7 +1843,8 @@ class StreamManager:
                     user_agent=stream_info.user_agent,
                     headers=stream_info.headers,
                     stream_id=stream_id,
-                    reuse_stream_key=stream_info.transcode_stream_key,  # Reuse existing key if available
+                    # Reuse existing key if available
+                    reuse_stream_key=stream_info.transcode_stream_key,
                 )
                 # Record the stream key for later mapping
                 stream_info.transcode_stream_key = stream_key
@@ -1825,20 +1860,25 @@ class StreamManager:
                             try:
                                 await self.pooled_manager.force_stop_stream(stream_key)
                             except Exception as e:
-                                logger.debug(f"Error cleaning up failed stream {stream_key}: {e}")
+                                logger.debug(
+                                    f"Error cleaning up failed stream {stream_key}: {e}")
                         # Attempt failover
-                        has_failover = bool(stream_info.failover_resolver_url or stream_info.failover_urls)
+                        has_failover = bool(
+                            stream_info.failover_resolver_url or stream_info.failover_urls)
                         if has_failover:
-                            logger.info(f"Attempting failover for stream {stream_id}")
+                            logger.info(
+                                f"Attempting failover for stream {stream_id}")
                             failover_success = await self._try_update_failover_url(stream_id, "hls_input_error")
                             if failover_success:
                                 # Failover successful, retry the stream fetch with new URL
-                                logger.info(f"HLS failover successful for stream {stream_id}, retrying with new URL")
+                                logger.info(
+                                    f"HLS failover successful for stream {stream_id}, retrying with new URL")
                                 return await self.get_playlist_content(stream_id, client_id, base_proxy_url)
                         # No failover available or failover failed
-                        logger.error(f"HLS input error for stream {stream_id} and no failover available or failover failed")
+                        logger.error(
+                            f"HLS input error for stream {stream_id} and no failover available or failover failed")
                         return None
-                    
+
                     # Wait briefly for FFmpeg to produce the initial playlist if it's not yet present.
                     playlist_text = await shared_process.read_playlist()
                     waited = 0.0
@@ -1855,20 +1895,25 @@ class StreamManager:
                                 try:
                                     await self.pooled_manager.force_stop_stream(stream_key)
                                 except Exception as e:
-                                    logger.debug(f"Error cleaning up failed stream {stream_key}: {e}")
+                                    logger.debug(
+                                        f"Error cleaning up failed stream {stream_key}: {e}")
                             # Attempt failover
-                            has_failover = bool(stream_info.failover_resolver_url or stream_info.failover_urls)
+                            has_failover = bool(
+                                stream_info.failover_resolver_url or stream_info.failover_urls)
                             if has_failover:
-                                logger.info(f"Attempting failover for stream {stream_id}")
+                                logger.info(
+                                    f"Attempting failover for stream {stream_id}")
                                 failover_success = await self._try_update_failover_url(stream_id, "hls_input_error")
                                 if failover_success:
                                     # Failover successful, retry the stream fetch with new URL
-                                    logger.info(f"HLS failover successful for stream {stream_id}, retrying with new URL")
+                                    logger.info(
+                                        f"HLS failover successful for stream {stream_id}, retrying with new URL")
                                     return await self.get_playlist_content(stream_id, client_id, base_proxy_url)
                             # No failover available or failover failed
-                            logger.error(f"HLS input error for stream {stream_id} and no failover available or failover failed")
+                            logger.error(
+                                f"HLS input error for stream {stream_id} and no failover available or failover failed")
                             return None
-                        
+
                         await asyncio.sleep(poll_interval)
                         waited += poll_interval
                         playlist_text = await shared_process.read_playlist()
@@ -1884,20 +1929,25 @@ class StreamManager:
                                 try:
                                     await self.pooled_manager.force_stop_stream(stream_key)
                                 except Exception as e:
-                                    logger.debug(f"Error cleaning up failed stream {stream_key}: {e}")
+                                    logger.debug(
+                                        f"Error cleaning up failed stream {stream_key}: {e}")
                             # Attempt failover
-                            has_failover = bool(stream_info.failover_resolver_url or stream_info.failover_urls)
+                            has_failover = bool(
+                                stream_info.failover_resolver_url or stream_info.failover_urls)
                             if has_failover:
-                                logger.info(f"Attempting failover for stream {stream_id}")
+                                logger.info(
+                                    f"Attempting failover for stream {stream_id}")
                                 failover_success = await self._try_update_failover_url(stream_id, "hls_input_error")
                                 if failover_success:
                                     # Failover successful, retry the stream fetch with new URL
-                                    logger.info(f"HLS failover successful for stream {stream_id}, retrying with new URL")
+                                    logger.info(
+                                        f"HLS failover successful for stream {stream_id}, retrying with new URL")
                                     return await self.get_playlist_content(stream_id, client_id, base_proxy_url)
                             # No failover available or failover failed
-                            logger.error(f"HLS input error for stream {stream_id} and no failover available or failover failed")
+                            logger.error(
+                                f"HLS input error for stream {stream_id} and no failover available or failover failed")
                             return None
-                        
+
                         # No input error detected, it's just a timeout
                         logger.warning(
                             f"HLS playlist not produced within {max_wait}s for stream {stream_id}; cleaning up transcoder")
@@ -1937,7 +1987,8 @@ class StreamManager:
                         if client_id in self.clients:
                             now = datetime.now(timezone.utc)
                             self.clients[client_id].last_access = now
-                            self.clients[client_id].last_data_time = now  # Playlist fetch is also data activity
+                            # Playlist fetch is also data activity
+                            self.clients[client_id].last_data_time = now
 
                         return processed_content
 
@@ -1950,9 +2001,11 @@ class StreamManager:
                     f"Error retrieving transcoded playlist from pooled manager: {e}")
 
         # Try to fetch the playlist with automatic failover support
-        has_failovers = bool(stream_info.failover_resolver_url or stream_info.failover_urls)
+        has_failovers = bool(
+            stream_info.failover_resolver_url or stream_info.failover_urls)
         # For legacy failover_urls, we can count the attempts; for resolver, allow reasonable retries
-        max_attempts = len(stream_info.failover_urls) + 1 if stream_info.failover_urls else (10 if stream_info.failover_resolver_url else 1)
+        max_attempts = len(stream_info.failover_urls) + 1 if stream_info.failover_urls else (
+            10 if stream_info.failover_resolver_url else 1)
         attempt = 0
         last_error = None
 
@@ -1960,7 +2013,8 @@ class StreamManager:
             try:
                 # Always read current URL from stream_info to pick up manual failover changes
                 current_url = stream_info.current_url or stream_info.original_url
-                logger.info(f"Fetching HLS playlist from: {current_url} (attempt {attempt + 1}/{max_attempts})")
+                logger.info(
+                    f"Fetching HLS playlist from: {current_url} (attempt {attempt + 1}/{max_attempts})")
                 headers = {'User-Agent': stream_info.user_agent}
                 headers.update(stream_info.headers)
                 response = await self.http_client.get(current_url, headers=headers)
@@ -1992,7 +2046,8 @@ class StreamManager:
                 if client_id in self.clients:
                     now = datetime.now(timezone.utc)
                     self.clients[client_id].last_access = now
-                    self.clients[client_id].last_data_time = now  # Playlist fetch is also data activity
+                    # Playlist fetch is also data activity
+                    self.clients[client_id].last_data_time = now
 
                 return processed_content
 
@@ -2001,21 +2056,24 @@ class StreamManager:
                 logger.error(
                     f"Error fetching playlist for stream {stream_id}: {e}")
                 stream_info.error_count += 1
-                
+
                 # Try failover if available and not the last attempt
-                has_failovers = bool(stream_info.failover_resolver_url or stream_info.failover_urls)
+                has_failovers = bool(
+                    stream_info.failover_resolver_url or stream_info.failover_urls)
                 if has_failovers and attempt < max_attempts - 1:
-                    logger.info(f"Attempting failover for playlist fetch (attempt {attempt + 1}/{max_attempts})")
+                    logger.info(
+                        f"Attempting failover for playlist fetch (attempt {attempt + 1}/{max_attempts})")
                     failover_success = await self._try_update_failover_url(stream_id, f"playlist_fetch_error_{type(e).__name__}")
                     if failover_success:
                         # current_url will be read from stream_info at the start of the next loop iteration
                         attempt += 1
                         continue
-                
+
                 # No failover available or failover failed
                 attempt += 1
                 if attempt >= max_attempts:
-                    logger.error(f"Failed to fetch playlist after {max_attempts} attempts. Last error: {last_error}")
+                    logger.error(
+                        f"Failed to fetch playlist after {max_attempts} attempts. Last error: {last_error}")
                     return None
 
     async def proxy_hls_segment(
@@ -2074,7 +2132,8 @@ class StreamManager:
                         self.clients[client_id].bytes_served += bytes_served
                         self.clients[client_id].segments_served += 1
                         self.clients[client_id].last_access = now
-                        self.clients[client_id].last_data_time = now  # Track that data is actively flowing
+                        # Track that data is actively flowing
+                        self.clients[client_id].last_data_time = now
 
                     if stream_id in self.streams:
                         self.streams[stream_id].total_bytes_served += bytes_served
@@ -2139,7 +2198,8 @@ class StreamManager:
                             (datetime.now(timezone.utc) - stream_info.last_health_check).total_seconds() >= stream_info.health_check_interval):
 
                         is_healthy = await self._health_check_stream(stream_id)
-                        has_failover = bool(stream_info.failover_resolver_url or stream_info.failover_urls)
+                        has_failover = bool(
+                            stream_info.failover_resolver_url or stream_info.failover_urls)
 
                         if not is_healthy and has_failover:
                             logger.warning(
@@ -2178,23 +2238,24 @@ class StreamManager:
 
     async def _resolve_next_failover_url(self, stream_id: str) -> Optional[str]:
         """Resolve the next failover URL using either resolver callback or static list
-        
+
         Prioritizes failover_resolver_url over failover_urls for maximum flexibility.
-        
+
         Args:
             stream_id: The stream ID to get failover URL for
-            
+
         Returns:
             Next failover URL or None if no more failovers available
         """
         if stream_id not in self.streams:
             return None
-            
+
         stream_info = self.streams[stream_id]
-        
+
         # Try resolver-based failover first (preferred method)
         if stream_info.failover_resolver_url:
-            logger.info(f"Using failover resolver callback for stream {stream_id}")
+            logger.info(
+                f"Using failover resolver callback for stream {stream_id}")
             try:
                 # Call the resolver endpoint with current URL and metadata
                 payload = {
@@ -2202,21 +2263,21 @@ class StreamManager:
                     'metadata': stream_info.metadata,
                     'current_failover_index': stream_info.current_failover_index
                 }
-                
+
                 async with httpx.AsyncClient(timeout=10) as client:
                     response = await client.post(
                         stream_info.failover_resolver_url,
                         json=payload
                     )
-                
+
                 if not response.is_success:
                     logger.warning(
                         f"Failover resolver returned {response.status_code} for stream {stream_id}")
                     return None
-                    
+
                 data = response.json()
                 next_url = data.get('next_url')
-                
+
                 if next_url:
                     logger.info(f"Failover resolver returned URL: {next_url}")
                     stream_info.current_failover_index += 1
@@ -2225,20 +2286,21 @@ class StreamManager:
                     logger.info(
                         f"No viable failover URL available from resolver for stream {stream_id}")
                     return None
-                    
+
             except Exception as e:
                 logger.error(
                     f"Error calling failover resolver for stream {stream_id}: {e}")
                 return None
-        
+
         # Fall back to static failover URLs list
         if stream_info.failover_urls:
-            next_index = (stream_info.current_failover_index + 1) % len(stream_info.failover_urls)
+            next_index = (stream_info.current_failover_index +
+                          1) % len(stream_info.failover_urls)
             next_url = stream_info.failover_urls[next_index]
             stream_info.current_failover_index = next_index
             logger.info(f"Using static failover URL #{next_index}: {next_url}")
             return next_url
-        
+
         # No failover mechanism available
         return None
 
@@ -2256,9 +2318,10 @@ class StreamManager:
             return False
 
         stream_info = self.streams[stream_id]
-        
+
         # Check if any failover mechanism is available
-        has_failovers = bool(stream_info.failover_resolver_url or stream_info.failover_urls)
+        has_failovers = bool(
+            stream_info.failover_resolver_url or stream_info.failover_urls)
         if not has_failovers:
             logger.warning(
                 f"No failover mechanism available for stream {stream_id}")
@@ -2267,11 +2330,12 @@ class StreamManager:
         # Resolve the next failover URL using the preferred method
         old_url = stream_info.current_url
         next_url = await self._resolve_next_failover_url(stream_id)
-        
+
         if not next_url:
-            logger.warning(f"No more failover URLs available for stream {stream_id}")
+            logger.warning(
+                f"No more failover URLs available for stream {stream_id}")
             return False
-        
+
         # Update stream info
         stream_info.current_url = next_url
         stream_info.failover_attempts += 1
@@ -2379,10 +2443,12 @@ class StreamManager:
                 stream_info = self.streams[stream_id]
                 if stream_info.is_transcoded and stream_info.transcode_stream_key and self.pooled_manager:
                     try:
-                        logger.info(f"Stopping transcoding process for inactive stream: {stream_info.transcode_stream_key}")
+                        logger.info(
+                            f"Stopping transcoding process for inactive stream: {stream_info.transcode_stream_key}")
                         await self.pooled_manager.force_stop_stream(stream_info.transcode_stream_key)
                     except Exception as e:
-                        logger.warning(f"Error stopping transcoding process during cleanup: {e}")
+                        logger.warning(
+                            f"Error stopping transcoding process during cleanup: {e}")
 
                 # Emit stream_stopped event before removing the stream
                 await self._emit_event("STREAM_STOPPED", stream_id, {
@@ -2397,7 +2463,7 @@ class StreamManager:
 
     async def _monitor_connection_idle_time(self):
         """Monitor long-held idle connections and emit alerts for potential resource leaks.
-        
+
         Tracks connections that have been idle (no data flowing) for extended periods.
         This helps detect stuck connections or resource exhaustion scenarios.
         """
@@ -2407,7 +2473,8 @@ class StreamManager:
             if not client_info.is_connected:
                 continue
 
-            idle_seconds = (current_time - client_info.last_data_time).total_seconds()
+            idle_seconds = (
+                current_time - client_info.last_data_time).total_seconds()
 
             # ERROR threshold: Very long idle time (30+ minutes)
             if idle_seconds > settings.CONNECTION_IDLE_ERROR_THRESHOLD:

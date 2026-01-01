@@ -1195,11 +1195,13 @@ class StreamManager:
                 f"Returning 206 Partial Content with range: {provider_content_range}")
             if provider_content_length:
                 headers["Content-Length"] = provider_content_length
-        # IMPORTANT: Do NOT set Content-Length for streams that can be cancelled mid-flight
-        # Setting Content-Length causes "Response content shorter than Content-Length" errors
-        # when cancel_event is triggered and the generator stops early.
-        # Only set Content-Length for range requests (206) where it's required for seeking.
-        # For live streams and regular streams, omit Content-Length to allow clean cancellation.
+
+        # CRITICAL: Remove Content-Length to prevent "Response content shorter than Content-Length" errors
+        # When streams are cancelled via cancel_event, the generator stops early but Content-Length
+        # has already been sent to the client. This causes Starlette/FastAPI to raise an error.
+        # Removing Content-Length allows clean cancellation for both live and VOD streams.
+        # Video players handle streaming without Content-Length just fine.
+        headers.pop("Content-Length", None)
 
         # Create new generator that yields the first chunk then continues with the rest
         async def generate_with_first_chunk():

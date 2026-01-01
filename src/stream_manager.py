@@ -1199,6 +1199,8 @@ class StreamManager:
             # Only include Content-Length for non-live or non-strict streams
             headers["Content-Length"] = provider_content_length
 
+        headers.pop("Content-Length", None)
+
         # Create new generator that yields the first chunk then continues with the rest
         async def generate_with_first_chunk():
             yield first_chunk

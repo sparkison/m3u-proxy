@@ -129,7 +129,7 @@ class Settings(BaseSettings):
     # When the upstream keeps the TCP connection open but stops sending data,
     # using a short per-chunk timeout allows the proxy to detect the stall
     # and trigger existing failover/reconnect logic instead of hanging.
-    LIVE_CHUNK_TIMEOUT_SECONDS: float = 5.0
+    LIVE_CHUNK_TIMEOUT_SECONDS: float = 15.0
     # Model configuration
     model_config = SettingsConfigDict(
         env_file=".env",

@@ -520,6 +520,18 @@ def get_client_info(request: Request):
 
     # Get username from X-Username header (set by m3u-editor for auth tracking)
     username = request.headers.get("x-username")
+    
+    # Fallback: IPTV clients won't forward custom headers across redirects (302/301).
+    # Allow passing username via querystring to preserve traceability.
+    if not username:
+        qp = request.query_params
+        username = qp.get("username") or qp.get("user") or qp.get("u")
+    
+    # Optional debug trace
+    if username and settings.APP_DEBUG:
+        logger.debug(
+            f"Resolved username={username} ip={ip_address} ua={request.headers.get('user-agent')}"
+        )
 
     return {
         "user_agent": request.headers.get("user-agent") or "unknown",

@@ -520,13 +520,13 @@ def get_client_info(request: Request):
 
     # Get username from X-Username header (set by m3u-editor for auth tracking)
     username = request.headers.get("x-username")
-    
+
     # Fallback: IPTV clients won't forward custom headers across redirects (302/301).
     # Allow passing username via querystring to preserve traceability.
     if not username:
         qp = request.query_params
         username = qp.get("username") or qp.get("user") or qp.get("u")
-    
+
     # Optional debug trace
     if username and settings.APP_DEBUG:
         logger.debug(
@@ -1529,55 +1529,8 @@ async def get_stream_info(stream_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.delete("/streams/{stream_id}", dependencies=[Depends(verify_token)])
-async def delete_stream(stream_id: str):
-    """Delete a stream and disconnect all its clients"""
-    try:
-        if stream_id not in stream_manager.streams:
-            raise HTTPException(status_code=404, detail="Stream not found")
-
-        stream_info = stream_manager.streams[stream_id]
-
-        # For transcoded streams, force stop the FFmpeg process immediately
-        if stream_info.is_transcoded and stream_manager.pooled_manager:
-            logger.info(f"Force stopping transcoded stream {stream_id}")
-            # Get the stream key used by pooled manager
-            # This is typically based on URL and profile
-            from pooled_stream_manager import PooledStreamManager
-            stream_key = stream_manager.pooled_manager._generate_stream_key(
-                stream_info.current_url or stream_info.original_url,
-                stream_info.transcode_profile or "default"
-            )
-            await stream_manager.pooled_manager.force_stop_stream(stream_key)
-
-        # Get all clients for this stream and clean them up
-        if stream_id in stream_manager.stream_clients:
-            client_ids = list(stream_manager.stream_clients[stream_id])
-            for client_id in client_ids:
-                await stream_manager.cleanup_client(client_id)
-
-        # Emit stream_stopped event before removing the stream
-        await stream_manager._emit_event("STREAM_STOPPED", stream_id, {
-            "reason": "manual_deletion",
-            "was_transcoded": stream_info.is_transcoded
-        })
-
-        # Remove stream
-        if stream_id in stream_manager.streams:
-            del stream_manager.streams[stream_id]
-        if stream_id in stream_manager.stream_clients:
-            del stream_manager.stream_clients[stream_id]
-
-        stream_manager._stats.active_streams -= 1
-
-        return {"message": f"Stream {stream_id} deleted"}
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error deleting stream: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
+# IMPORTANT: Routes with literal paths must come BEFORE parameterized routes
+# Otherwise FastAPI will match /streams/oldest-by-metadata as /streams/{stream_id}
 @app.delete("/streams/oldest-by-metadata", dependencies=[Depends(verify_token)])
 async def delete_oldest_stream_by_metadata(
     field: str = Query(..., description="Metadata field to filter by"),
@@ -1759,6 +1712,55 @@ async def delete_streams_by_metadata(
         raise
     except Exception as e:
         logger.error(f"Error deleting streams by metadata: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/streams/{stream_id}", dependencies=[Depends(verify_token)])
+async def delete_stream(stream_id: str):
+    """Delete a stream and disconnect all its clients"""
+    try:
+        if stream_id not in stream_manager.streams:
+            raise HTTPException(status_code=404, detail="Stream not found")
+
+        stream_info = stream_manager.streams[stream_id]
+
+        # For transcoded streams, force stop the FFmpeg process immediately
+        if stream_info.is_transcoded and stream_manager.pooled_manager:
+            logger.info(f"Force stopping transcoded stream {stream_id}")
+            # Get the stream key used by pooled manager
+            # This is typically based on URL and profile
+            from pooled_stream_manager import PooledStreamManager
+            stream_key = stream_manager.pooled_manager._generate_stream_key(
+                stream_info.current_url or stream_info.original_url,
+                stream_info.transcode_profile or "default"
+            )
+            await stream_manager.pooled_manager.force_stop_stream(stream_key)
+
+        # Get all clients for this stream and clean them up
+        if stream_id in stream_manager.stream_clients:
+            client_ids = list(stream_manager.stream_clients[stream_id])
+            for client_id in client_ids:
+                await stream_manager.cleanup_client(client_id)
+
+        # Emit stream_stopped event before removing the stream
+        await stream_manager._emit_event("STREAM_STOPPED", stream_id, {
+            "reason": "manual_deletion",
+            "was_transcoded": stream_info.is_transcoded
+        })
+
+        # Remove stream
+        if stream_id in stream_manager.streams:
+            del stream_manager.streams[stream_id]
+        if stream_id in stream_manager.stream_clients:
+            del stream_manager.stream_clients[stream_id]
+
+        stream_manager._stats.active_streams -= 1
+
+        return {"message": f"Stream {stream_id} deleted"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error deleting stream: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 

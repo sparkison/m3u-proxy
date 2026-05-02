@@ -1,9 +1,12 @@
 """
 Unit tests for live media_info population on transcoded streams.
 
-These tests cover the parser that extracts ffmpeg progress fields from stderr,
-and verify that media_info propagates through stream_manager.get_stats() so the
-m3u-editor UI can display live codec/bitrate/fps badges.
+These tests cover the parsers that extract codec/container/resolution/audio
+info and live progress (bitrate/fps/frame/speed) from ffmpeg's own stderr
+output, and verify media_info propagates through stream_manager.get_stats()
+so the m3u-editor UI can display live badges. We deliberately do NOT run a
+separate ffprobe against the source URL — that doubles the upstream connection
+count and trips per-user limits at IPTV providers.
 """
 
 import sys
@@ -11,8 +14,7 @@ import os
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-import pytest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock  # noqa: E402
 
 
 def _make_process():
@@ -133,22 +135,87 @@ def test_get_media_info_pulls_from_linked_pooled_process():
     assert info["bitrate_kbps"] == 4500.0
 
 
-@pytest.mark.asyncio
-async def test_probe_input_async_does_not_block_on_missing_ffprobe(monkeypatch):
-    """
-    If ffprobe isn't installed, _probe_input_async must swallow FileNotFoundError
-    rather than propagate it — the stream must still play even if probing fails.
-    """
-    import asyncio
-
+def test_parse_ffmpeg_input_line_extracts_container():
+    """The 'Input #0, FORMAT, from URL:' line should populate container."""
     process = _make_process()
 
-    async def _raise(*args, **kwargs):
-        raise FileNotFoundError("ffprobe not on PATH")
+    process._parse_ffmpeg_input_line(
+        "Input #0, mpegts, from 'http://example.com/stream.ts':"
+    )
 
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", _raise)
+    assert process.media_info["container"] == "MPEGTS"
 
-    # Should complete cleanly without raising.
-    await process._probe_input_async()
 
-    assert process.media_info == {}
+def test_parse_ffmpeg_input_line_takes_first_synonym():
+    """When ffmpeg lists multiple format synonyms, take the first one."""
+    process = _make_process()
+
+    process._parse_ffmpeg_input_line(
+        "Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'file.mp4':"
+    )
+
+    assert process.media_info["container"] == "MOV"
+
+
+def test_parse_ffmpeg_stream_line_extracts_video_codec_and_resolution():
+    """Video stream lines populate video_codec and resolution."""
+    process = _make_process()
+
+    process._parse_ffmpeg_stream_line(
+        "    Stream #0:0[0x100]: Video: h264 (Main) ([27][0][0][0] / 0x001B), "
+        "yuv420p(progressive), 1280x720 [SAR 1:1 DAR 16:9], 50 fps, 50 tbr, 90k tbn"
+    )
+
+    assert process.media_info["video_codec"] == "h264"
+    assert process.media_info["resolution"] == "1280x720"
+
+
+def test_parse_ffmpeg_stream_line_extracts_audio_codec_and_channels():
+    """Audio stream lines populate audio_codec and audio_channels."""
+    process = _make_process()
+
+    process._parse_ffmpeg_stream_line(
+        "    Stream #0:1[0x101](eng): Audio: aac (LC) ([15][0][0][0] / 0x000F), "
+        "48000 Hz, stereo, fltp, 192 kb/s"
+    )
+
+    assert process.media_info["audio_codec"] == "aac"
+    assert process.media_info["audio_channels"] == "stereo"
+
+
+def test_parse_ffmpeg_stream_line_handles_5_1_channel_layout():
+    """5.1 surround layout should map correctly."""
+    process = _make_process()
+
+    process._parse_ffmpeg_stream_line(
+        "    Stream #0:1: Audio: ac3, 48000 Hz, 5.1, fltp, 384 kb/s"
+    )
+
+    assert process.media_info["audio_channels"] == "5.1"
+
+
+def test_parse_ffmpeg_stream_line_does_not_clobber_existing_codec():
+    """
+    The first Video stream wins so we don't overwrite with secondary streams
+    (e.g. embedded thumbnails). Live progress fields (fps/bitrate) are still
+    free to update because they're handled by _parse_ffmpeg_progress.
+    """
+    process = _make_process()
+    process.media_info["video_codec"] = "h264"
+
+    process._parse_ffmpeg_stream_line(
+        "    Stream #0:2: Video: png, rgba, 256x256"
+    )
+
+    assert process.media_info["video_codec"] == "h264"
+
+
+def test_parse_ffmpeg_input_line_ignores_unrelated_lines():
+    """Non-Input lines should be no-ops."""
+    process = _make_process()
+
+    process._parse_ffmpeg_input_line(
+        "frame=  243 fps= 30 bitrate=1162.5kbits/s speed=1.01x"
+    )
+
+    assert "container" not in process.media_info

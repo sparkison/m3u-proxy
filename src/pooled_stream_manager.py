@@ -21,6 +21,23 @@ _FFMPEG_PROGRESS_FIELD_RE = re.compile(
     r"\b(?P<key>frame|fps|bitrate|speed|q|size|time)\s*=\s*(?P<val>\S+)"
 )
 
+# "Input #0, mpegts, from 'http://...':" or
+# "Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'file.mp4':" — captures the comma-
+# separated container synonyms list (split into the canonical name later).
+_FFMPEG_INPUT_LINE_RE = re.compile(
+    r"^\s*Input #\d+,\s*(?P<container>[\w,]+),\s*from\s+"
+)
+
+# "Stream #0:0[0x100]: Video: h264 (Main) ([27][0][0][0] / 0x001B), yuv420p..."
+# "Stream #0:1[0x101](eng): Audio: aac (LC) ..."
+_FFMPEG_STREAM_LINE_RE = re.compile(
+    r"Stream #\d+:\d+(?:\[[^\]]+\])?(?:\([^)]+\))?:\s+"
+    r"(?P<type>Video|Audio):\s+(?P<details>.+)$"
+)
+
+# "1280x720" or "1920x1080 [SAR 1:1 DAR 16:9]" inside a Stream line.
+_RESOLUTION_RE = re.compile(r"\b(?P<w>\d{2,5})x(?P<h>\d{2,5})\b")
+
 logger = logging.getLogger(__name__)
 
 try:
@@ -70,11 +87,14 @@ class SharedTranscodingProcess:
         self.last_access = time.time()
         self.total_bytes_served = 0
         self.status = "starting"
-        # Live media info populated from ffprobe (codec/container/resolution/audio)
-        # and the active ffmpeg process's stderr (bitrate/fps/frame/speed). Empty
-        # for resolver streams (streamlink/yt-dlp) that don't go through ffmpeg.
+        # Live media info parsed from the active ffmpeg process's own stderr —
+        # codec/container/resolution/audio from the "Input #" and "Stream #"
+        # lines printed at startup, plus live bitrate/fps from the periodic
+        # progress line. We do NOT run a separate ffprobe against the source
+        # because that would double the upstream connection count and IPTV
+        # providers reject the second connection. Empty for resolver streams
+        # (streamlink/yt-dlp) that don't go through ffmpeg.
         self.media_info: Dict[str, Any] = {}
-        self._probe_task: Optional[asyncio.Task] = None
 
         # Broadcasting support - each client gets its own queue
         self.client_queues: Dict[str, asyncio.Queue] = {}
@@ -359,13 +379,9 @@ class SharedTranscodingProcess:
             self.status = "running"
             logger.info(f"Shared FFmpeg process started with PID: {self.process.pid}")
 
-            # Start stderr logging task
+            # Start stderr logging task — also parses codec/resolution/bitrate
+            # from ffmpeg's own output (no extra upstream connections).
             asyncio.create_task(self._log_stderr())
-
-            # Probe the input async to populate codec/container/resolution.
-            # Fire-and-forget — never await this; stream startup must not block
-            # on ffprobe (it can take a few seconds against slow upstreams).
-            self._probe_task = asyncio.create_task(self._probe_input_async())
 
             # Start broadcaster task to read from FFmpeg and send to all clients
             if self.mode == "stdout":
@@ -469,114 +485,51 @@ class SharedTranscodingProcess:
         except Exception as e:
             logger.debug(f"HLS watch loop ended for {self.stream_id}: {e}")
 
-    async def _probe_input_async(self):
+    def _parse_ffmpeg_input_line(self, line_str: str) -> None:
         """
-        Run ffprobe against the source URL on a background task and populate
-        media_info with codec/container/resolution/audio info. Fire-and-forget;
-        callers must not await this so stream startup is never delayed.
+        Parse ffmpeg's "Input #0, FORMAT, from 'URL':" line for the container
+        format. ffmpeg prints this once per input when it opens the stream.
         """
-        cmd = [
-            "ffprobe",
-            "-v",
-            "quiet",
-            "-print_format",
-            "json",
-            "-show_streams",
-            "-show_format",
-        ]
-        if (
-            self.user_agent
-            and isinstance(self.url, str)
-            and ("://" in self.url and not self.url.startswith("file://"))
-        ):
-            cmd.extend(["-user_agent", self.user_agent])
-        if (
-            self.headers
-            and isinstance(self.url, str)
-            and ("://" in self.url and not self.url.startswith("file://"))
-        ):
-            header_str = "".join([f"{k}: {v}\r\n" for k, v in self.headers.items()])
-            cmd.extend(["-headers", header_str])
-        cmd.append(self.url)
+        match = _FFMPEG_INPUT_LINE_RE.match(line_str)
+        if not match:
+            return
+        container = match.group("container").strip().split(",")[0].strip()
+        if container:
+            self.media_info["container"] = container.upper()
 
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            try:
-                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=15)
-            except asyncio.TimeoutError:
-                logger.debug(
-                    f"ffprobe timed out for stream {self.stream_id}; skipping media_info population"
+    def _parse_ffmpeg_stream_line(self, line_str: str) -> None:
+        """
+        Parse ffmpeg's "Stream #0:N[...]: Video|Audio: ..." lines for codec
+        details. ffmpeg prints one per stream right after the input is opened
+        — this is free metadata that doesn't require a second connection.
+        """
+        match = _FFMPEG_STREAM_LINE_RE.search(line_str)
+        if not match:
+            return
+        stream_type = match.group("type").lower()
+        details = match.group("details")
+        if stream_type == "video":
+            # Codec name is the first token, may be followed by a parenthesised
+            # profile (e.g. "h264 (Main) (HEVC / 0x...)" — strip parens).
+            codec = details.split(",", 1)[0].strip()
+            codec = re.sub(r"\s*\(.*", "", codec).strip()
+            if codec and "video_codec" not in self.media_info:
+                self.media_info["video_codec"] = codec
+            res_match = _RESOLUTION_RE.search(details)
+            if res_match and "resolution" not in self.media_info:
+                self.media_info["resolution"] = (
+                    f"{res_match.group('w')}x{res_match.group('h')}"
                 )
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
-                return
-
-            if proc.returncode != 0 or not stdout:
-                return
-
-            try:
-                data = json.loads(stdout.decode("utf-8", errors="ignore"))
-            except json.JSONDecodeError:
-                return
-
-            video = next(
-                (s for s in data.get("streams", []) if s.get("codec_type") == "video"),
-                None,
-            )
-            audio = next(
-                (s for s in data.get("streams", []) if s.get("codec_type") == "audio"),
-                None,
-            )
-            fmt = data.get("format", {}) or {}
-
-            info: Dict[str, Any] = {}
-            if video:
-                width = video.get("width")
-                height = video.get("height")
-                if width and height:
-                    info["resolution"] = f"{width}x{height}"
-                if video.get("codec_name"):
-                    info["video_codec"] = video["codec_name"]
-                # Static fps from input — gets overwritten by live -progress data later
-                rate = video.get("avg_frame_rate") or video.get("r_frame_rate")
-                if rate and "/" in rate:
-                    try:
-                        num, den = rate.split("/", 1)
-                        if float(den) > 0:
-                            info["fps"] = round(float(num) / float(den), 2)
-                    except ValueError:
-                        pass
-            if audio:
-                if audio.get("codec_name"):
-                    info["audio_codec"] = audio["codec_name"]
-                channels = audio.get("channels")
-                if channels:
-                    info["audio_channels"] = {
-                        1: "mono",
-                        2: "stereo",
-                        6: "5.1",
-                        8: "7.1",
-                    }.get(int(channels), str(channels))
-            container = fmt.get("format_name")
-            if container:
-                # ffprobe returns comma-separated synonyms (e.g. "mov,mp4,m4a")
-                info["container"] = container.split(",")[0].upper()
-
-            # Merge — never clobber live fields already populated by ffmpeg progress
-            for key, value in info.items():
-                self.media_info.setdefault(key, value)
-        except FileNotFoundError:
-            logger.warning("ffprobe binary not found; cannot populate media_info")
-        except Exception as e:
-            logger.debug(
-                f"Error probing input for stream {self.stream_id}: {e}"
-            )
+        elif stream_type == "audio":
+            codec = details.split(",", 1)[0].strip()
+            codec = re.sub(r"\s*\(.*", "", codec).strip()
+            if codec and "audio_codec" not in self.media_info:
+                self.media_info["audio_codec"] = codec
+            for layout in ("stereo", "mono", "5.1", "7.1", "quad"):
+                if f", {layout}," in details or f", {layout} " in details:
+                    if "audio_channels" not in self.media_info:
+                        self.media_info["audio_channels"] = layout
+                    break
 
     def _parse_ffmpeg_progress(self, line_str: str) -> None:
         """
@@ -682,8 +635,10 @@ class SharedTranscodingProcess:
                     if not line_str:
                         continue
 
-                    # Log FFmpeg output and capture live progress fields
+                    # Log FFmpeg output and capture media info / live progress
                     logger.debug(f"FFmpeg [{self.stream_id}]: {line_str}")
+                    self._parse_ffmpeg_input_line(line_str)
+                    self._parse_ffmpeg_stream_line(line_str)
                     self._parse_ffmpeg_progress(line_str)
 
                     line_lower = line_str.lower()

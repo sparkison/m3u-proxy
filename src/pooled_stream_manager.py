@@ -1422,16 +1422,21 @@ class PooledStreamManager:
     async def force_stop_stream(self, stream_key: str):
         """
         Immediately stop a stream and its FFmpeg process without grace period.
-        Used when explicitly deleting a stream via API.
+        Used when explicitly deleting a stream via API and during failover.
+
+        Pops the entry up front and cleans up the captured reference so a
+        concurrent get_or_create_shared_stream that re-inserts at the same key
+        (e.g. a failover client racing this teardown) isn't torn down by the
+        trailing cleanup.
         """
-        if stream_key not in self.shared_processes:
+        process = self.shared_processes.pop(stream_key, None)
+        if process is None:
             logger.info(f"Stream {stream_key} not found in local processes")
             return False
 
         logger.info(
             f"Force stopping stream {stream_key} and terminating FFmpeg process"
         )
-        process = self.shared_processes[stream_key]
 
         # Remove all clients from this stream immediately
         clients_to_remove = list(process.clients.keys())
@@ -1440,8 +1445,24 @@ class PooledStreamManager:
             if client_id in self.client_streams:
                 del self.client_streams[client_id]
 
-        # Immediately cleanup the FFmpeg process
-        await self._cleanup_local_process(stream_key)
+        # Tear down the captured process — NOT whatever is at stream_key now.
+        await process.cleanup()
+
+        # Mirror the auxiliary cleanup that _cleanup_local_process does so the
+        # state stays consistent regardless of which path called us.
+        if stream_key in self.stream_key_to_id:
+            del self.stream_key_to_id[stream_key]
+        if self.redis_client:
+            try:
+                redis_key = f"stream:{stream_key}"
+                await self.redis_client.delete(redis_key)
+                await self.redis_client.srem(
+                    f"worker:{self.worker_id}:streams", redis_key
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Error cleaning up Redis state for stream {stream_key}: {e}"
+                )
 
         logger.info(f"Stream {stream_key} force stopped, FFmpeg process terminated")
         return True

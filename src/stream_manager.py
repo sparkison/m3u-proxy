@@ -4315,20 +4315,27 @@ class StreamManager:
         stream_info.failover_event.clear()
         stream_info.failover_event.set()
 
-        # For transcoded streams, stop and restart the transcoding process
+        # For transcoded streams, stop and restart the transcoding process.
+        # Clear the stream key BEFORE awaiting force_stop_stream — otherwise a
+        # client coroutine woken by failover_event can read the still-set
+        # transcode_stream_key and pass it as reuse_stream_key, which creates a
+        # new SharedTranscodingProcess at the same key. The tail-end
+        # _cleanup_local_process inside force_stop_stream then pops whatever is
+        # at that key (the brand-new process) and tears down its ffmpeg, killing
+        # the failover stream a couple of seconds after it started.
         if stream_info.is_transcoded and self.pooled_manager:
-            try:
-                # Stop the old transcoding process
-                if stream_info.transcode_stream_key:
+            old_stream_key = stream_info.transcode_stream_key
+            stream_info.transcode_stream_key = None
+            if old_stream_key:
+                try:
                     logger.info(
-                        f"Stopping transcoding process for failover: {stream_info.transcode_stream_key}"
+                        f"Stopping transcoding process for failover: {old_stream_key}"
                     )
-                    await self.pooled_manager.force_stop_stream(
-                        stream_info.transcode_stream_key
+                    await self.pooled_manager.force_stop_stream(old_stream_key)
+                except Exception as e:
+                    logger.error(
+                        f"Error stopping transcoding process during failover: {e}"
                     )
-                    stream_info.transcode_stream_key = None
-            except Exception as e:
-                logger.error(f"Error stopping transcoding process during failover: {e}")
 
         # Emit failover event
         await self._emit_event(

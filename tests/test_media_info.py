@@ -219,3 +219,54 @@ def test_parse_ffmpeg_input_line_ignores_unrelated_lines():
     )
 
     assert "container" not in process.media_info
+
+
+def test_force_stop_stream_does_not_clobber_concurrent_reinsertion():
+    """
+    Regression for failover race: force_stop_stream must tear down the process
+    it was called for, even if a concurrent get_or_create_shared_stream
+    re-inserts a brand-new SharedTranscodingProcess at the same stream_key
+    while the old one is being awaited. Otherwise the freshly-started failover
+    transcoder gets killed seconds after it starts and the stream goes dark.
+    """
+    import asyncio
+    from pooled_stream_manager import PooledStreamManager
+
+    async def _run():
+        # Build a manager without the redis/event-loop setup; we only exercise
+        # the in-memory force_stop_stream path.
+        manager = PooledStreamManager.__new__(PooledStreamManager)
+        manager.shared_processes = {}
+        manager.client_streams = {}
+        manager.stream_key_to_id = {}
+        manager.redis_client = None
+        manager.worker_id = "test-worker"
+
+        # The "old" process — replace its async methods with stubs so we don't
+        # actually need a running ffmpeg.
+        old = _make_process()
+        old.process = None  # cleanup() short-circuits when there's no process
+        old.clients = {"client-a": 0.0}
+
+        async def remove_client(client_id):
+            # During this await, another coroutine swaps in a new process at
+            # the same stream_key — simulating the client reconnect that
+            # caused the original race.
+            new = _make_process()
+            new.media_info["video_codec"] = "h264"
+            manager.shared_processes["key-X"] = new
+            old.clients.pop(client_id, None)
+
+        old.remove_client = remove_client
+        manager.shared_processes["key-X"] = old
+
+        await manager.force_stop_stream("key-X")
+
+        # The new process inserted mid-flight must still be present — only the
+        # captured 'old' reference should have been torn down.
+        survivor = manager.shared_processes.get("key-X")
+        assert survivor is not None, "force_stop_stream destroyed the new process"
+        assert survivor is not old
+        assert survivor.media_info.get("video_codec") == "h264"
+
+    asyncio.run(_run())

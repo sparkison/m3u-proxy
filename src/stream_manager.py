@@ -4531,6 +4531,21 @@ class StreamManager:
                     client_info.idle_warning_logged = False
                     client_info.idle_error_logged = False
 
+    def _get_media_info(self, stream: "StreamInfo") -> Dict[str, Any]:
+        """
+        Look up live media info (codec/container/resolution/bitrate/fps) for a
+        stream. Returns an empty dict for non-transcoded streams since live
+        ffmpeg metadata only exists when ffmpeg is the active producer.
+        """
+        if not stream.transcode_stream_key or not self.pooled_manager:
+            return {}
+        process = self.pooled_manager.shared_processes.get(
+            stream.transcode_stream_key
+        )
+        if not process:
+            return {}
+        return dict(getattr(process, "media_info", {}) or {})
+
     def get_stats(self) -> Dict:
         """Get comprehensive stats - aggregates variant stream stats into parent streams"""
         # Only count non-variant streams
@@ -4662,6 +4677,7 @@ class StreamManager:
                     "last_access": stream.last_access.isoformat(),
                     "metadata": stream.metadata,
                     "headers": stream.headers,
+                    "media_info": self._get_media_info(stream),
                 }
                 for stream in non_variant_streams
             ],

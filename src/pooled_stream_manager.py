@@ -5,6 +5,7 @@ Implements connection pooling and multi-worker coordination.
 
 import asyncio
 import json
+import re
 import time
 import uuid
 import hashlib
@@ -13,6 +14,12 @@ import logging
 from config import settings
 import os
 import tempfile
+
+# Live ffmpeg progress fields written to stderr (e.g.
+# "frame=  243 fps= 30 q=28.0 size=    1152kB time=00:00:08.13 bitrate=1162.5kbits/s speed=1.01x")
+_FFMPEG_PROGRESS_FIELD_RE = re.compile(
+    r"\b(?P<key>frame|fps|bitrate|speed|q|size|time)\s*=\s*(?P<val>\S+)"
+)
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +70,11 @@ class SharedTranscodingProcess:
         self.last_access = time.time()
         self.total_bytes_served = 0
         self.status = "starting"
+        # Live media info populated from ffprobe (codec/container/resolution/audio)
+        # and the active ffmpeg process's stderr (bitrate/fps/frame/speed). Empty
+        # for resolver streams (streamlink/yt-dlp) that don't go through ffmpeg.
+        self.media_info: Dict[str, Any] = {}
+        self._probe_task: Optional[asyncio.Task] = None
 
         # Broadcasting support - each client gets its own queue
         self.client_queues: Dict[str, asyncio.Queue] = {}
@@ -350,6 +362,11 @@ class SharedTranscodingProcess:
             # Start stderr logging task
             asyncio.create_task(self._log_stderr())
 
+            # Probe the input async to populate codec/container/resolution.
+            # Fire-and-forget — never await this; stream startup must not block
+            # on ffprobe (it can take a few seconds against slow upstreams).
+            self._probe_task = asyncio.create_task(self._probe_input_async())
+
             # Start broadcaster task to read from FFmpeg and send to all clients
             if self.mode == "stdout":
                 self._broadcaster_task = asyncio.create_task(self._broadcast_loop())
@@ -452,6 +469,149 @@ class SharedTranscodingProcess:
         except Exception as e:
             logger.debug(f"HLS watch loop ended for {self.stream_id}: {e}")
 
+    async def _probe_input_async(self):
+        """
+        Run ffprobe against the source URL on a background task and populate
+        media_info with codec/container/resolution/audio info. Fire-and-forget;
+        callers must not await this so stream startup is never delayed.
+        """
+        cmd = [
+            "ffprobe",
+            "-v",
+            "quiet",
+            "-print_format",
+            "json",
+            "-show_streams",
+            "-show_format",
+        ]
+        if (
+            self.user_agent
+            and isinstance(self.url, str)
+            and ("://" in self.url and not self.url.startswith("file://"))
+        ):
+            cmd.extend(["-user_agent", self.user_agent])
+        if (
+            self.headers
+            and isinstance(self.url, str)
+            and ("://" in self.url and not self.url.startswith("file://"))
+        ):
+            header_str = "".join([f"{k}: {v}\r\n" for k, v in self.headers.items()])
+            cmd.extend(["-headers", header_str])
+        cmd.append(self.url)
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            try:
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=15)
+            except asyncio.TimeoutError:
+                logger.debug(
+                    f"ffprobe timed out for stream {self.stream_id}; skipping media_info population"
+                )
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                return
+
+            if proc.returncode != 0 or not stdout:
+                return
+
+            try:
+                data = json.loads(stdout.decode("utf-8", errors="ignore"))
+            except json.JSONDecodeError:
+                return
+
+            video = next(
+                (s for s in data.get("streams", []) if s.get("codec_type") == "video"),
+                None,
+            )
+            audio = next(
+                (s for s in data.get("streams", []) if s.get("codec_type") == "audio"),
+                None,
+            )
+            fmt = data.get("format", {}) or {}
+
+            info: Dict[str, Any] = {}
+            if video:
+                width = video.get("width")
+                height = video.get("height")
+                if width and height:
+                    info["resolution"] = f"{width}x{height}"
+                if video.get("codec_name"):
+                    info["video_codec"] = video["codec_name"]
+                # Static fps from input — gets overwritten by live -progress data later
+                rate = video.get("avg_frame_rate") or video.get("r_frame_rate")
+                if rate and "/" in rate:
+                    try:
+                        num, den = rate.split("/", 1)
+                        if float(den) > 0:
+                            info["fps"] = round(float(num) / float(den), 2)
+                    except ValueError:
+                        pass
+            if audio:
+                if audio.get("codec_name"):
+                    info["audio_codec"] = audio["codec_name"]
+                channels = audio.get("channels")
+                if channels:
+                    info["audio_channels"] = {
+                        1: "mono",
+                        2: "stereo",
+                        6: "5.1",
+                        8: "7.1",
+                    }.get(int(channels), str(channels))
+            container = fmt.get("format_name")
+            if container:
+                # ffprobe returns comma-separated synonyms (e.g. "mov,mp4,m4a")
+                info["container"] = container.split(",")[0].upper()
+
+            # Merge — never clobber live fields already populated by ffmpeg progress
+            for key, value in info.items():
+                self.media_info.setdefault(key, value)
+        except FileNotFoundError:
+            logger.warning("ffprobe binary not found; cannot populate media_info")
+        except Exception as e:
+            logger.debug(
+                f"Error probing input for stream {self.stream_id}: {e}"
+            )
+
+    def _parse_ffmpeg_progress(self, line_str: str) -> None:
+        """
+        Extract live progress fields (bitrate, fps, frame, speed) from a single
+        ffmpeg stderr line and update media_info. No-op for non-progress lines.
+        """
+        # Cheap pre-filter — most stderr lines aren't progress
+        if "bitrate=" not in line_str and "fps=" not in line_str:
+            return
+        for match in _FFMPEG_PROGRESS_FIELD_RE.finditer(line_str):
+            key = match.group("key")
+            raw = match.group("val")
+            if key == "bitrate":
+                if raw.endswith("kbits/s"):
+                    try:
+                        self.media_info["bitrate_kbps"] = round(float(raw[:-7]), 1)
+                    except ValueError:
+                        pass
+            elif key == "fps":
+                try:
+                    self.media_info["fps"] = round(float(raw), 2)
+                except ValueError:
+                    pass
+            elif key == "frame":
+                try:
+                    self.media_info["frame"] = int(raw)
+                except ValueError:
+                    pass
+            elif key == "speed":
+                if raw.endswith("x"):
+                    try:
+                        self.media_info["speed"] = round(float(raw[:-1]), 2)
+                    except ValueError:
+                        pass
+
     async def _log_stderr(self):
         """Log FFmpeg stderr output and monitor for write errors and input failures"""
         if not self.process or not self.process.stderr:
@@ -502,15 +662,29 @@ class SharedTranscodingProcess:
 
                 buf += chunk
 
-                # Split on newline and process full lines
-                while b"\n" in buf:
-                    line, buf = buf.split(b"\n", 1)
+                # Split on \n OR \r — ffmpeg writes its periodic stats line with
+                # a trailing \r so it overwrites in-place in a terminal. Without
+                # splitting on \r those stats lines are buffered until the next
+                # newline arrives and we miss the live bitrate/fps updates.
+                while True:
+                    n_idx = buf.find(b"\n")
+                    r_idx = buf.find(b"\r")
+                    if n_idx == -1 and r_idx == -1:
+                        break
+                    if n_idx == -1:
+                        idx = r_idx
+                    elif r_idx == -1:
+                        idx = n_idx
+                    else:
+                        idx = min(n_idx, r_idx)
+                    line, buf = buf[:idx], buf[idx + 1 :]
                     line_str = line.decode("utf-8", errors="ignore").strip()
                     if not line_str:
                         continue
 
-                    # Log FFmpeg output (you could parse stats here)
+                    # Log FFmpeg output and capture live progress fields
                     logger.debug(f"FFmpeg [{self.stream_id}]: {line_str}")
+                    self._parse_ffmpeg_progress(line_str)
 
                     line_lower = line_str.lower()
 

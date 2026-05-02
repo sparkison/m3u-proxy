@@ -4546,9 +4546,7 @@ class StreamManager:
         """
         if not stream.transcode_stream_key or not self.pooled_manager:
             return {}
-        process = self.pooled_manager.shared_processes.get(
-            stream.transcode_stream_key
-        )
+        process = self.pooled_manager.shared_processes.get(stream.transcode_stream_key)
         if not process:
             return {}
         return dict(getattr(process, "media_info", {}) or {})

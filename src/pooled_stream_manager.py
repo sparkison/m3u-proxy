@@ -29,10 +29,17 @@ _FFMPEG_INPUT_LINE_RE = re.compile(
 )
 
 # "Stream #0:0[0x100]: Video: h264 (Main) ([27][0][0][0] / 0x001B), yuv420p..."
+# "Stream #0:0[0x100][0x200]: Video: hevc ..." (dual PID bracket groups in MPEG-TS)
 # "Stream #0:1[0x101](eng): Audio: aac (LC) ..."
 _FFMPEG_STREAM_LINE_RE = re.compile(
-    r"Stream #\d+:\d+(?:\[[^\]]+\])?(?:\([^)]+\))?:\s+"
+    r"Stream #\d+:\d+(?:\[[^\]]+\])*(?:\([^)]+\))?:\s+"
     r"(?P<type>Video|Audio):\s+(?P<details>.+)$"
+)
+
+# Audio channel layout: "stereo", "mono", "5.1", "5.1(side)", "5.1(back)", "7.1", "quad", etc.
+# The (?:\([^)]*\))? tolerates the variant suffixes ffmpeg appends to 5.1/7.1.
+_AUDIO_LAYOUT_RE = re.compile(
+    r",\s*(?P<layout>stereo|mono|5\.1|7\.1|quad)(?:\([^)]*\))?[,\s]"
 )
 
 # "1280x720" or "1920x1080 [SAR 1:1 DAR 16:9]" inside a Stream line.
@@ -494,7 +501,7 @@ class SharedTranscodingProcess:
         if not match:
             return
         container = match.group("container").strip().split(",")[0].strip()
-        if container:
+        if container and "container" not in self.media_info:
             self.media_info["container"] = container.upper()
 
     def _parse_ffmpeg_stream_line(self, line_str: str) -> None:
@@ -525,11 +532,9 @@ class SharedTranscodingProcess:
             codec = re.sub(r"\s*\(.*", "", codec).strip()
             if codec and "audio_codec" not in self.media_info:
                 self.media_info["audio_codec"] = codec
-            for layout in ("stereo", "mono", "5.1", "7.1", "quad"):
-                if f", {layout}," in details or f", {layout} " in details:
-                    if "audio_channels" not in self.media_info:
-                        self.media_info["audio_channels"] = layout
-                    break
+            layout_match = _AUDIO_LAYOUT_RE.search(details)
+            if layout_match and "audio_channels" not in self.media_info:
+                self.media_info["audio_channels"] = layout_match.group("layout")
 
     def _parse_ffmpeg_progress(self, line_str: str) -> None:
         """
@@ -635,11 +640,16 @@ class SharedTranscodingProcess:
                     if not line_str:
                         continue
 
-                    # Log FFmpeg output and capture media info / live progress
+                    # Log FFmpeg output and capture media info / live progress.
+                    # Skip parsers for resolver (yt-dlp/streamlink) stderr — their
+                    # output format is not ffmpeg's, so the regexes won't match but
+                    # a coincidental "fps=" or "bitrate=" in debug output could
+                    # populate stale values.
                     logger.debug(f"FFmpeg [{self.stream_id}]: {line_str}")
-                    self._parse_ffmpeg_input_line(line_str)
-                    self._parse_ffmpeg_stream_line(line_str)
-                    self._parse_ffmpeg_progress(line_str)
+                    if not self.resolver_type:
+                        self._parse_ffmpeg_input_line(line_str)
+                        self._parse_ffmpeg_stream_line(line_str)
+                        self._parse_ffmpeg_progress(line_str)
 
                     line_lower = line_str.lower()
 

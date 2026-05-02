@@ -82,7 +82,6 @@ def test_get_media_info_returns_empty_for_non_transcoded_streams():
     Plain HTTP-proxy streams (no ffmpeg) must return empty media_info — the
     UI relies on this to hide metadata badges when there's nothing live to show.
     """
-    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
     from stream_manager import StreamInfo, StreamManager
     from datetime import datetime, timezone
 
@@ -194,6 +193,34 @@ def test_parse_ffmpeg_stream_line_handles_5_1_channel_layout():
     assert process.media_info["audio_channels"] == "5.1"
 
 
+def test_parse_ffmpeg_stream_line_handles_dual_pid_brackets():
+    """
+    MPEG-TS streams commonly emit two consecutive PID bracket groups
+    (e.g. [0x100][0x200]). The regex must match both so video_codec and
+    resolution are populated — regression guard for the ? → * fix.
+    """
+    process = _make_process()
+
+    process._parse_ffmpeg_stream_line(
+        "    Stream #0:0[0x100][0x200]: Video: hevc (Main), "
+        "yuv420p(tv, bt709), 1920x1080, 50 fps, 50 tbr, 90k tbn"
+    )
+
+    assert process.media_info["video_codec"] == "hevc"
+    assert process.media_info["resolution"] == "1920x1080"
+
+
+def test_parse_ffmpeg_stream_line_handles_5_1_side_channel_layout():
+    """5.1(side) channel layout variant should map to '5.1'."""
+    process = _make_process()
+
+    process._parse_ffmpeg_stream_line(
+        "    Stream #0:1: Audio: eac3, 48000 Hz, 5.1(side), fltp, 384 kb/s"
+    )
+
+    assert process.media_info["audio_channels"] == "5.1"
+
+
 def test_parse_ffmpeg_stream_line_does_not_clobber_existing_codec():
     """
     The first Video stream wins so we don't overwrite with secondary streams
@@ -203,9 +230,7 @@ def test_parse_ffmpeg_stream_line_does_not_clobber_existing_codec():
     process = _make_process()
     process.media_info["video_codec"] = "h264"
 
-    process._parse_ffmpeg_stream_line(
-        "    Stream #0:2: Video: png, rgba, 256x256"
-    )
+    process._parse_ffmpeg_stream_line("    Stream #0:2: Video: png, rgba, 256x256")
 
     assert process.media_info["video_codec"] == "h264"
 

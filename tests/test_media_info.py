@@ -246,6 +246,193 @@ def test_parse_ffmpeg_input_line_ignores_unrelated_lines():
     assert "container" not in process.media_info
 
 
+def test_output_media_info_starts_empty_with_parser_state_unset():
+    """Fresh processes track output info separately and start in input mode."""
+    process = _make_process()
+
+    assert process.output_media_info == {}
+    assert process._parsing_output is False
+
+
+def test_parse_ffmpeg_output_line_captures_container_and_flips_state():
+    """The 'Output #0, FORMAT, to TARGET:' line should populate output_media_info
+    and switch the parser into output mode for subsequent Stream lines."""
+    process = _make_process()
+
+    process._parse_ffmpeg_output_line("Output #0, mpegts, to 'pipe:1':")
+
+    assert process.output_media_info["container"] == "MPEGTS"
+    assert process._parsing_output is True
+    # Input-side dict must not be polluted with the output container.
+    assert "container" not in process.media_info
+
+
+def test_parse_ffmpeg_output_line_takes_first_synonym():
+    """Multi-synonym output containers collapse to the first canonical name."""
+    process = _make_process()
+
+    process._parse_ffmpeg_output_line(
+        "Output #0, mov,mp4,m4a,3gp,3g2,mj2, to '/tmp/out.mp4':"
+    )
+
+    assert process.output_media_info["container"] == "MOV"
+
+
+def test_parse_ffmpeg_output_line_handles_hls_muxer():
+    """HLS output ('Output #0, hls, to ...') is the common transcoded path."""
+    process = _make_process()
+
+    process._parse_ffmpeg_output_line("Output #0, hls, to '/tmp/abc/index.m3u8':")
+
+    assert process.output_media_info["container"] == "HLS"
+
+
+def test_stream_lines_before_output_marker_go_to_input_media_info():
+    """While the parser hasn't seen Output #0, codec lines describe the source."""
+    process = _make_process()
+
+    process._parse_ffmpeg_stream_line(
+        "    Stream #0:0[0x100]: Video: hevc (Main), yuv420p, 1920x1080, 50 fps"
+    )
+    process._parse_ffmpeg_stream_line(
+        "    Stream #0:1[0x101](eng): Audio: ac3, 48000 Hz, 5.1, fltp, 384 kb/s"
+    )
+
+    assert process.media_info["video_codec"] == "hevc"
+    assert process.media_info["resolution"] == "1920x1080"
+    assert process.media_info["audio_codec"] == "ac3"
+    assert process.media_info["audio_channels"] == "5.1"
+    assert process.output_media_info == {}
+
+
+def test_stream_lines_after_output_marker_go_to_output_media_info():
+    """Once Output # is seen, the encoder Stream lines populate output_media_info,
+    leaving the input description intact."""
+    process = _make_process()
+
+    process._parse_ffmpeg_stream_line(
+        "    Stream #0:0[0x100]: Video: hevc, yuv420p, 1920x1080, 50 fps"
+    )
+    process._parse_ffmpeg_stream_line(
+        "    Stream #0:1[0x101]: Audio: ac3, 48000 Hz, 5.1, fltp, 384 kb/s"
+    )
+    process._parse_ffmpeg_output_line("Output #0, mpegts, to 'pipe:1':")
+    process._parse_ffmpeg_stream_line(
+        "    Stream #0:0: Video: h264, yuv420p, 1280x720, q=2-31, 25 fps"
+    )
+    process._parse_ffmpeg_stream_line(
+        "    Stream #0:1: Audio: aac (LC), 48000 Hz, stereo, fltp, 128 kb/s"
+    )
+
+    # Source side untouched
+    assert process.media_info["video_codec"] == "hevc"
+    assert process.media_info["resolution"] == "1920x1080"
+    assert process.media_info["audio_codec"] == "ac3"
+    assert process.media_info["audio_channels"] == "5.1"
+    # Encoder side captured separately
+    assert process.output_media_info["video_codec"] == "h264"
+    assert process.output_media_info["resolution"] == "1280x720"
+    assert process.output_media_info["audio_codec"] == "aac"
+    assert process.output_media_info["audio_channels"] == "stereo"
+    assert process.output_media_info["container"] == "MPEGTS"
+
+
+def test_progress_fields_dual_write_once_output_seen():
+    """Progress numbers describe encoder output. Before Output #0 they only
+    populate media_info (so the existing UI keeps getting bitrate/fps even on
+    very early reads); after Output #0 they mirror into output_media_info."""
+    process = _make_process()
+
+    process._parse_ffmpeg_progress(
+        "frame=10 fps=25 bitrate=1000.0kbits/s speed=1.0x"
+    )
+    assert process.media_info["bitrate_kbps"] == 1000.0
+    assert process.media_info["fps"] == 25.0
+    assert "bitrate_kbps" not in process.output_media_info
+
+    process._parse_ffmpeg_output_line("Output #0, mpegts, to 'pipe:1':")
+    process._parse_ffmpeg_progress(
+        "frame=20 fps=30 bitrate=2000.5kbits/s speed=1.5x"
+    )
+
+    assert process.media_info["bitrate_kbps"] == 2000.5
+    assert process.media_info["fps"] == 30.0
+    assert process.output_media_info["bitrate_kbps"] == 2000.5
+    assert process.output_media_info["fps"] == 30.0
+    assert process.output_media_info["frame"] == 20
+    assert process.output_media_info["speed"] == 1.5
+
+
+def test_parse_ffmpeg_output_line_does_not_clobber_existing_container():
+    """Some configs may emit multiple Output # markers (e.g. tee); only the
+    first wins so output_media_info reflects the primary muxer."""
+    process = _make_process()
+
+    process._parse_ffmpeg_output_line("Output #0, mpegts, to 'pipe:1':")
+    process._parse_ffmpeg_output_line("Output #1, hls, to '/tmp/idx.m3u8':")
+
+    assert process.output_media_info["container"] == "MPEGTS"
+
+
+def test_get_output_media_info_returns_empty_for_non_transcoded_streams():
+    """Plain HTTP-proxy streams have no ffmpeg process — output_media_info must
+    be empty so the editor knows not to render the Output Info badge row."""
+    from stream_manager import StreamInfo, StreamManager
+    from datetime import datetime, timezone
+
+    manager = StreamManager.__new__(StreamManager)
+    manager.pooled_manager = None
+
+    stream = StreamInfo(
+        stream_id="plain-stream",
+        original_url="http://example.com/plain.ts",
+        created_at=datetime.now(timezone.utc),
+        last_access=datetime.now(timezone.utc),
+    )
+
+    assert manager._get_output_media_info(stream) == {}
+
+
+def test_get_output_media_info_pulls_from_linked_pooled_process():
+    """Transcoded streams expose the linked process's output_media_info dict so
+    encoder-side stats reach the API response alongside the input description."""
+    from stream_manager import StreamInfo, StreamManager
+    from datetime import datetime, timezone
+
+    manager = StreamManager.__new__(StreamManager)
+    pooled = MagicMock()
+    fake_process = MagicMock()
+    fake_process.output_media_info = {
+        "resolution": "1280x720",
+        "video_codec": "h264",
+        "audio_codec": "aac",
+        "audio_channels": "stereo",
+        "container": "MPEGTS",
+        "fps": 25.0,
+        "bitrate_kbps": 2500.0,
+    }
+    pooled.shared_processes = {"key-out": fake_process}
+    manager.pooled_manager = pooled
+
+    stream = StreamInfo(
+        stream_id="t-stream",
+        original_url="http://example.com/t.ts",
+        created_at=datetime.now(timezone.utc),
+        last_access=datetime.now(timezone.utc),
+        transcode_stream_key="key-out",
+    )
+
+    info = manager._get_output_media_info(stream)
+
+    assert info["resolution"] == "1280x720"
+    assert info["video_codec"] == "h264"
+    assert info["audio_codec"] == "aac"
+    assert info["audio_channels"] == "stereo"
+    assert info["container"] == "MPEGTS"
+    assert info["fps"] == 25.0
+    assert info["bitrate_kbps"] == 2500.0
+
+
 def test_force_stop_stream_does_not_clobber_concurrent_reinsertion():
     """
     Regression for failover race: force_stop_stream must tear down the process

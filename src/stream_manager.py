@@ -4551,6 +4551,21 @@ class StreamManager:
             return {}
         return dict(getattr(process, "media_info", {}) or {})
 
+    def _get_output_media_info(self, stream: "StreamInfo") -> Dict[str, Any]:
+        """
+        Look up live encoder/muxer output info for a transcoded stream — the
+        codec/container/resolution ffmpeg has been told to produce, plus the
+        live progress fields that describe what's being written downstream.
+        Empty for non-transcoded streams (no ffmpeg process) or before ffmpeg
+        emits its "Output #" line.
+        """
+        if not stream.transcode_stream_key or not self.pooled_manager:
+            return {}
+        process = self.pooled_manager.shared_processes.get(stream.transcode_stream_key)
+        if not process:
+            return {}
+        return dict(getattr(process, "output_media_info", {}) or {})
+
     def get_stats(self) -> Dict:
         """Get comprehensive stats - aggregates variant stream stats into parent streams"""
         # Only count non-variant streams
@@ -4683,6 +4698,7 @@ class StreamManager:
                     "metadata": stream.metadata,
                     "headers": stream.headers,
                     "media_info": self._get_media_info(stream),
+                    "output_media_info": self._get_output_media_info(stream),
                 }
                 for stream in non_variant_streams
             ],

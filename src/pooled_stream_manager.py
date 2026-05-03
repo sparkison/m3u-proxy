@@ -28,6 +28,13 @@ _FFMPEG_INPUT_LINE_RE = re.compile(
     r"^\s*Input #\d+,\s*(?P<container>[\w,]+),\s*from\s+"
 )
 
+# "Output #0, mpegts, to 'pipe:1':" or "Output #0, hls, to '/path/index.m3u8':".
+# Once this line is emitted by ffmpeg, every subsequent Stream # line refers to
+# the encoder/muxer output rather than the source input.
+_FFMPEG_OUTPUT_LINE_RE = re.compile(
+    r"^\s*Output #\d+,\s*(?P<container>[\w,]+),\s*to\s+"
+)
+
 # "Stream #0:0[0x100]: Video: h264 (Main) ([27][0][0][0] / 0x001B), yuv420p..."
 # "Stream #0:0[0x100][0x200]: Video: hevc ..." (dual PID bracket groups in MPEG-TS)
 # "Stream #0:1[0x101](eng): Audio: aac (LC) ..."
@@ -102,6 +109,15 @@ class SharedTranscodingProcess:
         # providers reject the second connection. Empty for resolver streams
         # (streamlink/yt-dlp) that don't go through ffmpeg.
         self.media_info: Dict[str, Any] = {}
+        # Output-side counterpart describing what ffmpeg is producing right now
+        # (encoder codec / target resolution / muxer container) plus the live
+        # progress fields, which are technically output stats. Populated only
+        # after ffmpeg prints its "Output #" line, so it stays empty for plain
+        # passthrough where no ffmpeg process is involved.
+        self.output_media_info: Dict[str, Any] = {}
+        # Parser state: flips True once "Output #" is seen in stderr so the
+        # Stream-line parser knows where to route subsequent codec lines.
+        self._parsing_output: bool = False
 
         # Broadcasting support - each client gets its own queue
         self.client_queues: Dict[str, asyncio.Queue] = {}
@@ -504,15 +520,34 @@ class SharedTranscodingProcess:
         if container and "container" not in self.media_info:
             self.media_info["container"] = container.upper()
 
+    def _parse_ffmpeg_output_line(self, line_str: str) -> None:
+        """
+        Parse ffmpeg's "Output #0, FORMAT, to 'TARGET':" line. Captures the
+        muxer container into output_media_info and flips the parser state so
+        that subsequent Stream # lines are recognised as output streams. Only
+        the first Output block is honoured — multi-output configs (e.g. tee)
+        would each restate the marker but we keep the first match.
+        """
+        match = _FFMPEG_OUTPUT_LINE_RE.match(line_str)
+        if not match:
+            return
+        self._parsing_output = True
+        container = match.group("container").strip().split(",")[0].strip()
+        if container and "container" not in self.output_media_info:
+            self.output_media_info["container"] = container.upper()
+
     def _parse_ffmpeg_stream_line(self, line_str: str) -> None:
         """
         Parse ffmpeg's "Stream #0:N[...]: Video|Audio: ..." lines for codec
         details. ffmpeg prints one per stream right after the input is opened
         — this is free metadata that doesn't require a second connection.
+        Routes into media_info or output_media_info based on whether the
+        "Output #" marker has been seen yet.
         """
         match = _FFMPEG_STREAM_LINE_RE.search(line_str)
         if not match:
             return
+        target = self.output_media_info if self._parsing_output else self.media_info
         stream_type = match.group("type").lower()
         details = match.group("details")
         if stream_type == "video":
@@ -520,55 +555,70 @@ class SharedTranscodingProcess:
             # profile (e.g. "h264 (Main) (HEVC / 0x...)" — strip parens).
             codec = details.split(",", 1)[0].strip()
             codec = re.sub(r"\s*\(.*", "", codec).strip()
-            if codec and "video_codec" not in self.media_info:
-                self.media_info["video_codec"] = codec
+            if codec and "video_codec" not in target:
+                target["video_codec"] = codec
             res_match = _RESOLUTION_RE.search(details)
-            if res_match and "resolution" not in self.media_info:
-                self.media_info["resolution"] = (
+            if res_match and "resolution" not in target:
+                target["resolution"] = (
                     f"{res_match.group('w')}x{res_match.group('h')}"
                 )
         elif stream_type == "audio":
             codec = details.split(",", 1)[0].strip()
             codec = re.sub(r"\s*\(.*", "", codec).strip()
-            if codec and "audio_codec" not in self.media_info:
-                self.media_info["audio_codec"] = codec
+            if codec and "audio_codec" not in target:
+                target["audio_codec"] = codec
             layout_match = _AUDIO_LAYOUT_RE.search(details)
-            if layout_match and "audio_channels" not in self.media_info:
-                self.media_info["audio_channels"] = layout_match.group("layout")
+            if layout_match and "audio_channels" not in target:
+                target["audio_channels"] = layout_match.group("layout")
 
     def _parse_ffmpeg_progress(self, line_str: str) -> None:
         """
         Extract live progress fields (bitrate, fps, frame, speed) from a single
-        ffmpeg stderr line and update media_info. No-op for non-progress lines.
+        ffmpeg stderr line. Progress numbers describe the encoder output, so
+        once the "Output #" marker has been seen we mirror them into
+        output_media_info. We also keep writing them to media_info so existing
+        callers (Stream Info badge row in m3u-editor PR #1089) don't regress.
+        No-op for non-progress lines.
         """
         # Cheap pre-filter — most stderr lines aren't progress
         if "bitrate=" not in line_str and "fps=" not in line_str:
             return
+        targets = [self.media_info]
+        if self._parsing_output:
+            targets.append(self.output_media_info)
         for match in _FFMPEG_PROGRESS_FIELD_RE.finditer(line_str):
             key = match.group("key")
             raw = match.group("val")
             if key == "bitrate":
                 if raw.endswith("kbits/s"):
                     try:
-                        self.media_info["bitrate_kbps"] = round(float(raw[:-7]), 1)
+                        value = round(float(raw[:-7]), 1)
                     except ValueError:
-                        pass
+                        continue
+                    for t in targets:
+                        t["bitrate_kbps"] = value
             elif key == "fps":
                 try:
-                    self.media_info["fps"] = round(float(raw), 2)
+                    value = round(float(raw), 2)
                 except ValueError:
-                    pass
+                    continue
+                for t in targets:
+                    t["fps"] = value
             elif key == "frame":
                 try:
-                    self.media_info["frame"] = int(raw)
+                    value = int(raw)
                 except ValueError:
-                    pass
+                    continue
+                for t in targets:
+                    t["frame"] = value
             elif key == "speed":
                 if raw.endswith("x"):
                     try:
-                        self.media_info["speed"] = round(float(raw[:-1]), 2)
+                        value = round(float(raw[:-1]), 2)
                     except ValueError:
-                        pass
+                        continue
+                    for t in targets:
+                        t["speed"] = value
 
     async def _log_stderr(self):
         """Log FFmpeg stderr output and monitor for write errors and input failures"""
@@ -650,6 +700,7 @@ class SharedTranscodingProcess:
                     # populate stale values.
                     if not self.resolver_type:
                         self._parse_ffmpeg_input_line(line_str)
+                        self._parse_ffmpeg_output_line(line_str)
                         self._parse_ffmpeg_stream_line(line_str)
                         self._parse_ffmpeg_progress(line_str)
 

@@ -452,7 +452,10 @@ class TestFFmpegErrorPatterns:
     """Test FFmpeg stderr error pattern detection"""
 
     def test_input_error_patterns(self):
-        """Test that SharedTranscodingProcess detects input errors"""
+        """Test that SharedTranscodingProcess detects input errors via the
+        module-level pattern tuple."""
+        from pooled_stream_manager import _FFMPEG_INPUT_ERROR_PATTERNS
+
         # These are the error patterns we should detect
         error_patterns = [
             "Error opening input file https://example.com/stream.m3u8",
@@ -465,21 +468,20 @@ class TestFFmpegErrorPatterns:
             "Protocol not found",
         ]
 
-        # Verify each pattern would be caught
         for error_msg in error_patterns:
             assert any(
-                pattern in error_msg.lower()
-                for pattern in [
-                    "error opening input",
-                    "failed to resolve hostname",
-                    "connection refused",
-                    "connection timed out",
-                    "server returned 4",
-                    "server returned 5",
-                    "invalid data found",
-                    "protocol not found",
-                ]
-            )
+                pattern in error_msg.lower() for pattern in _FFMPEG_INPUT_ERROR_PATTERNS
+            ), f"Expected to match an input error pattern: {error_msg}"
+
+    def test_input_error_patterns_excludes_bare_end_of_file(self):
+        """Regression: ffmpeg 8.1 prints 'Error reading HTTP response: End of file'
+        on every HLS segment fetch end while -reconnect 1 silently reconnects,
+        so 'end of file' must not be a failover trigger on its own. Real upstream
+        loss is caught by the more specific patterns + the data-starvation
+        detector in stream_manager."""
+        from pooled_stream_manager import _FFMPEG_INPUT_ERROR_PATTERNS
+
+        assert "end of file" not in _FFMPEG_INPUT_ERROR_PATTERNS
 
     @pytest.mark.asyncio
     async def test_stderr_monitor_detects_input_error(self):
@@ -510,6 +512,36 @@ class TestFFmpegErrorPatterns:
 
         # Should have marked the stream as input_failed
         assert process.status == "input_failed"
+
+    @pytest.mark.asyncio
+    async def test_stderr_monitor_ignores_segment_end_eof(self):
+        """Regression for ffmpeg 8.1: a normal HLS segment-fetch EOF must NOT
+        flip status to input_failed. ffmpeg 8.1 logs this on every segment end
+        and recovers via -reconnect 1, so it isn't a failure."""
+        process = SharedTranscodingProcess(
+            stream_id="test_stream_eof",
+            url="http://example.com/stream.m3u8",
+            profile="test",
+            ffmpeg_args=["-i", "{input_url}", "-c", "copy", "pipe:1"],
+            user_agent="test-agent",
+        )
+
+        mock_process = Mock()
+        mock_stderr = AsyncMock()
+
+        eof_line = (
+            b"[http @ 0x7f202400c740] Error reading HTTP response: End of file\n"
+        )
+        mock_stderr.read = AsyncMock(side_effect=[eof_line, b""])
+
+        mock_process.stderr = mock_stderr
+        mock_process.returncode = None
+        process.process = mock_process
+
+        await process._log_stderr()
+
+        # Status must remain "starting" (init default), not flip to input_failed.
+        assert process.status != "input_failed"
 
 
 class TestFailoverStats:

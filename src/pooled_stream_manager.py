@@ -45,6 +45,41 @@ _AUDIO_LAYOUT_RE = re.compile(
 # "1280x720" or "1920x1080 [SAR 1:1 DAR 16:9]" inside a Stream line.
 _RESOLUTION_RE = re.compile(r"\b(?P<w>\d{2,5})x(?P<h>\d{2,5})\b")
 
+# stderr substrings (case-insensitive match) that signal ffmpeg has been told
+# to write somewhere it can't. These mark the stream as failed for cleanup.
+_FFMPEG_WRITE_ERROR_PATTERNS = (
+    "no space left on device",
+    "permission denied",
+    "i/o error",
+    "disk full",
+    "cannot write",
+    "failed to open",
+    "error writing",
+)
+
+# stderr substrings (case-insensitive match) that signal a genuine upstream
+# input failure and should trip failover. We deliberately do NOT include the
+# bare "end of file" string: ffmpeg 8.1 writes "Error reading HTTP response:
+# End of file" on every HLS segment fetch end (the HTTP layer closes when the
+# segment body is exhausted) and immediately reconnects via -reconnect 1, so
+# that line is normal traffic — not a stream failure. Genuine upstream loss
+# is still caught by:
+#   * the more specific patterns below ("connection refused", "server returned
+#     4xx/5xx", "error opening input", etc. — emitted when reconnect fails)
+#   * the low-bitrate / silence detectors in stream_manager.py, which trigger
+#     on actual data starvation regardless of what stderr says.
+_FFMPEG_INPUT_ERROR_PATTERNS = (
+    "error opening input",
+    "failed to resolve hostname",
+    "connection refused",
+    "connection timed out",
+    "input/output error",
+    "server returned 4",  # Matches 403, 404, etc.
+    "server returned 5",  # Matches 500, 502, 503, etc.
+    "invalid data found",
+    "protocol not found",
+)
+
 logger = logging.getLogger(__name__)
 
 try:
@@ -576,31 +611,6 @@ class SharedTranscodingProcess:
             return
 
         try:
-            # Monitor FFmpeg stderr for various error conditions
-            write_error_patterns = [
-                "no space left on device",
-                "permission denied",
-                "i/o error",
-                "disk full",
-                "cannot write",
-                "failed to open",
-                "error writing",
-            ]
-
-            # Input/connection error patterns that should trigger failover
-            input_error_patterns = [
-                "error opening input",
-                "failed to resolve hostname",
-                "connection refused",
-                "connection timed out",
-                "input/output error",
-                "server returned 4",  # Matches 403, 404, etc.
-                "server returned 5",  # Matches 500, 502, 503, etc.
-                "invalid data found",
-                "protocol not found",
-                "end of file",
-            ]
-
             # Read stderr in small chunks and buffer lines ourselves to avoid
             # asyncio.StreamReader's LimitOverrunError when ffmpeg writes very
             # long lines without a newline (which results in the message
@@ -656,7 +666,7 @@ class SharedTranscodingProcess:
                     line_lower = line_str.lower()
 
                     # Check for write errors
-                    for pattern in write_error_patterns:
+                    for pattern in _FFMPEG_WRITE_ERROR_PATTERNS:
                         if pattern in line_lower:
                             logger.error(
                                 f"FFmpeg write error detected for {self.stream_id}: {line_str}"
@@ -666,7 +676,7 @@ class SharedTranscodingProcess:
                             break
 
                     # Check for input/connection errors that should trigger failover
-                    for pattern in input_error_patterns:
+                    for pattern in _FFMPEG_INPUT_ERROR_PATTERNS:
                         if pattern in line_lower:
                             logger.error(
                                 f"FFmpeg input error detected for {self.stream_id}: {line_str}"

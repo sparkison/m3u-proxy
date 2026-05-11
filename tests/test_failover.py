@@ -529,9 +529,7 @@ class TestFFmpegErrorPatterns:
         mock_process = Mock()
         mock_stderr = AsyncMock()
 
-        eof_line = (
-            b"[http @ 0x7f202400c740] Error reading HTTP response: End of file\n"
-        )
+        eof_line = b"[http @ 0x7f202400c740] Error reading HTTP response: End of file\n"
         mock_stderr.read = AsyncMock(side_effect=[eof_line, b""])
 
         mock_process.stderr = mock_stderr

@@ -594,9 +594,7 @@ class SharedTranscodingProcess:
                 target["video_codec"] = codec
             res_match = _RESOLUTION_RE.search(details)
             if res_match and "resolution" not in target:
-                target["resolution"] = (
-                    f"{res_match.group('w')}x{res_match.group('h')}"
-                )
+                target["resolution"] = f"{res_match.group('w')}x{res_match.group('h')}"
         elif stream_type == "audio":
             codec = details.split(",", 1)[0].strip()
             codec = re.sub(r"\s*\(.*", "", codec).strip()

@@ -343,17 +343,13 @@ def test_progress_fields_dual_write_once_output_seen():
     very early reads); after Output #0 they mirror into output_media_info."""
     process = _make_process()
 
-    process._parse_ffmpeg_progress(
-        "frame=10 fps=25 bitrate=1000.0kbits/s speed=1.0x"
-    )
+    process._parse_ffmpeg_progress("frame=10 fps=25 bitrate=1000.0kbits/s speed=1.0x")
     assert process.media_info["bitrate_kbps"] == 1000.0
     assert process.media_info["fps"] == 25.0
     assert "bitrate_kbps" not in process.output_media_info
 
     process._parse_ffmpeg_output_line("Output #0, mpegts, to 'pipe:1':")
-    process._parse_ffmpeg_progress(
-        "frame=20 fps=30 bitrate=2000.5kbits/s speed=1.5x"
-    )
+    process._parse_ffmpeg_progress("frame=20 fps=30 bitrate=2000.5kbits/s speed=1.5x")
 
     assert process.media_info["bitrate_kbps"] == 2000.5
     assert process.media_info["fps"] == 30.0

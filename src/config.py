@@ -129,6 +129,11 @@ class Settings(BaseSettings):
     # Maximum chunk wait time in seconds for pre-buffer (to avoid infinite wait)
     STRICT_LIVE_TS_PREBUFFER_TIMEOUT: int = 10
 
+    # Minimum chunks per upstream connection before a silent reconnect is attempted.
+    # Prevents infinite reconnect loops when a stream ends naturally after a few chunks.
+    # At 32KB chunks and typical IPTV bitrates, a 10s+ connection delivers 300-2000 chunks.
+    LIVE_SILENT_RECONNECT_MIN_CHUNKS: int = 10
+
     # Bitrate Quality Monitoring - detect slow/degraded streams and trigger failover
     # Enable bitrate monitoring for automatic failover on degraded streams
     ENABLE_BITRATE_MONITORING: bool = False

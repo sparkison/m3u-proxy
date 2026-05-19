@@ -1364,6 +1364,7 @@ class StreamManager:
             failover_count = 0
             silent_reconnect_count = 0
             skip_prebuffer = False
+            chunk_count_at_last_reconnect = 0
             # Use configured max or fall back to total available failovers (0 = unlimited)
             configured_max = settings.MAX_FAILOVER_ATTEMPTS
             if configured_max > 0:
@@ -2222,23 +2223,38 @@ class StreamManager:
                                 # Providers that close connections periodically (e.g. every 10-15s)
                                 # require this to keep the client (e.g. Channels DVR) connected
                                 # without a full disconnect/reconnect cycle on their end.
-                                silent_reconnect_count += 1
-                                logger.info(
-                                    f"Live stream closed by provider for client {client_id} "
-                                    f"({chunk_count} chunks, {bytes_served} bytes) — "
-                                    f"reconnecting to same URL (silent reconnect #{silent_reconnect_count})"
-                                )
-                                if stream_context is not None:
-                                    try:
-                                        await stream_context.__aexit__(None, None, None)
-                                    except Exception:
-                                        pass
-                                stream_context = None
-                                response = None
-                                # Skip pre-buffer on reconnect to avoid replaying the provider's
-                                # rolling live buffer and causing a jump-back on the client.
-                                skip_prebuffer = True
-                                continue  # Reconnect to same URL, client stays connected
+                                # Guard: only reconnect if enough chunks were delivered since the
+                                # last reconnect. A stream that closes after 1-2 chunks has ended
+                                # naturally; a live stream closing after thousands of chunks is a
+                                # periodic provider keep-alive pattern.
+                                chunks_this_connection = chunk_count - chunk_count_at_last_reconnect
+                                min_chunks = settings.LIVE_SILENT_RECONNECT_MIN_CHUNKS
+                                if chunks_this_connection < min_chunks:
+                                    logger.info(
+                                        f"Live stream ended after {chunks_this_connection} chunks "
+                                        f"(min {min_chunks} required for silent reconnect), "
+                                        f"treating as natural completion for client {client_id}"
+                                    )
+                                else:
+                                    silent_reconnect_count += 1
+                                    logger.info(
+                                        f"Live stream closed by provider for client {client_id} "
+                                        f"({chunks_this_connection} chunks this connection, "
+                                        f"{bytes_served} bytes total) — "
+                                        f"reconnecting to same URL (silent reconnect #{silent_reconnect_count})"
+                                    )
+                                    if stream_context is not None:
+                                        try:
+                                            await stream_context.__aexit__(None, None, None)
+                                        except Exception:
+                                            pass
+                                    stream_context = None
+                                    response = None
+                                    # Skip pre-buffer on reconnect to avoid replaying the provider's
+                                    # rolling live buffer and causing a jump-back on the client.
+                                    skip_prebuffer = True
+                                    chunk_count_at_last_reconnect = chunk_count
+                                    continue  # Reconnect to same URL, client stays connected
 
                         # Stream completed normally (VOD, or live with failover exhausted)
                         if not stream_info.failover_event.is_set():

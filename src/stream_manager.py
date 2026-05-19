@@ -1362,6 +1362,8 @@ class StreamManager:
             last_stats_update = 0  # Track bytes at last stats update
             vod_reconnects = 0
             failover_count = 0
+            silent_reconnect_count = 0
+            skip_prebuffer = False
             # Use configured max or fall back to total available failovers (0 = unlimited)
             configured_max = settings.MAX_FAILOVER_ATTEMPTS
             if configured_max > 0:
@@ -1554,11 +1556,16 @@ class StreamManager:
                         last_chunk_time = asyncio.get_event_loop().time()
 
                         # Pre-buffering for Strict Live TS Mode
+                        # Skip pre-buffer on silent reconnects to avoid replaying upstream
+                        # rolling-buffer data that was already sent to the client.
                         target_prebuffer = (
                             settings.STRICT_LIVE_TS_PREBUFFER_SIZE
-                            if strict_mode_enabled and stream_info.is_live_continuous
+                            if strict_mode_enabled
+                            and stream_info.is_live_continuous
+                            and not skip_prebuffer
                             else 0
                         )
+                        skip_prebuffer = False
 
                         if target_prebuffer > 0:
                             logger.info(
@@ -2210,8 +2217,30 @@ class StreamManager:
                                 response = None
                                 failover_count += 1
                                 continue  # Retry with failover URL
+                            else:
+                                # No failover configured — silently reconnect to the same URL.
+                                # Providers that close connections periodically (e.g. every 10-15s)
+                                # require this to keep the client (e.g. Channels DVR) connected
+                                # without a full disconnect/reconnect cycle on their end.
+                                silent_reconnect_count += 1
+                                logger.info(
+                                    f"Live stream closed by provider for client {client_id} "
+                                    f"({chunk_count} chunks, {bytes_served} bytes) — "
+                                    f"reconnecting to same URL (silent reconnect #{silent_reconnect_count})"
+                                )
+                                if stream_context is not None:
+                                    try:
+                                        await stream_context.__aexit__(None, None, None)
+                                    except Exception:
+                                        pass
+                                stream_context = None
+                                response = None
+                                # Skip pre-buffer on reconnect to avoid replaying the provider's
+                                # rolling live buffer and causing a jump-back on the client.
+                                skip_prebuffer = True
+                                continue  # Reconnect to same URL, client stays connected
 
-                        # Stream completed normally (VOD, or live with no failover available)
+                        # Stream completed normally (VOD, or live with failover exhausted)
                         if not stream_info.failover_event.is_set():
                             logger.info(
                                 f"Stream completed for client {client_id}: {chunk_count} chunks, {bytes_served} bytes"

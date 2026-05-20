@@ -2227,7 +2227,9 @@ class StreamManager:
                                 # last reconnect. A stream that closes after 1-2 chunks has ended
                                 # naturally; a live stream closing after thousands of chunks is a
                                 # periodic provider keep-alive pattern.
-                                chunks_this_connection = chunk_count - chunk_count_at_last_reconnect
+                                chunks_this_connection = (
+                                    chunk_count - chunk_count_at_last_reconnect
+                                )
                                 min_chunks = settings.LIVE_SILENT_RECONNECT_MIN_CHUNKS
                                 if chunks_this_connection < min_chunks:
                                     logger.info(
@@ -2245,7 +2247,9 @@ class StreamManager:
                                     )
                                     if stream_context is not None:
                                         try:
-                                            await stream_context.__aexit__(None, None, None)
+                                            await stream_context.__aexit__(
+                                                None, None, None
+                                            )
                                         except Exception:
                                             pass
                                     stream_context = None
@@ -2475,8 +2479,43 @@ class StreamManager:
                                 response = None
 
                                 continue  # Reconnect outer loop with Range bytes=resume_from_byte-
+                            elif stream_info.is_live_continuous:
+                                # Upstream dropped the connection mid-stream (TCP RST or abrupt close).
+                                # Some providers periodically reset connections (e.g. every 10-15s).
+                                # Treat as an upstream drop, not a client disconnect: silently reconnect
+                                # if enough chunks were delivered so the client stays connected.
+                                chunks_this_connection = (
+                                    chunk_count - chunk_count_at_last_reconnect
+                                )
+                                min_chunks = settings.LIVE_SILENT_RECONNECT_MIN_CHUNKS
+                                if chunks_this_connection >= min_chunks:
+                                    silent_reconnect_count += 1
+                                    logger.info(
+                                        f"Upstream ReadError mid-stream for client {client_id} "
+                                        f"({chunks_this_connection} chunks, {bytes_served} bytes) — "
+                                        f"silently reconnecting (#{silent_reconnect_count})"
+                                    )
+                                    if stream_context is not None:
+                                        try:
+                                            await stream_context.__aexit__(
+                                                None, None, None
+                                            )
+                                        except Exception:
+                                            pass
+                                    stream_context = None
+                                    response = None
+                                    skip_prebuffer = True
+                                    chunk_count_at_last_reconnect = chunk_count
+                                    continue  # Reconnect outer loop, client stays connected
+                                else:
+                                    # Too few chunks — likely a genuine stream end or bad upstream.
+                                    logger.info(
+                                        f"Upstream ReadError after only {chunks_this_connection} chunks "
+                                        f"(min {min_chunks}), treating as stream end for client {client_id}"
+                                    )
+                                    break
                             else:
-                                # Non-VOD or retries exhausted -> treat as client disconnect
+                                # Non-live ReadError mid-stream -> treat as client disconnect
                                 logger.info(
                                     f"Client {client_id} likely disconnected during streaming"
                                 )

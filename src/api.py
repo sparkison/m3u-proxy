@@ -527,7 +527,10 @@ async def custom_swagger_ui_html():
 @app.get("/static/{filename:path}", include_in_schema=False)
 async def serve_static_file(filename: str):
     """Serve static files like logo and favicon"""
-    file_path = os.path.join(static_path, filename)
+    static_root = os.path.realpath(static_path)
+    file_path = os.path.realpath(os.path.join(static_path, filename))
+    if not file_path.startswith(static_root + os.sep):
+        raise HTTPException(status_code=403, detail="Access denied")
     if os.path.exists(file_path) and os.path.isfile(file_path):
         # Determine media type based on extension
         if filename.endswith(".svg"):
@@ -2326,7 +2329,7 @@ async def validate_cookies_file(
         return {"valid": True, "message": "File exists and is readable."}
     except Exception as e:
         logger.warning(f"cookies file validation error for path {path!r}: {e}")
-        return {"valid": False, "message": f"Unexpected error: {e}"}
+        return {"valid": False, "message": "Unexpected error validating path"}
 
 
 class YtDlpMetadataRequest(BaseModel):
@@ -2539,8 +2542,7 @@ async def test_url_connectivity(request: TestConnectionRequest):
         logger.error(f"Error testing URL {test_url}: {e}")
         return {
             "success": False,
-            "message": f"Error testing connection: {str(e)}",
-            "error": str(e),
+            "message": "An unexpected error occurred while testing the connection",
             "url_tested": test_url,
         }
 

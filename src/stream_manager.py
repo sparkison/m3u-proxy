@@ -4466,6 +4466,21 @@ class StreamManager:
             if (
                 current_time - client_info.last_access
             ).total_seconds() > self.client_timeout:
+                # Never forcibly evict a client whose streaming generator is
+                # still running — the generator has its own LIVE_CHUNK_TIMEOUT
+                # that handles upstream stalls. Killing an active connection
+                # here (before the chunk timeout fires) causes spurious
+                # disconnects and reconnect storms when the provider is briefly
+                # slow but not dead.
+                conn_id = client_info.active_connection_id
+                if conn_id and conn_id in self.connection_cancel_events:
+                    cancel = self.connection_cancel_events[conn_id]
+                    if not cancel.is_set():
+                        logger.debug(
+                            f"Skipping inactive cleanup for client {client_id}: "
+                            f"active streaming connection {conn_id} still live"
+                        )
+                        continue
                 inactive_clients.append(client_id)
 
         for client_id in inactive_clients:

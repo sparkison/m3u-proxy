@@ -1436,24 +1436,51 @@ async def get_direct_stream(
             client_id = f"client_{client_hash}"
 
             # Collision check: if this client_id already has an active
-            # connection on the same stream, this is a different device.
+            # connection on the same stream, decide whether to reuse or fork.
+            #
+            # A zombie connection (client dropped behind a reverse proxy where
+            # http.disconnect never arrives) has a non-set cancel event but
+            # stale last_data_time — it looks "active" but is dead.  Forking a
+            # unique suffix for a zombie causes client IDs to accumulate and
+            # holds a provider connection slot open indefinitely.
+            #
+            # Strategy:
+            #   - data stale > chunk_timeout → zombie; evict old, reuse ID
+            #   - data fresh                → genuinely concurrent device; fork
+            existing = stream_manager.clients.get(client_id)
             if (
-                client_id in stream_manager.clients
-                and stream_manager.clients[client_id].stream_id == stream_id
-                and stream_manager.clients[client_id].active_connection_id
-                and stream_manager.clients[client_id].active_connection_id
+                existing is not None
+                and existing.stream_id == stream_id
+                and existing.active_connection_id
+                and existing.active_connection_id
                 in stream_manager.connection_cancel_events
                 and not stream_manager.connection_cancel_events[
-                    stream_manager.clients[client_id].active_connection_id
+                    existing.active_connection_id
                 ].is_set()
             ):
-                # Active connection exists — make this client unique
-                unique_suffix = uuid.uuid4().hex[:8]
-                client_id = f"client_{client_hash}_{unique_suffix}"
-                logger.info(
-                    f"Client ID collision detected for stream {stream_id}, "
-                    f"assigning unique ID: {client_id}"
-                )
+                chunk_timeout = getattr(settings, "LIVE_CHUNK_TIMEOUT_SECONDS", 15.0)
+                data_elapsed = (
+                    datetime.now(timezone.utc) - existing.last_data_time
+                ).total_seconds()
+                if data_elapsed > chunk_timeout:
+                    # Zombie connection — evict it so this new request cleanly
+                    # takes over the same client record.
+                    logger.info(
+                        f"Evicting zombie connection for client {client_id} "
+                        f"(no data for {data_elapsed:.1f}s, chunk_timeout={chunk_timeout}s) "
+                        f"on stream {stream_id}"
+                    )
+                    await stream_manager.cleanup_client(client_id)
+                else:
+                    # Genuinely active — a different device is likely sharing
+                    # the same IP/UA hash.  Fork to a unique ID so the two
+                    # connections stay independent.
+                    unique_suffix = uuid.uuid4().hex[:8]
+                    client_id = f"client_{client_hash}_{unique_suffix}"
+                    logger.info(
+                        f"Client ID collision detected for stream {stream_id}, "
+                        f"assigning unique ID: {client_id}"
+                    )
 
         # Only register client if not already registered for this stream
         if (

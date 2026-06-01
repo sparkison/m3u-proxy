@@ -4461,27 +4461,33 @@ class StreamManager:
         """Clean up clients that haven't been accessed recently"""
         current_time = datetime.now(timezone.utc)
         inactive_clients = []
+        chunk_timeout = getattr(settings, "LIVE_CHUNK_TIMEOUT_SECONDS", 15.0)
 
         for client_id, client_info in self.clients.items():
             if (
                 current_time - client_info.last_access
-            ).total_seconds() > self.client_timeout:
-                # Never forcibly evict a client whose streaming generator is
-                # still running — the generator has its own LIVE_CHUNK_TIMEOUT
-                # that handles upstream stalls. Killing an active connection
-                # here (before the chunk timeout fires) causes spurious
-                # disconnects and reconnect storms when the provider is briefly
-                # slow but not dead.
-                conn_id = client_info.active_connection_id
-                if conn_id and conn_id in self.connection_cancel_events:
-                    cancel = self.connection_cancel_events[conn_id]
-                    if not cancel.is_set():
-                        logger.debug(
-                            f"Skipping inactive cleanup for client {client_id}: "
-                            f"active streaming connection {conn_id} still live"
-                        )
-                        continue
-                inactive_clients.append(client_id)
+            ).total_seconds() <= self.client_timeout:
+                continue
+
+            # Client has exceeded the inactive threshold. Before evicting,
+            # check last_data_time (updated on every chunk, unlike last_access
+            # which is every 10 chunks). If data flowed more recently than the
+            # chunk timeout, the generator is mid-stall and its own chunk
+            # timeout will fire shortly — don't race it. If data is older than
+            # the chunk timeout, either the chunk timeout already fired and
+            # cleaned up, or the generator is genuinely stuck (e.g. client
+            # dropped behind a reverse proxy and ASGI disconnect never arrived).
+            # In both cases it's safe to evict here.
+            data_elapsed = (current_time - client_info.last_data_time).total_seconds()
+            if data_elapsed < chunk_timeout:
+                logger.debug(
+                    f"Skipping inactive cleanup for client {client_id}: "
+                    f"data flowed {data_elapsed:.1f}s ago (chunk_timeout={chunk_timeout}s), "
+                    f"letting chunk timeout handle it"
+                )
+                continue
+
+            inactive_clients.append(client_id)
 
         for client_id in inactive_clients:
             await self.cleanup_client(client_id)

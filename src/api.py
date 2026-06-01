@@ -1501,9 +1501,16 @@ async def get_direct_stream(
 
             # For transcoded streams outputting to pipe:1 or other non-HLS formats,
             # use streamed transcoding path
-            return await stream_manager.stream_transcoded(
+            response = await stream_manager.stream_transcoded(
                 stream_id, client_id, range_header=range_header
             )
+
+            # Start ASGI disconnect monitor so the generator exits promptly
+            # when the client disconnects.  GeneratorExit is not reliably
+            # delivered with uvloop, so we poll the ASGI receive channel.
+            _start_disconnect_monitor(request, client_id, stream_manager)
+
+            return response
         else:
             # Use direct proxy for continuous streams
             # This provides true byte-for-byte proxying with per-client connections

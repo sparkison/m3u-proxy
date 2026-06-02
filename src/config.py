@@ -62,6 +62,10 @@ class Settings(BaseSettings):
     CONNECTION_IDLE_ERROR_THRESHOLD: int = 1800
     # Enable connection idle monitoring (can be disabled for high-throughput scenarios)
     ENABLE_CONNECTION_IDLE_MONITORING: bool = True
+    # Set to True to disable the ASGI http.disconnect monitor and rely solely
+    # on the periodic cleanup / chunk-timeout paths. Useful for testing the
+    # timeout-based disconnect handling without needing a reverse proxy.
+    DISABLE_ASGI_DISCONNECT_MONITOR: bool = False
 
     # Additional configuration from .env file
     DEFAULT_RETRY_ATTEMPTS: int = 3

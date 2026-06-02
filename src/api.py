@@ -1359,7 +1359,14 @@ def _start_disconnect_monitor(
     generator to reach post-loop cleanup because Starlette stops iterating
     the generator once the client is gone — the generator stays suspended at
     ``yield`` and only its ``finally`` blocks run during GC.
+
+    Set DISABLE_ASGI_DISCONNECT_MONITOR=true to skip this and rely solely on
+    the periodic cleanup / chunk-timeout paths (useful for testing that path
+    without a real reverse proxy in front).
     """
+    if settings.DISABLE_ASGI_DISCONNECT_MONITOR:
+        return
+
     client_info = sm.clients.get(client_id)
     if not client_info or not client_info.active_connection_id:
         return

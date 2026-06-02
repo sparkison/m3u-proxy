@@ -3085,8 +3085,17 @@ class StreamManager:
                 max_failovers = 3  # No failovers configured, keep original default
             is_failover = False  # Track if we broke due to failover
 
-            # Main loop with automatic reconnection on failover
-            while failover_count <= max_failovers:
+            # Wrap everything in try/finally so cleanup_client is guaranteed to
+            # run regardless of how the generator exits:
+            #   - return (cancel_event, end-of-stream, early FFmpeg errors)
+            #   - GeneratorExit  (Starlette calls aclose() after client disconnect)
+            #   - CancelledError (asyncio task cancellation)
+            # Without this, every `return` inside the while loop bypasses the
+            # sequential cleanup code at the bottom of the function, leaving
+            # the client registered as active indefinitely.
+            try:
+              # Main loop with automatic reconnection on failover
+              while failover_count <= max_failovers:
                 try:
                     # Get current URL (may have changed due to failover)
                     active_url = stream_info.current_url or stream_info.original_url
@@ -3464,19 +3473,20 @@ class StreamManager:
                     # Don't retry on unexpected exceptions
                     break
 
-            # Final cleanup after all retries exhausted or normal completion
-            # Clean up: remove client from the shared stream
-            if client_id and stream_key and self.pooled_manager:
-                try:
-                    await self.pooled_manager.remove_client_from_stream(client_id)
-                except Exception:
-                    pass
-
-            # Final client cleanup - pass connection_id to prevent race conditions
-            await self.cleanup_client(client_id, connection_id)
-            logger.info(
-                f"Finished pooled stream for client {client_id}, served {bytes_served} bytes"
-            )
+            finally:
+                # Guaranteed cleanup for ALL exit paths:
+                #   - return (cancel_event, end-of-stream, FFmpeg errors)
+                #   - GeneratorExit (Starlette aclose() after client disconnect)
+                #   - CancelledError (asyncio task cancellation)
+                if client_id and stream_key and self.pooled_manager:
+                    try:
+                        await self.pooled_manager.remove_client_from_stream(client_id)
+                    except Exception:
+                        pass
+                await self.cleanup_client(client_id, connection_id)
+                logger.info(
+                    f"Finished pooled stream for client {client_id}, served {bytes_served} bytes"
+                )
 
         headers = {
             "Content-Type": None,

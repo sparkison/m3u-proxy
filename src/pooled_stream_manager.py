@@ -788,8 +788,13 @@ class SharedTranscodingProcess:
                     f"Client {client_id} left shared stream {self.stream_id} ({len(self.clients)} remaining)"
                 )
 
-            # Remove client's queue
+            # Remove client's queue, sending None sentinel first so the
+            # streaming generator exits its wait loop promptly.
             if client_id in self.client_queues:
+                try:
+                    self.client_queues[client_id].put_nowait(None)
+                except Exception:
+                    pass
                 del self.client_queues[client_id]
 
     async def prune_stale_clients(self, timeout: int):

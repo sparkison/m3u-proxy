@@ -60,7 +60,7 @@ while IFS=$'\t' read -r subject hash; do
     fix)         FIXES+=("$entry") ;;
     perf)        PERF+=("$entry") ;;
     docs)        DOCS+=("$entry") ;;
-    chore|ci|build|style) ;; # silently skip noise
+    ci|build|style) ;; # silently skip noise
     *)           OTHER+=("$entry") ;;
   esac
 done <<< "$COMMITS"

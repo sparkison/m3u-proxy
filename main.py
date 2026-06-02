@@ -18,6 +18,55 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
 from redis_config import get_redis_config, should_use_pooling
 from config import settings, VERSION
 
+def _build_uvicorn_log_config(log_level: str, anonymize: bool) -> dict:
+    """Return a dictConfig-compatible logging config for uvicorn.
+
+    When anonymize=True the AnonymizingFilter is added to both the default
+    and access handlers so access-log request lines are also scrubbed.
+    """
+    config: dict = {
+        "version": 1,
+        "disable_existing_loggers": False,
+        "formatters": {
+            "default": {
+                "()": "uvicorn.logging.DefaultFormatter",
+                "fmt": "%(levelprefix)s %(message)s",
+                "use_colors": None,
+            },
+            "access": {
+                "()": "uvicorn.logging.AccessFormatter",
+                "fmt": '%(levelprefix)s %(client_addr)s - "%(request_line)s" %(status_code)s',
+            },
+        },
+        "handlers": {
+            "default": {
+                "formatter": "default",
+                "class": "logging.StreamHandler",
+                "stream": "ext://sys.stderr",
+            },
+            "access": {
+                "formatter": "access",
+                "class": "logging.StreamHandler",
+                "stream": "ext://sys.stdout",
+            },
+        },
+        "loggers": {
+            "uvicorn": {"handlers": ["default"], "level": log_level.upper(), "propagate": False},
+            "uvicorn.error": {"level": log_level.upper()},
+            "uvicorn.access": {"handlers": ["access"], "level": log_level.upper(), "propagate": False},
+        },
+    }
+
+    if anonymize:
+        config["filters"] = {
+            "anonymizing": {"()": "log_anonymizer.AnonymizingFilter"},
+        }
+        for handler in config["handlers"].values():
+            handler["filters"] = ["anonymizing"]
+
+    return config
+
+
 def main():
     """Main function to start the m3u-proxy server."""
 
@@ -48,6 +97,12 @@ def main():
     file_handler.setLevel(settings.LOG_LEVEL.upper())
     file_handler.setFormatter(logging.Formatter(log_format))
     logging.getLogger().addHandler(file_handler)
+
+    if settings.LOG_ANONYMIZE:
+        from log_anonymizer import AnonymizingFilter
+        anon_filter = AnonymizingFilter()
+        for handler in logging.getLogger().handlers:
+            handler.addFilter(anon_filter)
 
     logger = logging.getLogger(__name__)
     logger.info("="*60)
@@ -113,6 +168,7 @@ def main():
         port=settings.PORT,
         reload=settings.RELOAD,
         log_level=settings.LOG_LEVEL.lower(),
+        log_config=_build_uvicorn_log_config(settings.LOG_LEVEL, settings.LOG_ANONYMIZE),
         loop="uvloop" if use_uvloop and not settings.RELOAD else "asyncio"
     )
 

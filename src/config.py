@@ -18,6 +18,7 @@ class Settings(BaseSettings):
     # work automatically with any reverse proxy setup.
     # PUBLIC_URL: Optional[str] = None
     LOG_LEVEL: str = "error"
+    LOG_ANONYMIZE: bool = True
     APP_DEBUG: bool = False
     RELOAD: bool = False
     DOCS_URL: str = "/docs"

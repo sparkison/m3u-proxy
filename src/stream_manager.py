@@ -1443,6 +1443,13 @@ class StreamManager:
                         )
                         break
 
+                    # Clear any stale failover_event from a previous iteration so it
+                    # can't be mistaken for a new signal on this connection attempt.
+                    # Generators that detect the event clear it themselves; this is
+                    # only a safety net for the cases where they don't (e.g. the
+                    # client disconnected before the next chunk arrived).
+                    stream_info.failover_event.clear()
+
                     try:
                         # Get current URL (may have changed due to failover)
                         active_url = stream_info.current_url or stream_info.original_url
@@ -3109,6 +3116,8 @@ class StreamManager:
             try:
                 # Main loop with automatic reconnection on failover
                 while failover_count <= max_failovers:
+                    # Clear any stale failover_event from a previous iteration.
+                    stream_info.failover_event.clear()
                     try:
                         # Get current URL (may have changed due to failover)
                         active_url = stream_info.current_url or stream_info.original_url
@@ -4481,11 +4490,9 @@ class StreamManager:
             },
         )
 
-        # Reset the event for next failover.
-        # 2s window so busy event loops (many webhook tasks) don't clear the event
-        # before all active generators have had a chance to detect it.
-        await asyncio.sleep(2.0)
-        stream_info.failover_event.clear()
+        # Generators clear failover_event themselves on detection (direct: line ~1850,
+        # transcoded: queue-None handler). No sleep needed here — removing the timer
+        # avoids blocking the API response and eliminates the stale-event window.
 
         return True
 

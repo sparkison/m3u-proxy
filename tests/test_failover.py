@@ -704,14 +704,27 @@ class TestManualFailoverRegression:
         )
         stream_info = stream_manager.streams[stream_id]
 
-        # Simulate _try_update_failover_url having already run externally:
-        # current_url points to the failover URL and the event is set.
-        stream_info.current_url = failover_url
-        stream_info.failover_event.set()
+        # Queue 1 (original stream): starts empty — None is injected externally once
+        # the generator is already reading from it, mimicking _try_update_failover_url
+        # killing FFmpeg mid-stream.  We use an instrumented queue so the test can
+        # coordinate precisely: set failover_event and inject None only AFTER the
+        # generator has started its q1.get() call (i.e. after the outer loop's
+        # failover_event.clear() has already run).
+        class _SignallingQueue:
+            """Wraps asyncio.Queue, setting an asyncio.Event on the first get() call."""
 
-        # Queue 1 (original stream): receives None immediately — FFmpeg was killed.
-        q1 = asyncio.Queue()
-        await q1.put(None)
+            def __init__(self):
+                self._q = asyncio.Queue()
+                self.first_get = asyncio.Event()
+
+            async def get(self):
+                self.first_get.set()
+                return await self._q.get()
+
+            def empty(self):
+                return self._q.empty()
+
+        q1 = _SignallingQueue()
 
         # Queue 2 (failover stream): delivers one real chunk then ends naturally.
         q2 = asyncio.Queue()
@@ -741,10 +754,26 @@ class TestManualFailoverRegression:
         # Skip the 2-second FFmpeg startup polling loop for test speed.
         monkeypatch.setattr(asyncio, "sleep", AsyncMock(return_value=None))
 
-        response = await stream_manager.stream_transcoded(stream_id, client_id)
         chunks = []
-        async for chunk in response.body_iterator:
-            chunks.append(chunk)
+
+        async def consume():
+            resp = await stream_manager.stream_transcoded(stream_id, client_id)
+            async for chunk in resp.body_iterator:
+                chunks.append(chunk)
+
+        consume_task = asyncio.create_task(consume())
+
+        # Wait until the generator has started its first q1.get() — the outer loop's
+        # failover_event.clear() has already executed by this point, so setting the
+        # event here won't be wiped by that safety clear.
+        await q1.first_get.wait()
+
+        # Simulate _try_update_failover_url: update URL, fire event, kill FFmpeg.
+        stream_info.current_url = failover_url
+        stream_info.failover_event.set()
+        await q1._q.put(None)
+
+        await consume_task
 
         assert b"failover_data" in chunks, (
             "Generator should have served data from the failover stream"

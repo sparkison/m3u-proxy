@@ -663,5 +663,197 @@ class TestFailoverIntegration:
         assert stream_info.current_url == failover_url
 
 
+class TestManualFailoverRegression:
+    """Regression tests for manual failover triggered from the Stream Monitor.
+
+    Covers the two bugs from issue #1180:
+    1. Transcoded streams: FFmpeg is killed (queuing None) before the generator can check
+       failover_event in the normal place, so the generator disconnected the client instead
+       of reconnecting to the failover URL.
+    2. Direct (live TS) streams, resolver mode: after the inner loop broke due to
+       failover_event, the post-inner-loop code called _try_update_failover_url a second
+       time, double-advancing to URL #3 instead of reconnecting to the intended URL #2.
+    """
+
+    @pytest_asyncio.fixture
+    async def stream_manager(self):
+        manager = StreamManager()
+        manager.pooled_manager = Mock(spec=PooledStreamManager)
+        yield manager
+        if hasattr(manager, "_running"):
+            manager._running = False
+
+    @pytest.mark.asyncio
+    async def test_transcoded_failover_stays_connected_on_queue_none(
+        self, stream_manager, monkeypatch
+    ):
+        """Regression #1180 (transcoded path): when _try_update_failover_url kills the
+        FFmpeg process (sending None to the client queue) while failover_event is set,
+        the generator must stay connected and serve data from the failover stream rather
+        than disconnecting the client."""
+        primary_url = "http://primary.example.com/stream.m3u8"
+        failover_url = "http://backup.example.com/stream.m3u8"
+        client_id = "test_client"
+
+        stream_id = await stream_manager.get_or_create_stream(
+            primary_url,
+            failover_resolver_url="http://resolver.example.com/failover",
+            is_transcoded=True,
+            transcode_profile="custom",
+            transcode_ffmpeg_args=["-i", "{input_url}", "-f", "mpegts", "pipe:1"],
+        )
+        stream_info = stream_manager.streams[stream_id]
+
+        # Simulate _try_update_failover_url having already run externally:
+        # current_url points to the failover URL and the event is set.
+        stream_info.current_url = failover_url
+        stream_info.failover_event.set()
+
+        # Queue 1 (original stream): receives None immediately — FFmpeg was killed.
+        q1 = asyncio.Queue()
+        await q1.put(None)
+
+        # Queue 2 (failover stream): delivers one real chunk then ends naturally.
+        q2 = asyncio.Queue()
+        await q2.put(b"failover_data")
+        await q2.put(None)
+
+        def _make_process(queue):
+            p = Mock()
+            p.status = "running"
+            p.process = Mock()
+            p.process.pid = 1000
+            p.process.returncode = None
+            p.process.stdout = Mock()
+            p.client_queues = {client_id: queue}
+            return p
+
+        stream_manager.pooled_manager.get_or_create_shared_stream = AsyncMock(
+            side_effect=[
+                ("key1", _make_process(q1)),
+                ("key2", _make_process(q2)),
+            ]
+        )
+        stream_manager.pooled_manager.remove_client_from_stream = AsyncMock()
+        stream_manager.pooled_manager.force_stop_stream = AsyncMock()
+        stream_manager.pooled_manager.update_client_activity = Mock()
+
+        # Skip the 2-second FFmpeg startup polling loop for test speed.
+        monkeypatch.setattr(asyncio, "sleep", AsyncMock(return_value=None))
+
+        response = await stream_manager.stream_transcoded(stream_id, client_id)
+        chunks = []
+        async for chunk in response.body_iterator:
+            chunks.append(chunk)
+
+        assert b"failover_data" in chunks, (
+            "Generator should have served data from the failover stream"
+        )
+        assert (
+            stream_manager.pooled_manager.get_or_create_shared_stream.call_count == 2
+        ), (
+            "Generator must reconnect (call get_or_create_shared_stream twice) "
+            "rather than disconnecting the client"
+        )
+
+    @pytest.mark.asyncio
+    async def test_direct_stream_no_double_advance_after_failover_event(
+        self, stream_manager, monkeypatch
+    ):
+        """Regression #1180 (direct stream, resolver mode): after the inner loop breaks
+        due to failover_event, the generator must reconnect to the already-set failover URL
+        without calling _try_update_failover_url again.  Calling it would double-advance
+        to URL #3 instead of URL #2 (the intended manual-failover target)."""
+        primary_url = "http://primary.example.com/stream.ts"
+        failover_url = "http://backup.example.com/stream.ts"
+
+        stream_id = await stream_manager.get_or_create_stream(
+            primary_url,
+            failover_resolver_url="http://resolver.example.com/failover",
+        )
+        stream_info = stream_manager.streams[stream_id]
+
+        # Simulate _try_update_failover_url having already run externally:
+        # current_url = failover URL, event is set, attempt counter updated.
+        stream_info.current_url = failover_url
+        stream_info.failover_event.set()
+        stream_info.failover_attempts = 1
+        stream_info.current_failover_index = 0
+
+        called_urls = []
+        call_number = [0]
+
+        async def _fake_stream(method, url, **kwargs):
+            called_urls.append(url)
+            call_number[0] += 1
+
+            # On the second connection: disable resolver so the natural stream-end
+            # path exits cleanly (has_failover=False, chunks < min_chunks threshold).
+            if call_number[0] >= 2:
+                stream_info.failover_resolver_url = None
+                stream_info.failover_urls = []
+
+            class _Iter:
+                def __init__(self, chunks):
+                    self._chunks = list(chunks)
+                    self._idx = 0
+
+                def __aiter__(self):
+                    return self
+
+                async def __anext__(self):
+                    if self._idx >= len(self._chunks):
+                        raise StopAsyncIteration
+                    c = self._chunks[self._idx]
+                    self._idx += 1
+                    return c
+
+            class _Resp:
+                status_code = 200
+                headers = {"content-type": "video/mp2t"}
+
+                def raise_for_status(self):
+                    pass
+
+                def aiter_bytes(self, chunk_size=32768):
+                    # First connection: no chunks (inner loop detects failover_event immediately).
+                    # Second connection: one chunk (< LIVE_SILENT_RECONNECT_MIN_CHUNKS=10 → natural exit).
+                    data = [] if call_number[0] == 1 else [b"failover_data"]
+                    return _Iter(data)
+
+            class _CM:
+                async def __aenter__(self):
+                    return _Resp()
+
+                async def __aexit__(self, *args):
+                    return False
+
+            return _CM()
+
+        monkeypatch.setattr(stream_manager.live_stream_client, "stream", _fake_stream)
+
+        response = await stream_manager.stream_continuous_direct(
+            stream_id, "test_client"
+        )
+        chunks = []
+        async for chunk in response.body_iterator:
+            chunks.append(chunk)
+
+        assert len(called_urls) >= 2, (
+            f"Expected at least 2 upstream connections, got: {called_urls}"
+        )
+        assert called_urls[0] == failover_url, (
+            "First connection should be to the already-set failover URL"
+        )
+        assert called_urls[1] == failover_url, (
+            "Second connection must ALSO be the failover URL — "
+            "_try_update_failover_url must not be called again after the "
+            "failover_event break (that would double-advance to URL #3)"
+        )
+        assert b"failover_data" in chunks, (
+            "Generator should have served data from the second (failover) connection"
+        )
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

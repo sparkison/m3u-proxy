@@ -1365,6 +1365,9 @@ class StreamManager:
             silent_reconnect_count = 0
             skip_prebuffer = False
             chunk_count_at_last_reconnect = 0
+            broke_for_failover = (
+                False  # True when inner loop broke due to failover_event detection
+            )
             # Use configured max or fall back to total available failovers (0 = unlimited)
             configured_max = settings.MAX_FAILOVER_ATTEMPTS
             if configured_max > 0:
@@ -1652,6 +1655,7 @@ class StreamManager:
                         )
 
                         # Continue streaming from where pre-buffer left off (or from start if no pre-buffer)
+                        broke_for_failover = False
                         while True:
                             try:
                                 # Read next chunk with a per-chunk timeout to detect silent stalls
@@ -1870,6 +1874,7 @@ class StreamManager:
                                         pass
                                 stream_context = None
                                 response = None
+                                broke_for_failover = True
                                 failover_count += 1
                                 # Break inner loop to reconnect with new URL
                                 break
@@ -2181,6 +2186,14 @@ class StreamManager:
                                     stream_context = None
                                     response = None
                                     continue  # Retry with failover URL
+
+                        # If the inner loop broke because failover_event was detected, the
+                        # caller already set current_url to the intended failover URL. Just
+                        # continue the outer loop to reconnect — don't call
+                        # _try_update_failover_url again, which would double-advance to URL #3
+                        # instead of URL #2 (regression: issue #1180, resolver mode).
+                        if broke_for_failover:
+                            continue
 
                         # If we reach here, the upstream response iterator ended without error.
                         # For live continuous streams, this is unexpected — it likely means the
@@ -3402,6 +3415,29 @@ class StreamManager:
                                 continue
 
                             if chunk is None:  # None signals end of stream
+                                # The broadcaster sends None when FFmpeg stops. If _try_update_failover_url
+                                # triggered that stop (it kills FFmpeg before the generator can check
+                                # failover_event in the normal place), catch it here so the client
+                                # stays connected and reconnects to the new URL.
+                                if stream_info.failover_event.is_set():
+                                    stream_info.failover_event.clear()
+                                    logger.info(
+                                        f"Failover detected via queue None for transcoded stream {stream_id}, "
+                                        f"reconnecting client {client_id} to new URL: {stream_info.current_url}"
+                                    )
+                                    if client_id and stream_key and self.pooled_manager:
+                                        try:
+                                            await self.pooled_manager.remove_client_from_stream(
+                                                client_id
+                                            )
+                                        except Exception as e:
+                                            logger.warning(
+                                                f"Error removing client from old stream during queue-None failover: {e}"
+                                            )
+                                    stream_key = None
+                                    is_failover = True
+                                    failover_count += 1
+                                    break
                                 logger.info(
                                     f"Transcoded streaming ended for client {client_id}"
                                 )
@@ -4445,8 +4481,10 @@ class StreamManager:
             },
         )
 
-        # Reset the event for next failover
-        await asyncio.sleep(0.1)  # Give clients time to detect the event
+        # Reset the event for next failover.
+        # 2s window so busy event loops (many webhook tasks) don't clear the event
+        # before all active generators have had a chance to detect it.
+        await asyncio.sleep(2.0)
         stream_info.failover_event.clear()
 
         return True

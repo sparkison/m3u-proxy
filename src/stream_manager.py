@@ -923,6 +923,37 @@ class StreamManager:
     # DIRECT PROXY FOR CONTINUOUS STREAMS (New Architecture)
     # ============================================================================
 
+    @staticmethod
+    def _inject_ts_discontinuity(chunk: bytes) -> bytes:
+        """Set the discontinuity_indicator bit in every TS packet adaptation field found in chunk.
+
+        Called once on the first chunk after a silent reconnect so downstream players
+        (ChannelsDVR, VLC, etc.) know to reinitialise their decoders at the splice point.
+        Only touches packets that already carry an adaptation field with at least one flags
+        byte — no structural changes to packet layout are made.
+        """
+        PACKET_SIZE = 188
+        if len(chunk) < PACKET_SIZE:
+            return chunk
+
+        result = bytearray(chunk)
+        i = 0
+        # Sync to first valid 0x47 sync byte.
+        while i < len(result) - PACKET_SIZE and result[i] != 0x47:
+            i += 1
+
+        while i + PACKET_SIZE <= len(result):
+            if result[i] != 0x47:
+                i += 1
+                continue
+            afc = (result[i + 3] >> 4) & 0x3
+            # afc 2 = adaptation only, 3 = adaptation + payload; both have AF at byte i+4
+            if afc in (2, 3) and result[i + 4] >= 1:
+                result[i + 5] |= 0x80  # discontinuity_indicator
+            i += PACKET_SIZE
+
+        return bytes(result)
+
     def _broadcast_chunk_to_subscribers(self, stream_id: str, chunk: bytes) -> None:
         """Broadcast a chunk from the primary reader to all subscriber queues."""
         queues = self._direct_broadcast_queues.get(stream_id)
@@ -1364,6 +1395,7 @@ class StreamManager:
             failover_count = 0
             silent_reconnect_count = 0
             skip_prebuffer = False
+            mark_discontinuity = False
             chunk_count_at_last_reconnect = 0
             broke_for_failover = (
                 False  # True when inner loop broke due to failover_event detection
@@ -1886,6 +1918,9 @@ class StreamManager:
                                 # Break inner loop to reconnect with new URL
                                 break
 
+                            if mark_discontinuity:
+                                chunk = self._inject_ts_discontinuity(chunk)
+                                mark_discontinuity = False
                             yield chunk
                             self._broadcast_chunk_to_subscribers(stream_id, chunk)
                             bytes_served += len(chunk)
@@ -2277,6 +2312,7 @@ class StreamManager:
                                     # Skip pre-buffer on reconnect to avoid replaying the provider's
                                     # rolling live buffer and causing a jump-back on the client.
                                     skip_prebuffer = True
+                                    mark_discontinuity = True
                                     chunk_count_at_last_reconnect = chunk_count
                                     continue  # Reconnect to same URL, client stays connected
 
@@ -2525,6 +2561,7 @@ class StreamManager:
                                     stream_context = None
                                     response = None
                                     skip_prebuffer = True
+                                    mark_discontinuity = True
                                     chunk_count_at_last_reconnect = chunk_count
                                     continue  # Reconnect outer loop, client stays connected
                                 else:

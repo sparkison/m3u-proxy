@@ -10,9 +10,10 @@ _URL_RE = re.compile(
     r'(?:https?|rtmps?|ftps?|hls)://[^\s"\'<>\[\]{}\|\\^`]+',
     re.IGNORECASE,
 )
-# Matches key=value or key: value, stops before & ) space quote etc.
+# Matches key=value, key: value, key='value', key="value".
+# Group 1: keyword, group 2: optional quote, group 3: value, \2: matching close quote.
 _USER_RE = re.compile(
-    r'(?i)\b(username|user|login|ip)\s*[:=]\s*([^&\s"\'<>#,\)\]]+)',
+    r"""(?i)\b(username|user|login|ip|host|hostname|server)\s*[:=]\s*(['"']?)([^&\s"'<>#,\)\]]+)\2""",
 )
 # UUIDs are resource identifiers that can be used to probe APIs
 _UUID_RE = re.compile(
@@ -23,7 +24,7 @@ _UUID_RE = re.compile(
 
 def _scrub(text: str) -> str:
     text = _URL_RE.sub("****", text)
-    text = _USER_RE.sub(r"\1=****", text)
+    text = _USER_RE.sub(r"\1=\2****\2", text)
     text = _UUID_RE.sub("****", text)
     return text
 

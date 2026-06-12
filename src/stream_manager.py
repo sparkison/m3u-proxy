@@ -1482,6 +1482,15 @@ class StreamManager:
                     # client disconnected before the next chunk arrived).
                     stream_info.failover_event.clear()
 
+                    # Any upstream switch — failover or silent reconnect — produces a splice
+                    # point in the TS byte stream. Signal discontinuity so downstream decoders
+                    # (ChannelsDVR, VLC, etc.) reinitialise at the boundary rather than trying
+                    # to decode the new stream as a continuation of the old one.
+                    # silent reconnects set this flag themselves (before their continue), so
+                    # this only triggers for failovers (failover_count > 0).
+                    if failover_count > 0:
+                        mark_discontinuity = True
+
                     try:
                         # Get current URL (may have changed due to failover)
                         active_url = stream_info.current_url or stream_info.original_url

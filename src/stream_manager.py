@@ -1648,6 +1648,12 @@ class StreamManager:
                                         chunk = await stream_iterator.__anext__()
 
                                     # Yield immediately - no separate storage needed
+                                    # Inject discontinuity on the very first pre-buffer chunk
+                                    # after a failover so the player reinitialises decoders
+                                    # before it sees any post-splice data.
+                                    if mark_discontinuity:
+                                        chunk = self._inject_ts_discontinuity(chunk)
+                                        mark_discontinuity = False
                                     yield chunk
                                     self._broadcast_chunk_to_subscribers(
                                         stream_id, chunk

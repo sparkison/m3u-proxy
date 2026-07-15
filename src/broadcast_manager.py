@@ -52,6 +52,10 @@ class BroadcastConfig:
     # DVR mode: preserve all HLS segments (no rolling deletion) for post-processing
     dvr_mode: bool = False
     metadata: Optional[Dict] = None
+    # Preferred audio language (ISO 639 code) for FFmpeg -map 0:a:m:language:XX?
+    preferred_audio_language: Optional[str] = None
+    # Whether to expose embedded subtitle streams via -map 0:s?
+    subtitles_enabled: bool = False
 
 
 @dataclass
@@ -188,10 +192,18 @@ class NetworkBroadcastProcess:
         if self.config.duration_seconds > 0:
             cmd.extend(["-t", str(self.config.duration_seconds)])
 
-        # Stream mapping - video + audio only (drop subtitles, data streams)
-        # Both video and audio are optional to support audio-only streams (e.g. radio stations)
-        # and video-only streams. FFmpeg silently skips missing optional streams.
-        cmd.extend(["-map", "0:v:0?", "-map", "0:a:0?"])
+        # Stream mapping — video (always), audio (by language or first), subtitles (optional)
+        # Video and audio are optional (? suffix) to support audio-only and video-only streams.
+        cmd.extend(["-map", "0:v:0?"])
+
+        if self.config.preferred_audio_language:
+            lang = self.config.preferred_audio_language.strip()
+            cmd.extend(["-map", f"0:a:m:language:{lang}?"])
+        else:
+            cmd.extend(["-map", "0:a:0?"])
+
+        if self.config.subtitles_enabled:
+            cmd.extend(["-map", "0:s?"])
 
         # Codec selection
         if self.config.transcode:
@@ -220,6 +232,8 @@ class NetworkBroadcastProcess:
             cmd.extend(["-ac", "2"])  # Force stereo output
         else:
             cmd.extend(["-c:v", "copy", "-c:a", "copy"])
+            if self.config.subtitles_enabled:
+                cmd.extend(["-c:s", "copy"])
 
         # HLS output configuration
         cmd.extend(["-f", "hls"])

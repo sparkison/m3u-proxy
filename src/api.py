@@ -2711,6 +2711,12 @@ class BroadcastStartRequest(BaseModel):
     # DVR mode: preserve all HLS segments for post-processing concat
     dvr_mode: bool = False
     metadata: Optional[dict] = None
+    # Preferred audio language (ISO 639 code, e.g. "eng", "jpn") for FFmpeg
+    # to select via -map 0:a:m:language:XX?. When None, defaults to first audio.
+    preferred_audio_language: Optional[str] = None
+    # Whether the proxy should detect and expose embedded subtitle tracks.
+    # When True, FFmpeg maps 0:s? so subtitle streams reach the HLS output.
+    subtitles_enabled: bool = False
 
     @field_validator("stream_url")
     @classmethod
@@ -2794,6 +2800,8 @@ async def start_broadcast(
             headers=request.headers,
             dvr_mode=request.dvr_mode,
             metadata=request.metadata,
+            preferred_audio_language=request.preferred_audio_language,
+            subtitles_enabled=request.subtitles_enabled,
         )
         status = await broadcast_manager.start_broadcast(config)
         return BroadcastStatusResponse(

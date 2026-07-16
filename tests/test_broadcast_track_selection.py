@@ -55,6 +55,22 @@ def test_subtitle_map_when_enabled():
     assert "0:s?" in cmd
 
 
+def test_embedded_subtitle_maps_by_language_when_set():
+    """With subtitles_enabled + subtitle_language, the proxy maps 0:s:m:language:XX?
+    instead of the generic 0:s? — this lets a per-item override pick a specific
+    embedded subtitle track out of several rather than always getting the first."""
+    cmd = _build_cmd(subtitles_enabled=True, subtitle_language="jpn")
+    assert "0:s:m:language:jpn?" in cmd
+    assert "0:s?" not in cmd
+
+
+def test_embedded_subtitle_falls_back_to_generic_map_without_language():
+    """Without subtitle_language, embedded subtitles still map via the generic
+    0:s? (any subtitle) — unchanged behavior for callers that don't know the language."""
+    cmd = _build_cmd(subtitles_enabled=True, subtitle_language=None)
+    assert "0:s?" in cmd
+
+
 def test_subtitle_codec_copy_when_enabled_and_not_transcoding():
     """When not transcoding, subtitles_enabled adds -c:s copy for passthrough."""
     cmd = _build_cmd(subtitles_enabled=True, transcode=False)

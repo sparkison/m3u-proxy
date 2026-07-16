@@ -227,10 +227,17 @@ class NetworkBroadcastProcess:
 
         # Subtitle mapping: external sidecar (input 1:s) takes precedence over
         # embedded (0:s?) so we don't duplicate subtitle tracks when both exist.
+        # Embedded subtitles are language-aware (mirroring the audio mapping above)
+        # when subtitle_language is set, so a per-item override can pick a specific
+        # embedded track out of several rather than always getting the first one.
         if has_external_subtitle:
             cmd.extend(["-map", "1:s:0?"])
         elif self.config.subtitles_enabled:
-            cmd.extend(["-map", "0:s?"])
+            sub_lang = getattr(self.config, "subtitle_language", None)
+            if sub_lang and sub_lang.strip():
+                cmd.extend(["-map", f"0:s:m:language:{sub_lang.strip()}?"])
+            else:
+                cmd.extend(["-map", "0:s?"])
 
         # Codec selection
         if self.config.transcode:

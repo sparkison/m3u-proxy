@@ -52,7 +52,11 @@ class BroadcastConfig:
     # DVR mode: preserve all HLS segments (no rolling deletion) for post-processing
     dvr_mode: bool = False
     metadata: Optional[Dict] = None
-    # Preferred audio language (ISO 639 code) for FFmpeg -map 0:a:m:language:XX
+    # Preferred audio track: an ISO 639 code (network-level default; FFmpeg
+    # -map 0:a:m:language:XX) or a numeric type-relative stream position from a
+    # per-item override (FFmpeg -map 0:a:N? — see NetworkBroadcastService's
+    # resolveTrackPreference on the editor side for the composite value this is
+    # resolved from).
     preferred_audio_language: Optional[str] = None
     # Whether to expose embedded subtitle streams via -map 0:s?
     subtitles_enabled: bool = False
@@ -220,16 +224,24 @@ class NetworkBroadcastProcess:
         cmd.extend(["-map", "0:v:0?"])
 
         if self.config.preferred_audio_language:
-            # NOTE: no trailing '?' here. FFmpeg's metadata-based stream specifier
-            # (`m:key:value`) does not support the optional-map suffix at all — it
-            # fails "Invalid argument" whether or not a stream actually matches, not
-            # just when the match is empty (confirmed against a real FFmpeg build).
-            # Appending '?' to `0:a:0` (a plain index specifier) is fine; appending it
-            # to `0:a:m:language:XX` is not. Without it, this succeeds immediately
-            # when the language matches, and fails cleanly (caught and retried by
-            # _retry_without_broken_language_maps()) only when it genuinely doesn't.
             lang = self.config.preferred_audio_language.strip()
-            cmd.extend(["-map", f"0:a:m:language:{lang}"])
+            if lang.isdigit():
+                # A per-item override (see NetworkBroadcastService::resolveTrackPreference
+                # on the editor side) resolves to the exact type-relative stream position
+                # (e.g. "1" = the 2nd audio stream) rather than a language — precise, and
+                # a plain index specifier degrades gracefully via '?' if the position no
+                # longer exists, unlike the metadata form below.
+                cmd.extend(["-map", f"0:a:{lang}?"])
+            else:
+                # NOTE: no trailing '?' here. FFmpeg's metadata-based stream specifier
+                # (`m:key:value`) does not support the optional-map suffix at all — it
+                # fails "Invalid argument" whether or not a stream actually matches, not
+                # just when the match is empty (confirmed against a real FFmpeg build).
+                # Appending '?' to `0:a:0` (a plain index specifier) is fine; appending it
+                # to `0:a:m:language:XX` is not. Without it, this succeeds immediately
+                # when the language matches, and fails cleanly (caught and retried by
+                # _retry_without_broken_language_maps()) only when it genuinely doesn't.
+                cmd.extend(["-map", f"0:a:m:language:{lang}"])
         else:
             cmd.extend(["-map", "0:a:0?"])
 
@@ -243,8 +255,15 @@ class NetworkBroadcastProcess:
         elif self.config.subtitles_enabled:
             sub_lang = getattr(self.config, "subtitle_language", None)
             if sub_lang and sub_lang.strip():
-                # No trailing '?' — see the audio map above for why.
-                cmd.extend(["-map", f"0:s:m:language:{sub_lang.strip()}"])
+                sub_lang = sub_lang.strip()
+                if sub_lang.isdigit():
+                    # Per-item override — exact type-relative subtitle stream position.
+                    # See the audio map above for why this uses a plain (gracefully
+                    # optional) index specifier instead of the metadata form.
+                    cmd.extend(["-map", f"0:s:{sub_lang}?"])
+                else:
+                    # No trailing '?' — see the audio map above for why.
+                    cmd.extend(["-map", f"0:s:m:language:{sub_lang}"])
             else:
                 cmd.extend(["-map", "0:s?"])
 

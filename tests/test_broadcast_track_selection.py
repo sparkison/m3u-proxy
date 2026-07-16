@@ -43,6 +43,16 @@ def test_preferred_audio_language_eng():
     assert "0:a:m:language:eng" in cmd
 
 
+def test_numeric_preferred_audio_maps_by_type_relative_position():
+    """A per-item override resolves to a numeric type-relative stream position
+    (e.g. "1" = the 2nd audio stream) rather than a language — the proxy must map
+    it with a plain index specifier (0:a:N?), not the metadata form, since a plain
+    index degrades gracefully via '?' while the metadata form does not."""
+    cmd = _build_cmd(preferred_audio_language="1")
+    assert _audio_map(cmd) == "0:a:1?"
+    assert "0:a:m:language:1" not in cmd
+
+
 def test_no_subtitle_map_when_disabled():
     """Subtitles are not mapped when subtitles_enabled is False (default)."""
     cmd = _build_cmd()
@@ -70,6 +80,15 @@ def test_embedded_subtitle_falls_back_to_generic_map_without_language():
     0:s? (any subtitle) — unchanged behavior for callers that don't know the language."""
     cmd = _build_cmd(subtitles_enabled=True, subtitle_language=None)
     assert "0:s?" in cmd
+
+
+def test_numeric_subtitle_language_maps_by_type_relative_position():
+    """A per-item override resolves to a numeric type-relative subtitle stream
+    position rather than a language — mapped with a plain (gracefully optional)
+    index specifier, mirroring the audio case."""
+    cmd = _build_cmd(subtitles_enabled=True, subtitle_language="0")
+    assert "0:s:0?" in cmd
+    assert "0:s:m:language:0" not in cmd
 
 
 def test_subtitle_codec_copy_when_enabled_and_not_transcoding():

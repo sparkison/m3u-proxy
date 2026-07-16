@@ -32,15 +32,15 @@ def test_default_maps_first_audio():
 
 
 def test_preferred_audio_language_maps_by_language():
-    """With preferred_audio_language the proxy maps 0:a:m:language:XX?."""
+    """With preferred_audio_language the proxy maps 0:a:m:language:XX (no trailing '?' — FFmpeg's metadata stream specifier doesn't support it)."""
     cmd = _build_cmd(preferred_audio_language="jpn")
-    assert _audio_map(cmd) == "0:a:m:language:jpn?"
+    assert _audio_map(cmd) == "0:a:m:language:jpn"
 
 
 def test_preferred_audio_language_eng():
     """English audio language selection."""
     cmd = _build_cmd(preferred_audio_language="eng")
-    assert "0:a:m:language:eng?" in cmd
+    assert "0:a:m:language:eng" in cmd
 
 
 def test_no_subtitle_map_when_disabled():
@@ -56,11 +56,12 @@ def test_subtitle_map_when_enabled():
 
 
 def test_embedded_subtitle_maps_by_language_when_set():
-    """With subtitles_enabled + subtitle_language, the proxy maps 0:s:m:language:XX?
-    instead of the generic 0:s? — this lets a per-item override pick a specific
-    embedded subtitle track out of several rather than always getting the first."""
+    """With subtitles_enabled + subtitle_language, the proxy maps 0:s:m:language:XX
+    (no trailing '?') instead of the generic 0:s? — this lets a per-item override
+    pick a specific embedded subtitle track out of several rather than always
+    getting the first."""
     cmd = _build_cmd(subtitles_enabled=True, subtitle_language="jpn")
-    assert "0:s:m:language:jpn?" in cmd
+    assert "0:s:m:language:jpn" in cmd
     assert "0:s?" not in cmd
 
 
@@ -88,7 +89,7 @@ def test_no_subtitle_codec_when_disabled():
 def test_audio_language_and_subtitles_combined():
     """Both preferred_audio_language and subtitles_enabled can be active together."""
     cmd = _build_cmd(preferred_audio_language="fra", subtitles_enabled=True)
-    assert "0:a:m:language:fra?" in cmd
+    assert "0:a:m:language:fra" in cmd
     assert "0:s?" in cmd
     assert "-c:s" in cmd
 
@@ -191,7 +192,7 @@ def test_external_subtitle_with_audio_language_combined():
         subtitle_language="eng",
         preferred_audio_language="jpn",
     )
-    assert "0:a:m:language:jpn?" in cmd
+    assert "0:a:m:language:jpn" in cmd
     assert "1:s:0?" in cmd
     assert "-c:s" in cmd
     assert "language=eng" in cmd

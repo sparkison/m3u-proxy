@@ -52,7 +52,7 @@ class BroadcastConfig:
     # DVR mode: preserve all HLS segments (no rolling deletion) for post-processing
     dvr_mode: bool = False
     metadata: Optional[Dict] = None
-    # Preferred audio language (ISO 639 code) for FFmpeg -map 0:a:m:language:XX?
+    # Preferred audio language (ISO 639 code) for FFmpeg -map 0:a:m:language:XX
     preferred_audio_language: Optional[str] = None
     # Whether to expose embedded subtitle streams via -map 0:s?
     subtitles_enabled: bool = False
@@ -220,8 +220,16 @@ class NetworkBroadcastProcess:
         cmd.extend(["-map", "0:v:0?"])
 
         if self.config.preferred_audio_language:
+            # NOTE: no trailing '?' here. FFmpeg's metadata-based stream specifier
+            # (`m:key:value`) does not support the optional-map suffix at all — it
+            # fails "Invalid argument" whether or not a stream actually matches, not
+            # just when the match is empty (confirmed against a real FFmpeg build).
+            # Appending '?' to `0:a:0` (a plain index specifier) is fine; appending it
+            # to `0:a:m:language:XX` is not. Without it, this succeeds immediately
+            # when the language matches, and fails cleanly (caught and retried by
+            # _retry_without_broken_language_maps()) only when it genuinely doesn't.
             lang = self.config.preferred_audio_language.strip()
-            cmd.extend(["-map", f"0:a:m:language:{lang}?"])
+            cmd.extend(["-map", f"0:a:m:language:{lang}"])
         else:
             cmd.extend(["-map", "0:a:0?"])
 
@@ -235,7 +243,8 @@ class NetworkBroadcastProcess:
         elif self.config.subtitles_enabled:
             sub_lang = getattr(self.config, "subtitle_language", None)
             if sub_lang and sub_lang.strip():
-                cmd.extend(["-map", f"0:s:m:language:{sub_lang.strip()}?"])
+                # No trailing '?' — see the audio map above for why.
+                cmd.extend(["-map", f"0:s:m:language:{sub_lang.strip()}"])
             else:
                 cmd.extend(["-map", "0:s?"])
 
@@ -308,6 +317,74 @@ class NetworkBroadcastProcess:
 
         return cmd
 
+    # Matches FFmpeg's option-parsing failure for a `-map` value that matches zero
+    # streams, e.g. Failed to set value '0:a:m:language:eng' for option 'map': Invalid argument
+    _MAP_FAILURE_PATTERN = re.compile(r"Failed to set value '([^']*)' for option 'map'")
+
+    async def _retry_without_broken_language_maps(
+        self,
+    ) -> asyncio.subprocess.Process:
+        """
+        Give self.process a brief window to fail on FFmpeg's option parsing (happens
+        near-instantly, before any encoding, when a `-map 0:X:m:language:YY` matches
+        zero streams of type X) and, if it does, clear whichever language caused it
+        and respawn. Loops up to twice since a single broadcast can hit this on the
+        audio map, the subtitle map, or both (e.g. an audio-only source with both
+        preferred_audio_language and a subtitle language configured) — the first
+        failure only reveals one bad map at a time.
+
+        FFmpeg's own error message quotes the exact map spec that failed, so which
+        language to clear is read from stderr rather than assumed — an earlier
+        version of this always blamed the audio language, which silently failed to
+        fix subtitle-map failures and looked like the retry "didn't work".
+        """
+        for _ in range(2):
+            try:
+                await asyncio.wait_for(self.process.wait(), timeout=1.5)
+            except asyncio.TimeoutError:
+                return self.process
+
+            stderr = b""
+            if self.process.stderr:
+                stderr = await self.process.stderr.read()
+
+            match = self._MAP_FAILURE_PATTERN.search(stderr.decode(errors="ignore"))
+            if not match:
+                # Exited for some other reason — leave it for the normal failure path.
+                return self.process
+
+            bad_map = match.group(1)
+
+            if bad_map.startswith("0:a:") and self.config.preferred_audio_language:
+                logger.warning(
+                    f"Broadcast {self.network_id}: preferred audio language "
+                    f"'{self.config.preferred_audio_language}' matched no audio stream "
+                    f"in the source (FFmpeg rejected '{bad_map}'); retrying with the "
+                    "default audio track."
+                )
+                self.config.preferred_audio_language = None
+            elif bad_map.startswith("0:s:") and self.config.subtitle_language:
+                logger.warning(
+                    f"Broadcast {self.network_id}: subtitle language "
+                    f"'{self.config.subtitle_language}' matched no subtitle stream in "
+                    f"the source (FFmpeg rejected '{bad_map}'); retrying without "
+                    "embedded subtitle language matching."
+                )
+                self.config.subtitle_language = None
+            else:
+                # A map failure we don't have a specific fallback for — leave it for
+                # the normal failure path rather than retrying blindly.
+                return self.process
+
+            cmd = self._build_ffmpeg_command()
+            logger.info(f"Restarting broadcast {self.network_id}: {' '.join(cmd)}")
+
+            self.process = await asyncio.create_subprocess_exec(
+                *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE
+            )
+
+        return self.process
+
     async def start(self) -> bool:
         """Start the FFmpeg broadcast process."""
         try:
@@ -351,6 +428,14 @@ class NetworkBroadcastProcess:
             self.process = await asyncio.create_subprocess_exec(
                 *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE
             )
+
+            # FFmpeg's `-map 0:X:m:language:YY` fails option parsing near-instantly
+            # ("Invalid argument") when zero streams of type X match language YY.
+            # Give it a brief window to hit that failure and, if it does, retry
+            # without whichever language caused it so the broadcast still starts
+            # instead of failing outright.
+            if self.config.preferred_audio_language or self.config.subtitle_language:
+                self.process = await self._retry_without_broken_language_maps()
 
             self.started_at = datetime.now(timezone.utc)
             self.status = "running"

@@ -56,6 +56,14 @@ class BroadcastConfig:
     preferred_audio_language: Optional[str] = None
     # Whether to expose embedded subtitle streams via -map 0:s?
     subtitles_enabled: bool = False
+    # External subtitle URL (Emby sidecar). When present, added as a second
+    # FFmpeg input and mapped into the HLS output. Takes precedence over 0:s?.
+    subtitle_url: Optional[str] = None
+    # Language tag for the external subtitle (passed as FFmpeg metadata).
+    subtitle_language: Optional[str] = None
+    # Seek offset for the external subtitle input. 0 = server-rebased (Emby
+    # startPositionTicks); positive = full-file subtitle needing local -ss.
+    subtitle_seek_seconds: float = 0.0
 
 
 @dataclass
@@ -188,6 +196,21 @@ class NetworkBroadcastProcess:
         if "-i" not in cmd:
             cmd.extend(["-i", self.config.stream_url])
 
+        # External subtitle as a second FFmpeg input (Emby sidecar file).
+        # The seek offset is applied per-input: when subtitle_seek_seconds > 0 the
+        # subtitle file is a full-file fetch that needs local -ss to align with the
+        # video's timeline; when 0 the media server already rebased the cues (Emby's
+        # startPositionTicks path segment) and the proxy must NOT re-seek.
+        has_external_subtitle = bool(
+            getattr(self.config, "subtitle_url", None)
+            and self.config.subtitle_url.strip()
+        )
+        if has_external_subtitle:
+            sub_seek = getattr(self.config, "subtitle_seek_seconds", 0.0)
+            if sub_seek and sub_seek > 0:
+                cmd.extend(["-ss", str(sub_seek)])
+            cmd.extend(["-i", self.config.subtitle_url])
+
         # Duration limiting for programme boundary
         if self.config.duration_seconds > 0:
             cmd.extend(["-t", str(self.config.duration_seconds)])
@@ -202,8 +225,19 @@ class NetworkBroadcastProcess:
         else:
             cmd.extend(["-map", "0:a:0?"])
 
-        if self.config.subtitles_enabled:
-            cmd.extend(["-map", "0:s?"])
+        # Subtitle mapping: external sidecar (input 1:s) takes precedence over
+        # embedded (0:s?) so we don't duplicate subtitle tracks when both exist.
+        # Embedded subtitles are language-aware (mirroring the audio mapping above)
+        # when subtitle_language is set, so a per-item override can pick a specific
+        # embedded track out of several rather than always getting the first one.
+        if has_external_subtitle:
+            cmd.extend(["-map", "1:s:0?"])
+        elif self.config.subtitles_enabled:
+            sub_lang = getattr(self.config, "subtitle_language", None)
+            if sub_lang and sub_lang.strip():
+                cmd.extend(["-map", f"0:s:m:language:{sub_lang.strip()}?"])
+            else:
+                cmd.extend(["-map", "0:s?"])
 
         # Codec selection
         if self.config.transcode:
@@ -232,8 +266,16 @@ class NetworkBroadcastProcess:
             cmd.extend(["-ac", "2"])  # Force stereo output
         else:
             cmd.extend(["-c:v", "copy", "-c:a", "copy"])
-            if self.config.subtitles_enabled:
+            # Subtitle codec: copy when passthrough (preserves SRT/ASS/VTT as-is);
+            # when transcoding, the HLS muxer auto-selects webvtt for the .vtt segments.
+            if has_external_subtitle or self.config.subtitles_enabled:
                 cmd.extend(["-c:s", "copy"])
+
+        # Tag the external subtitle's language so the HLS variant carries metadata
+        # (DEFAULT=NO/AUTOSELECT=YES is flipped by NetworkHlsController on the Laravel
+        # side so the subtitle is available-but-not-forced).
+        if has_external_subtitle and getattr(self.config, "subtitle_language", None):
+            cmd.extend(["-metadata:s:s:0", f"language={self.config.subtitle_language}"])
 
         # HLS output configuration
         cmd.extend(["-f", "hls"])

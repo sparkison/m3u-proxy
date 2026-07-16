@@ -17,7 +17,7 @@ own fallback.
 """
 
 import asyncio
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -39,13 +39,31 @@ def _make_process(**config_overrides) -> NetworkBroadcastProcess:
 
 
 def _fake_process(stderr: bytes = b"", returncode: int = 1):
-    """A fake asyncio.subprocess.Process double that has already exited."""
-    process = AsyncMock()
+    """A fake asyncio.subprocess.Process double that has already exited.
+
+    Uses a plain MagicMock as the container (not AsyncMock) — only .wait() and
+    .stderr.read() need to be awaitable, and they're explicitly given AsyncMocks
+    below. An AsyncMock container makes every unconfigured attribute access
+    awaitable too, which left a dangling "coroutine was never awaited" warning
+    from something touching an attribute this test never actually uses.
+    """
+    process = MagicMock()
     process.returncode = returncode
     process.wait = AsyncMock(return_value=returncode)
-    process.stderr = AsyncMock()
+    process.stderr = MagicMock()
     process.stderr.read = AsyncMock(return_value=stderr)
     return process
+
+
+async def _timeout_without_awaiting(coro, timeout):
+    """Stand-in for asyncio.wait_for() that times out immediately without ever
+    awaiting the coroutine it was given — matching a process that's still
+    running when the grace window ends. Must close() the unawaited coroutine
+    itself (the real wait_for would eventually consume it); otherwise it's
+    garbage-collected later with a "coroutine was never awaited" warning
+    attributed to whatever unrelated test happens to be running at GC time."""
+    coro.close()
+    raise asyncio.TimeoutError()
 
 
 @pytest.mark.asyncio
@@ -61,7 +79,7 @@ async def test_returns_same_process_when_still_running_after_grace_window():
     with (
         patch(
             "src.broadcast_manager.asyncio.wait_for",
-            AsyncMock(side_effect=asyncio.TimeoutError),
+            AsyncMock(side_effect=_timeout_without_awaiting),
         ),
         patch(
             "src.broadcast_manager.asyncio.create_subprocess_exec", AsyncMock()

@@ -1,6 +1,7 @@
 """
-Log anonymization filter — scrubs URLs and usernames from log records
-before they are written. Activated when LOG_ANONYMIZE=true (default).
+Log anonymization filter — scrubs URLs, usernames/passwords, and auth
+tokens/headers (Plex, Emby/Jellyfin, generic Authorization/Bearer) from log
+records before they are written. Activated when LOG_ANONYMIZE=true (default).
 """
 
 import logging
@@ -13,7 +14,25 @@ _URL_RE = re.compile(
 # Matches key=value, key: value, key='value', key="value".
 # Group 1: keyword, group 2: optional quote, group 3: value, \2: matching close quote.
 _USER_RE = re.compile(
-    r"""(?i)\b(username|user|login|ip|host|hostname|server)\s*[:=]\s*(['"']?)([^&\s"'<>#,\)\]]+)\2""",
+    r"""(?i)\b(username|user|login|password|ip|host|hostname|server)\s*[:=]\s*(['"']?)([^&\s"'<>#,\)\]]+)\2""",
+)
+# Auth tokens/credentials that can appear OUTSIDE a URL — e.g. Plex's X-Plex-Token is
+# deliberately pulled out of the stream URL into a raw FFmpeg -headers argument (so
+# the URL itself isn't tagged with it), which means _URL_RE's whole-URL redaction
+# never sees it. Covers the header form (`Key: value`, as FFmpeg receives it) and the
+# query-string form (`key=value`, e.g. Emby/Jellyfin's api_key) for both.
+# Group 1: keyword, group 2: separator + optional quote, group 3: quote, group 4: value.
+_TOKEN_RE = re.compile(
+    r"""(?i)\b(x-plex-token|x-emby-token|x-mediabrowser-token|api[_-]?key|access[_-]?token)(\s*[:=]\s*)(['"']?)([^&\s"'<>#,\)\]]+)\3""",
+)
+# Authorization-style headers carry more than a single bare token — a scheme prefix
+# + token separated by a space (`Bearer <token>`, `Basic <base64>`), or Emby's
+# structured `MediaBrowser Client="...", Token="..."` form. _TOKEN_RE's
+# whitespace/quote-terminated value would only swallow the first word or segment
+# and leave the actual credential exposed, so this redacts the entire header value
+# (everything after the colon up to end-of-line) instead of trying to parse it.
+_AUTH_HEADER_RE = re.compile(
+    r"""(?i)\b(authorization|x-emby-authorization)\s*:\s*[^\r\n]+""",
 )
 # UUIDs are resource identifiers that can be used to probe APIs
 _UUID_RE = re.compile(
@@ -25,6 +44,8 @@ _UUID_RE = re.compile(
 def _scrub(text: str) -> str:
     text = _URL_RE.sub("****", text)
     text = _USER_RE.sub(r"\1=\2****\2", text)
+    text = _TOKEN_RE.sub(r"\1\2\3****\3", text)
+    text = _AUTH_HEADER_RE.sub(r"\1: ****", text)
     text = _UUID_RE.sub("****", text)
     return text
 

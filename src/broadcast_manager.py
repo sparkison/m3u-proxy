@@ -340,24 +340,36 @@ class NetworkBroadcastProcess:
     # streams, e.g. Failed to set value '0:a:m:language:eng' for option 'map': Invalid argument
     _MAP_FAILURE_PATTERN = re.compile(r"Failed to set value '([^']*)' for option 'map'")
 
+    # FFmpeg's HLS output defaults to WebVTT for any mapped subtitle stream, which
+    # only supports text-to-text conversion — a bitmap format (PGS/VobSub, common on
+    # Blu-ray rips) hits this and crashes outright, confirmed against a real
+    # broadcast. Unlike the map-failure pattern above, this message doesn't quote
+    # which stream caused it, so there's nothing more specific to clear than
+    # "subtitles" as a whole.
+    _SUBTITLE_ENCODING_FAILURE = "subtitle encoding currently only possible from text to text or bitmap to bitmap"
+
     async def _retry_without_broken_language_maps(
         self,
     ) -> asyncio.subprocess.Process:
         """
-        Give self.process a brief window to fail on FFmpeg's option parsing (happens
-        near-instantly, before any encoding, when a `-map 0:X:m:language:YY` matches
-        zero streams of type X) and, if it does, clear whichever language caused it
-        and respawn. Loops up to twice since a single broadcast can hit this on the
-        audio map, the subtitle map, or both (e.g. an audio-only source with both
-        preferred_audio_language and a subtitle language configured) — the first
-        failure only reveals one bad map at a time.
+        Give self.process a brief window to fail near-instantly, before any real
+        encoding, on either of two known-recoverable FFmpeg failures, and retry
+        without whichever part caused it:
 
-        FFmpeg's own error message quotes the exact map spec that failed, so which
-        language to clear is read from stderr rather than assumed — an earlier
-        version of this always blamed the audio language, which silently failed to
-        fix subtitle-map failures and looked like the retry "didn't work".
+        1. A `-map 0:X:m:language:YY` metadata specifier matching zero streams of
+           type X (FFmpeg's option parsing rejects this outright rather than
+           degrading gracefully) — clears whichever of preferred_audio_language /
+           subtitle_language caused it, read from FFmpeg's own error message
+           (which quotes the exact map spec) rather than assumed.
+        2. A mapped subtitle stream that's a bitmap format FFmpeg's WebVTT encoder
+           can't convert — disables subtitles entirely, since the failure message
+           doesn't identify which stream caused it.
+
+        Loops up to three times since a single broadcast can hit more than one of
+        these across the audio map, the subtitle map, and the subtitle codec — each
+        failure only reveals one broken piece at a time.
         """
-        for _ in range(2):
+        for _ in range(3):
             try:
                 await asyncio.wait_for(self.process.wait(), timeout=1.5)
             except asyncio.TimeoutError:
@@ -366,34 +378,44 @@ class NetworkBroadcastProcess:
             stderr = b""
             if self.process.stderr:
                 stderr = await self.process.stderr.read()
+            stderr_text = stderr.decode(errors="ignore")
 
-            match = self._MAP_FAILURE_PATTERN.search(stderr.decode(errors="ignore"))
-            if not match:
-                # Exited for some other reason — leave it for the normal failure path.
-                return self.process
-
-            bad_map = match.group(1)
-
-            if bad_map.startswith("0:a:") and self.config.preferred_audio_language:
+            if self._SUBTITLE_ENCODING_FAILURE in stderr_text.lower():
                 logger.warning(
-                    f"Broadcast {self.network_id}: preferred audio language "
-                    f"'{self.config.preferred_audio_language}' matched no audio stream "
-                    f"in the source (FFmpeg rejected '{bad_map}'); retrying with the "
-                    "default audio track."
+                    f"Broadcast {self.network_id}: mapped subtitle stream is a bitmap "
+                    "format (e.g. PGS/VobSub) that FFmpeg cannot convert to WebVTT; "
+                    "disabling subtitles for this broadcast."
                 )
-                self.config.preferred_audio_language = None
-            elif bad_map.startswith("0:s:") and self.config.subtitle_language:
-                logger.warning(
-                    f"Broadcast {self.network_id}: subtitle language "
-                    f"'{self.config.subtitle_language}' matched no subtitle stream in "
-                    f"the source (FFmpeg rejected '{bad_map}'); retrying without "
-                    "embedded subtitle language matching."
-                )
+                self.config.subtitles_enabled = False
                 self.config.subtitle_language = None
             else:
-                # A map failure we don't have a specific fallback for — leave it for
-                # the normal failure path rather than retrying blindly.
-                return self.process
+                match = self._MAP_FAILURE_PATTERN.search(stderr_text)
+                if not match:
+                    # Exited for some other reason — leave it for the normal failure path.
+                    return self.process
+
+                bad_map = match.group(1)
+
+                if bad_map.startswith("0:a:") and self.config.preferred_audio_language:
+                    logger.warning(
+                        f"Broadcast {self.network_id}: preferred audio language "
+                        f"'{self.config.preferred_audio_language}' matched no audio "
+                        f"stream in the source (FFmpeg rejected '{bad_map}'); retrying "
+                        "with the default audio track."
+                    )
+                    self.config.preferred_audio_language = None
+                elif bad_map.startswith("0:s:") and self.config.subtitle_language:
+                    logger.warning(
+                        f"Broadcast {self.network_id}: subtitle language "
+                        f"'{self.config.subtitle_language}' matched no subtitle stream "
+                        f"in the source (FFmpeg rejected '{bad_map}'); retrying without "
+                        "embedded subtitle language matching."
+                    )
+                    self.config.subtitle_language = None
+                else:
+                    # A map failure we don't have a specific fallback for — leave it for
+                    # the normal failure path rather than retrying blindly.
+                    return self.process
 
             cmd = self._build_ffmpeg_command()
             logger.info(f"Restarting broadcast {self.network_id}: {' '.join(cmd)}")
@@ -448,12 +470,18 @@ class NetworkBroadcastProcess:
                 *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE
             )
 
-            # FFmpeg's `-map 0:X:m:language:YY` fails option parsing near-instantly
-            # ("Invalid argument") when zero streams of type X match language YY.
-            # Give it a brief window to hit that failure and, if it does, retry
-            # without whichever language caused it so the broadcast still starts
-            # instead of failing outright.
-            if self.config.preferred_audio_language or self.config.subtitle_language:
+            # Give the process a brief window to hit either of two known-recoverable
+            # failures — a `-map 0:X:m:language:YY` matching zero streams, or a mapped
+            # subtitle stream FFmpeg's WebVTT encoder can't convert (bitmap formats) —
+            # and retry without whichever part caused it, so the broadcast still
+            # starts instead of failing outright. subtitles_enabled covers the plain
+            # `-map 0:s?` case (no language/position preference) too, since that can
+            # still hit a bitmap-only subtitle stream in Local (transcode) mode.
+            if (
+                self.config.preferred_audio_language
+                or self.config.subtitle_language
+                or self.config.subtitles_enabled
+            ):
                 self.process = await self._retry_without_broken_language_maps()
 
             self.started_at = datetime.now(timezone.utc)
@@ -853,10 +881,16 @@ class NetworkBroadcastProcess:
         return path if os.path.exists(path) else None
 
     def get_segment_path(self, filename: str) -> Optional[str]:
-        """Get path to a specific segment file."""
+        """Get path to a specific segment or sub-playlist file.
+
+        Covers .ts (video segments), .vtt (WebVTT subtitle segments), and .m3u8
+        (the subtitle sub-playlist FFmpeg auto-derives, and the video sub-playlist
+        the editor's hls-variant route also fetches through this same endpoint) —
+        not just .ts, which this used to hard-code to before subtitle support.
+        """
         # Sanitize filename to prevent directory traversal
         safe_filename = os.path.basename(filename)
-        if not safe_filename.endswith(".ts"):
+        if not safe_filename.endswith((".ts", ".vtt", ".m3u8")):
             return None
 
         path = os.path.join(self.hls_dir, safe_filename)
@@ -1119,10 +1153,11 @@ class BroadcastManager:
             return None
 
     def get_segment_path(self, network_id: str, filename: str) -> Optional[str]:
-        """Get path to a segment file for a network."""
+        """Get path to a segment or sub-playlist file for a network — see
+        NetworkBroadcastProcess.get_segment_path() for which extensions and why."""
         # Sanitize filename
         safe_filename = os.path.basename(filename)
-        if not safe_filename.endswith(".ts"):
+        if not safe_filename.endswith((".ts", ".vtt", ".m3u8")):
             return None
 
         # Check active broadcast first

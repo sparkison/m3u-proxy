@@ -2717,6 +2717,18 @@ class BroadcastStartRequest(BaseModel):
     # Whether the proxy should detect and expose embedded subtitle tracks.
     # When True, FFmpeg maps 0:s? so subtitle streams reach the HLS output.
     subtitles_enabled: bool = False
+    # External subtitle URL (e.g. Emby /Subtitles/{i}/{ticks}/Stream.{fmt}).
+    # When present, the proxy adds it as a second FFmpeg input and maps it
+    # into the HLS output. Takes precedence over the embedded 0:s? map.
+    subtitle_url: Optional[str] = None
+    # Language tag for the external subtitle (informational; passed to FFmpeg
+    # as metadata so the HLS variant carries it).
+    subtitle_language: Optional[str] = None
+    # Seek offset the proxy must apply to the external subtitle input.
+    # 0 = already rebased server-side (Emby's startPositionTicks path segment);
+    # positive = full-file subtitle that the proxy must -ss locally to align
+    # with the video's timeline.
+    subtitle_seek_seconds: float = 0.0
 
     @field_validator("stream_url")
     @classmethod
@@ -2726,6 +2738,13 @@ class BroadcastStartRequest(BaseModel):
     @field_validator("callback_url")
     @classmethod
     def validate_callback_url(cls, v):
+        if v is not None:
+            return validate_url(v)
+        return v
+
+    @field_validator("subtitle_url")
+    @classmethod
+    def validate_subtitle_url(cls, v):
         if v is not None:
             return validate_url(v)
         return v
@@ -2802,6 +2821,9 @@ async def start_broadcast(
             metadata=request.metadata,
             preferred_audio_language=request.preferred_audio_language,
             subtitles_enabled=request.subtitles_enabled,
+            subtitle_url=request.subtitle_url,
+            subtitle_language=request.subtitle_language,
+            subtitle_seek_seconds=request.subtitle_seek_seconds,
         )
         status = await broadcast_manager.start_broadcast(config)
         return BroadcastStatusResponse(

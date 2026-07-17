@@ -155,7 +155,7 @@ async def test_retries_without_subtitle_language_on_subtitle_map_failure():
     )
     proc.process = _fake_process(
         stderr=(
-            b"Failed to set value '0:s:m:language:eng' for option 'map': Invalid argument\n"
+            b"Failed to set value '1:s:m:language:eng' for option 'map': Invalid argument\n"
             b"Error parsing options for output file live.m3u8.\n"
         ),
     )
@@ -173,10 +173,47 @@ async def test_retries_without_subtitle_language_on_subtitle_map_failure():
     assert proc.config.preferred_audio_language == "eng"  # untouched — it was fine
 
     retried_cmd = mock_exec.call_args.args
-    assert "0:s:m:language:eng" not in retried_cmd
-    assert "0:s?" in retried_cmd
+    assert "1:s:m:language:eng" not in retried_cmd
+    # subtitles_enabled itself is untouched by this retry (only subtitle_language
+    # is cleared), so embedded subtitles still map — now via the generic 1:s?
+    # (any subtitle) from the subtitle's own un-throttled second input.
+    assert "1:s?" in retried_cmd
     # Audio map preference is preserved across the subtitle-only retry.
     assert "0:a:m:language:eng" in retried_cmd
+
+
+@pytest.mark.asyncio
+async def test_disables_subtitles_on_bitmap_subtitle_encoding_failure():
+    """PGS/VobSub bitmap subtitles crash FFmpeg's default WebVTT encoder outright
+    ("Subtitle encoding currently only possible from text to text or bitmap to
+    bitmap"), reproduced against a real broadcast. The message doesn't quote
+    which stream caused it, so there's nothing more specific to clear than
+    disabling subtitles for the broadcast entirely, and it must NOT touch
+    preferred_audio_language."""
+    proc = _make_process(
+        preferred_audio_language="eng",
+        subtitles_enabled=True,
+        subtitle_language="eng",
+    )
+    proc.process = _fake_process(
+        stderr=(
+            b"Subtitle encoding currently only possible from text to text "
+            b"or bitmap to bitmap\n"
+        ),
+    )
+
+    replacement = _fake_process(returncode=0)
+    with patch(
+        "src.broadcast_manager.asyncio.create_subprocess_exec",
+        AsyncMock(return_value=replacement),
+    ) as mock_exec:
+        result = await proc._retry_without_broken_language_maps()
+
+    assert result is replacement
+    mock_exec.assert_called_once()
+    assert proc.config.subtitles_enabled is False
+    assert proc.config.subtitle_language is None
+    assert proc.config.preferred_audio_language == "eng"
 
 
 @pytest.mark.asyncio

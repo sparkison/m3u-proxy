@@ -52,7 +52,11 @@ class BroadcastConfig:
     # DVR mode: preserve all HLS segments (no rolling deletion) for post-processing
     dvr_mode: bool = False
     metadata: Optional[Dict] = None
-    # Preferred audio language (ISO 639 code) for FFmpeg -map 0:a:m:language:XX
+    # Preferred audio track: an ISO 639 code (network-level default; FFmpeg
+    # -map 0:a:m:language:XX) or a numeric type-relative stream position from a
+    # per-item override (FFmpeg -map 0:a:N? — see NetworkBroadcastService's
+    # resolveTrackPreference on the editor side for the composite value this is
+    # resolved from).
     preferred_audio_language: Optional[str] = None
     # Whether to expose embedded subtitle streams via -map 0:s?
     subtitles_enabled: bool = False
@@ -130,6 +134,33 @@ class NetworkBroadcastProcess:
         # Segment filenames already counted
         self._seen_segments: Set[str] = set()
 
+    # Confirmed live (Plex, via Safari): the embedded-subtitle second input's
+    # cues consistently show up ~1s EARLY relative to the dialogue they belong
+    # to (each input independently zeroes its own -ss landing point to
+    # timestamp 0, and the subtitle-only input's landing point leads the
+    # primary's by this small, constant amount). A positive -itsoffset on that
+    # input delays its local zero point by the same amount, cancelling the
+    # lead directly. Tuned empirically against one specific setup: 1.5
+    # overcorrected (subs then ran late), 1.0 lines up correctly.
+    #
+    # This isn't necessarily a universal constant — the gap comes from real
+    # connection/timing behavior (how long the second connection to the source
+    # takes to land relative to the first), which plausibly varies with
+    # network latency to the media server, the media server's own response
+    # time, and per-server/version quirks. Overridable via
+    # BROADCAST_SUBTITLE_SYNC_OFFSET_SECONDS so a different deployment can
+    # retune it without a code change, instead of baking in one setup's
+    # measurement as gospel.
+    #
+    # An earlier attempt used -copyts to preserve each input's true source
+    # timestamps instead (making the gap explicit rather than compensating for
+    # it blindly) but had to be reverted: -copyts also disables FFmpeg's normal
+    # timestamp-discontinuity sanitization, which this live Plex source
+    # apparently relies on — confirmed live, it broke playback outright and
+    # left the proxy stuck retry-looping. Plain -itsoffset needs none of that;
+    # it only shifts one input's local timeline, sanitization included.
+    _DEFAULT_SUBTITLE_SYNC_OFFSET_SECONDS = 1.0
+
     def _build_ffmpeg_command(self) -> List[str]:
         """Build the FFmpeg command for HLS broadcast output."""
         cmd = ["ffmpeg", "-y"]
@@ -141,60 +172,73 @@ class NetworkBroadcastProcess:
             if hwaccel and hwaccel.lower() not in ("none", ""):
                 cmd.extend(["-hwaccel", hwaccel])
 
-        # Input-level seeking (BEFORE -i for accuracy)
-        if self.config.seek_seconds > 0:
-            cmd.extend(["-ss", str(self.config.seek_seconds)])
+        def add_source_input(url: str, seek_seconds: float, *, realtime: bool) -> None:
+            """Append an -i for `url`, matching this proxy's header/seek/reconnect
+            conventions.
 
-        # Real-time pacing - critical for live streaming
-        cmd.append("-re")
-
-        # Reconnection options for network streams
-        cmd.extend(
-            [
-                "-reconnect",
-                "1",
-                "-reconnect_streamed",
-                "1",
-                "-reconnect_delay_max",
-                "10",
-            ]
-        )
-
-        # Input URL
-        # If headers are provided explicitly in the BroadcastConfig, prefer them.
-        if (
-            getattr(self.config, "headers", None)
-            and isinstance(self.config.headers, dict)
-            and isinstance(self.config.stream_url, str)
-            and (
-                "://" in self.config.stream_url
-                and not self.config.stream_url.startswith("file://")
+            `realtime` controls whether `-re` precedes this input. Pass False for
+            a second, subtitle-only read of the same source: FFmpeg's `-re`
+            real-time governor paces the shared demux loop against wall-clock
+            time using EVERY mapped stream's packets, but a container's embedded
+            subtitle packets are often extremely sparse/bursty — confirmed
+            against a real broadcast, the governor's reported "lag" for the
+            subtitle stream climbed without bound (0.6s -> 50s+ over under a
+            minute), and since the demux loop is shared, that dragged video/audio
+            segment output down to a crawl too, even though only the subtitle
+            stream was the one falling behind. Reading the embedded subtitle
+            track from its own un-paced second input sidesteps the governor
+            entirely — verified against the same real broadcast, segment cadence
+            returned to normal immediately. This mirrors the external-subtitle
+            input below, which was never `-re`-throttled in the first place and
+            never hit this bug.
+            """
+            if seek_seconds > 0:
+                cmd.extend(["-ss", str(seek_seconds)])
+            if realtime:
+                cmd.append("-re")
+            cmd.extend(
+                [
+                    "-reconnect",
+                    "1",
+                    "-reconnect_streamed",
+                    "1",
+                    "-reconnect_delay_max",
+                    "10",
+                ]
             )
-        ):
-            try:
-                headers = []
-                for hk, hv in self.config.headers.items():
-                    # sanitize header names/values
-                    k = str(hk).replace("\r", "").replace("\n", "").strip()
-                    v = str(hv).replace("\r", "").replace("\n", "").strip()
-                    if not k:
-                        continue
-                    headers.append(f"{k}: {v}")
 
-                if headers:
-                    header_str = "\r\n".join(headers) + "\r\n"
-                    cmd.extend(["-headers", header_str, "-i", self.config.stream_url])
-                else:
-                    cmd.extend(["-i", self.config.stream_url])
-            except Exception as e:
-                logger.warning(f"Failed to construct headers for FFmpeg input: {e}")
-                cmd.extend(["-i", self.config.stream_url])
+            # If headers are provided explicitly in the BroadcastConfig, prefer them.
+            if (
+                getattr(self.config, "headers", None)
+                and isinstance(self.config.headers, dict)
+                and isinstance(url, str)
+                and ("://" in url and not url.startswith("file://"))
+            ):
+                try:
+                    headers = []
+                    for hk, hv in self.config.headers.items():
+                        # sanitize header names/values
+                        k = str(hk).replace("\r", "").replace("\n", "").strip()
+                        v = str(hv).replace("\r", "").replace("\n", "").strip()
+                        if not k:
+                            continue
+                        headers.append(f"{k}: {v}")
 
-        # If no input has been added by the header logic above, append it as a plain -i.
-        # This is a defensive measure to avoid malformed commands when headers are not
-        # provided and the URL is a simple network resource (e.g., Emby/Jellyfin stream.ts).
-        if "-i" not in cmd:
-            cmd.extend(["-i", self.config.stream_url])
+                    if headers:
+                        header_str = "\r\n".join(headers) + "\r\n"
+                        cmd.extend(["-headers", header_str, "-i", url])
+                        return
+                except Exception as e:
+                    logger.warning(f"Failed to construct headers for FFmpeg input: {e}")
+
+            cmd.extend(["-i", url])
+
+        # Primary input: video + audio (+ embedded subtitle, when nothing forces
+        # a second input for it). Real-time paced, since this governs the actual
+        # broadcast's live pacing.
+        add_source_input(
+            self.config.stream_url, self.config.seek_seconds, realtime=True
+        )
 
         # External subtitle as a second FFmpeg input (Emby sidecar file).
         # The seek offset is applied per-input: when subtitle_seek_seconds > 0 the
@@ -205,11 +249,30 @@ class NetworkBroadcastProcess:
             getattr(self.config, "subtitle_url", None)
             and self.config.subtitle_url.strip()
         )
+        # Type-relative input index the subtitle -map should address. Embedded
+        # subtitles need their own second input (see add_source_input's realtime
+        # note) whenever there's no external subtitle already covering it.
+        subtitle_input_index = 0
         if has_external_subtitle:
             sub_seek = getattr(self.config, "subtitle_seek_seconds", 0.0)
             if sub_seek and sub_seek > 0:
                 cmd.extend(["-ss", str(sub_seek)])
             cmd.extend(["-i", self.config.subtitle_url])
+        elif self.config.subtitles_enabled:
+            # See _DEFAULT_SUBTITLE_SYNC_OFFSET_SECONDS above: cancels the
+            # sync lag confirmed live between this input's cues and the
+            # dialogue they belong to. Overridable per-deployment since the
+            # exact gap isn't necessarily universal.
+            sync_offset = getattr(
+                settings,
+                "BROADCAST_SUBTITLE_SYNC_OFFSET_SECONDS",
+                self._DEFAULT_SUBTITLE_SYNC_OFFSET_SECONDS,
+            )
+            cmd.extend(["-itsoffset", str(sync_offset)])
+            add_source_input(
+                self.config.stream_url, self.config.seek_seconds, realtime=False
+            )
+            subtitle_input_index = 1
 
         # Duration limiting for programme boundary
         if self.config.duration_seconds > 0:
@@ -220,33 +283,53 @@ class NetworkBroadcastProcess:
         cmd.extend(["-map", "0:v:0?"])
 
         if self.config.preferred_audio_language:
-            # NOTE: no trailing '?' here. FFmpeg's metadata-based stream specifier
-            # (`m:key:value`) does not support the optional-map suffix at all — it
-            # fails "Invalid argument" whether or not a stream actually matches, not
-            # just when the match is empty (confirmed against a real FFmpeg build).
-            # Appending '?' to `0:a:0` (a plain index specifier) is fine; appending it
-            # to `0:a:m:language:XX` is not. Without it, this succeeds immediately
-            # when the language matches, and fails cleanly (caught and retried by
-            # _retry_without_broken_language_maps()) only when it genuinely doesn't.
             lang = self.config.preferred_audio_language.strip()
-            cmd.extend(["-map", f"0:a:m:language:{lang}"])
+            if lang.isdigit():
+                # A per-item override (see NetworkBroadcastService::resolveTrackPreference
+                # on the editor side) resolves to the exact type-relative stream position
+                # (e.g. "1" = the 2nd audio stream) rather than a language — precise, and
+                # a plain index specifier degrades gracefully via '?' if the position no
+                # longer exists, unlike the metadata form below.
+                cmd.extend(["-map", f"0:a:{lang}?"])
+            else:
+                # NOTE: no trailing '?' here. FFmpeg's metadata-based stream specifier
+                # (`m:key:value`) does not support the optional-map suffix at all — it
+                # fails "Invalid argument" whether or not a stream actually matches, not
+                # just when the match is empty (confirmed against a real FFmpeg build).
+                # Appending '?' to `0:a:0` (a plain index specifier) is fine; appending it
+                # to `0:a:m:language:XX` is not. Without it, this succeeds immediately
+                # when the language matches, and fails cleanly (caught and retried by
+                # _retry_without_broken_language_maps()) only when it genuinely doesn't.
+                cmd.extend(["-map", f"0:a:m:language:{lang}"])
         else:
             cmd.extend(["-map", "0:a:0?"])
 
         # Subtitle mapping: external sidecar (input 1:s) takes precedence over
-        # embedded (0:s?) so we don't duplicate subtitle tracks when both exist.
-        # Embedded subtitles are language-aware (mirroring the audio mapping above)
-        # when subtitle_language is set, so a per-item override can pick a specific
-        # embedded track out of several rather than always getting the first one.
+        # embedded so we don't duplicate subtitle tracks when both exist. Embedded
+        # subtitles are read from their own un-throttled second input (see
+        # add_source_input's realtime note above) at subtitle_input_index, NOT
+        # from the primary input — mapping them from input 0 would re-subject
+        # them to the -re governor's shared demux loop and reintroduce the stall.
+        # Embedded subtitles are also language-aware (mirroring the audio mapping
+        # above) when subtitle_language is set, so a per-item override can pick a
+        # specific embedded track out of several rather than always the first one.
         if has_external_subtitle:
             cmd.extend(["-map", "1:s:0?"])
         elif self.config.subtitles_enabled:
             sub_lang = getattr(self.config, "subtitle_language", None)
+            sub_prefix = f"{subtitle_input_index}:s"
             if sub_lang and sub_lang.strip():
-                # No trailing '?' — see the audio map above for why.
-                cmd.extend(["-map", f"0:s:m:language:{sub_lang.strip()}"])
+                sub_lang = sub_lang.strip()
+                if sub_lang.isdigit():
+                    # Per-item override — exact type-relative subtitle stream position.
+                    # See the audio map above for why this uses a plain (gracefully
+                    # optional) index specifier instead of the metadata form.
+                    cmd.extend(["-map", f"{sub_prefix}:{sub_lang}?"])
+                else:
+                    # No trailing '?' — see the audio map above for why.
+                    cmd.extend(["-map", f"{sub_prefix}:m:language:{sub_lang}"])
             else:
-                cmd.extend(["-map", "0:s?"])
+                cmd.extend(["-map", f"{sub_prefix}?"])
 
         # Codec selection
         if self.config.transcode:
@@ -275,10 +358,19 @@ class NetworkBroadcastProcess:
             cmd.extend(["-ac", "2"])  # Force stereo output
         else:
             cmd.extend(["-c:v", "copy", "-c:a", "copy"])
-            # Subtitle codec: copy when passthrough (preserves SRT/ASS/VTT as-is);
-            # when transcoding, the HLS muxer auto-selects webvtt for the .vtt segments.
-            if has_external_subtitle or self.config.subtitles_enabled:
-                cmd.extend(["-c:s", "copy"])
+            # Subtitle codec is deliberately left unspecified here, even in this
+            # video/audio-passthrough branch: HLS's .vtt segments must actually be
+            # WebVTT. `-c:s copy` was tried here previously, under the assumption
+            # that it "preserves" the source subtitle format the same way -c:v/-c:a
+            # copy do — but a source in SRT/ASS copied as-is produces bytes that
+            # merely look like WebVTT (SRT's comma decimal separator instead of a
+            # period, no "WEBVTT" header, etc.), which some players parse leniently
+            # enough to render the very first cue and then silently drop every
+            # cue after it — the exact "one line of dialogue, then nothing" bug
+            # reported live. Leaving -c:s unset lets FFmpeg's HLS muxer apply its
+            # own default (real webvtt transcoding) regardless of the video/audio
+            # copy mode, identical to what already happens in the transcode branch
+            # above.
 
         # Tag the external subtitle's language so the HLS variant carries metadata
         # (DEFAULT=NO/AUTOSELECT=YES is flipped by NetworkHlsController on the Laravel
@@ -311,6 +403,12 @@ class NetworkBroadcastProcess:
         segment_pattern = os.path.join(self.hls_dir, "live%06d.ts")
         cmd.extend(["-hls_segment_filename", segment_pattern])
 
+        # The negative -itsoffset above can produce a negative starting
+        # timestamp on the subtitle input; this keeps the HLS muxer from
+        # choking on it at the very start of the broadcast.
+        if subtitle_input_index == 1:
+            cmd.extend(["-avoid_negative_ts", "make_zero"])
+
         # Output playlist
         playlist_path = os.path.join(self.hls_dir, "live.m3u8")
         cmd.append(playlist_path)
@@ -321,24 +419,36 @@ class NetworkBroadcastProcess:
     # streams, e.g. Failed to set value '0:a:m:language:eng' for option 'map': Invalid argument
     _MAP_FAILURE_PATTERN = re.compile(r"Failed to set value '([^']*)' for option 'map'")
 
+    # FFmpeg's HLS output defaults to WebVTT for any mapped subtitle stream, which
+    # only supports text-to-text conversion — a bitmap format (PGS/VobSub, common on
+    # Blu-ray rips) hits this and crashes outright, confirmed against a real
+    # broadcast. Unlike the map-failure pattern above, this message doesn't quote
+    # which stream caused it, so there's nothing more specific to clear than
+    # "subtitles" as a whole.
+    _SUBTITLE_ENCODING_FAILURE = "subtitle encoding currently only possible from text to text or bitmap to bitmap"
+
     async def _retry_without_broken_language_maps(
         self,
     ) -> asyncio.subprocess.Process:
         """
-        Give self.process a brief window to fail on FFmpeg's option parsing (happens
-        near-instantly, before any encoding, when a `-map 0:X:m:language:YY` matches
-        zero streams of type X) and, if it does, clear whichever language caused it
-        and respawn. Loops up to twice since a single broadcast can hit this on the
-        audio map, the subtitle map, or both (e.g. an audio-only source with both
-        preferred_audio_language and a subtitle language configured) — the first
-        failure only reveals one bad map at a time.
+        Give self.process a brief window to fail near-instantly, before any real
+        encoding, on either of two known-recoverable FFmpeg failures, and retry
+        without whichever part caused it:
 
-        FFmpeg's own error message quotes the exact map spec that failed, so which
-        language to clear is read from stderr rather than assumed — an earlier
-        version of this always blamed the audio language, which silently failed to
-        fix subtitle-map failures and looked like the retry "didn't work".
+        1. A `-map 0:X:m:language:YY` metadata specifier matching zero streams of
+           type X (FFmpeg's option parsing rejects this outright rather than
+           degrading gracefully) — clears whichever of preferred_audio_language /
+           subtitle_language caused it, read from FFmpeg's own error message
+           (which quotes the exact map spec) rather than assumed.
+        2. A mapped subtitle stream that's a bitmap format FFmpeg's WebVTT encoder
+           can't convert — disables subtitles entirely, since the failure message
+           doesn't identify which stream caused it.
+
+        Loops up to three times since a single broadcast can hit more than one of
+        these across the audio map, the subtitle map, and the subtitle codec — each
+        failure only reveals one broken piece at a time.
         """
-        for _ in range(2):
+        for _ in range(3):
             try:
                 await asyncio.wait_for(self.process.wait(), timeout=1.5)
             except asyncio.TimeoutError:
@@ -347,34 +457,50 @@ class NetworkBroadcastProcess:
             stderr = b""
             if self.process.stderr:
                 stderr = await self.process.stderr.read()
+            stderr_text = stderr.decode(errors="ignore")
 
-            match = self._MAP_FAILURE_PATTERN.search(stderr.decode(errors="ignore"))
-            if not match:
-                # Exited for some other reason — leave it for the normal failure path.
-                return self.process
-
-            bad_map = match.group(1)
-
-            if bad_map.startswith("0:a:") and self.config.preferred_audio_language:
+            if self._SUBTITLE_ENCODING_FAILURE in stderr_text.lower():
                 logger.warning(
-                    f"Broadcast {self.network_id}: preferred audio language "
-                    f"'{self.config.preferred_audio_language}' matched no audio stream "
-                    f"in the source (FFmpeg rejected '{bad_map}'); retrying with the "
-                    "default audio track."
+                    f"Broadcast {self.network_id}: mapped subtitle stream is a bitmap "
+                    "format (e.g. PGS/VobSub) that FFmpeg cannot convert to WebVTT; "
+                    "disabling subtitles for this broadcast."
                 )
-                self.config.preferred_audio_language = None
-            elif bad_map.startswith("0:s:") and self.config.subtitle_language:
-                logger.warning(
-                    f"Broadcast {self.network_id}: subtitle language "
-                    f"'{self.config.subtitle_language}' matched no subtitle stream in "
-                    f"the source (FFmpeg rejected '{bad_map}'); retrying without "
-                    "embedded subtitle language matching."
-                )
+                self.config.subtitles_enabled = False
                 self.config.subtitle_language = None
             else:
-                # A map failure we don't have a specific fallback for — leave it for
-                # the normal failure path rather than retrying blindly.
-                return self.process
+                match = self._MAP_FAILURE_PATTERN.search(stderr_text)
+                if not match:
+                    # Exited for some other reason — leave it for the normal failure path.
+                    return self.process
+
+                bad_map = match.group(1)
+
+                if bad_map.startswith("0:a:") and self.config.preferred_audio_language:
+                    logger.warning(
+                        f"Broadcast {self.network_id}: preferred audio language "
+                        f"'{self.config.preferred_audio_language}' matched no audio "
+                        f"stream in the source (FFmpeg rejected '{bad_map}'); retrying "
+                        "with the default audio track."
+                    )
+                    self.config.preferred_audio_language = None
+                elif (
+                    # Matches "N:s:..." for any input index N, not just "0:s:" —
+                    # embedded subtitles are mapped from their own second,
+                    # un-throttled input (see add_source_input's realtime note),
+                    # so a genuine failure quotes "1:s:m:language:XX", not "0:s:...".
+                    re.match(r"^\d+:s:", bad_map) and self.config.subtitle_language
+                ):
+                    logger.warning(
+                        f"Broadcast {self.network_id}: subtitle language "
+                        f"'{self.config.subtitle_language}' matched no subtitle stream "
+                        f"in the source (FFmpeg rejected '{bad_map}'); retrying without "
+                        "embedded subtitle language matching."
+                    )
+                    self.config.subtitle_language = None
+                else:
+                    # A map failure we don't have a specific fallback for — leave it for
+                    # the normal failure path rather than retrying blindly.
+                    return self.process
 
             cmd = self._build_ffmpeg_command()
             logger.info(f"Restarting broadcast {self.network_id}: {' '.join(cmd)}")
@@ -429,12 +555,18 @@ class NetworkBroadcastProcess:
                 *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE
             )
 
-            # FFmpeg's `-map 0:X:m:language:YY` fails option parsing near-instantly
-            # ("Invalid argument") when zero streams of type X match language YY.
-            # Give it a brief window to hit that failure and, if it does, retry
-            # without whichever language caused it so the broadcast still starts
-            # instead of failing outright.
-            if self.config.preferred_audio_language or self.config.subtitle_language:
+            # Give the process a brief window to hit either of two known-recoverable
+            # failures — a `-map 0:X:m:language:YY` matching zero streams, or a mapped
+            # subtitle stream FFmpeg's WebVTT encoder can't convert (bitmap formats) —
+            # and retry without whichever part caused it, so the broadcast still
+            # starts instead of failing outright. subtitles_enabled covers the plain
+            # `-map 0:s?` case (no language/position preference) too, since that can
+            # still hit a bitmap-only subtitle stream in Local (transcode) mode.
+            if (
+                self.config.preferred_audio_language
+                or self.config.subtitle_language
+                or self.config.subtitles_enabled
+            ):
                 self.process = await self._retry_without_broken_language_maps()
 
             self.started_at = datetime.now(timezone.utc)
@@ -834,10 +966,16 @@ class NetworkBroadcastProcess:
         return path if os.path.exists(path) else None
 
     def get_segment_path(self, filename: str) -> Optional[str]:
-        """Get path to a specific segment file."""
+        """Get path to a specific segment or sub-playlist file.
+
+        Covers .ts (video segments), .vtt (WebVTT subtitle segments), and .m3u8
+        (the subtitle sub-playlist FFmpeg auto-derives, and the video sub-playlist
+        the editor's hls-variant route also fetches through this same endpoint) —
+        not just .ts, which this used to hard-code to before subtitle support.
+        """
         # Sanitize filename to prevent directory traversal
         safe_filename = os.path.basename(filename)
-        if not safe_filename.endswith(".ts"):
+        if not safe_filename.endswith((".ts", ".vtt", ".m3u8")):
             return None
 
         path = os.path.join(self.hls_dir, safe_filename)
@@ -1100,10 +1238,11 @@ class BroadcastManager:
             return None
 
     def get_segment_path(self, network_id: str, filename: str) -> Optional[str]:
-        """Get path to a segment file for a network."""
+        """Get path to a segment or sub-playlist file for a network — see
+        NetworkBroadcastProcess.get_segment_path() for which extensions and why."""
         # Sanitize filename
         safe_filename = os.path.basename(filename)
-        if not safe_filename.endswith(".ts"):
+        if not safe_filename.endswith((".ts", ".vtt", ".m3u8")):
             return None
 
         # Check active broadcast first

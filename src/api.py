@@ -2893,19 +2893,33 @@ async def get_broadcast_playlist(network_id: str) -> Response:
 @app.get("/broadcast/{network_id}/segment/{filename}")
 async def get_broadcast_segment(network_id: str, filename: str) -> FileResponse:
     """
-    Serve a segment file for a network broadcast.
+    Serve a segment or sub-playlist file for a network broadcast.
 
-    Segments are served with caching headers since they are immutable
-    once created.
+    .ts/.vtt segments are immutable once written, so they're cached aggressively.
+    .m3u8 sub-playlists (the video/subtitle variants the editor's hls-variant route
+    fetches through this same endpoint) are live — FFmpeg keeps rewriting them as
+    new segments land — so they must never be cached, same as the top-level
+    live.m3u8 endpoint; caching them would freeze a player on a stale segment list.
     """
     segment_path = broadcast_manager.get_segment_path(network_id, filename)
     if segment_path is None or not os.path.exists(segment_path):
         raise HTTPException(status_code=404, detail="Segment not found")
+
+    if filename.endswith(".m3u8"):
+        media_type = "application/vnd.apple.mpegurl"
+        cache_control = "no-cache, no-store, must-revalidate"
+    elif filename.endswith(".vtt"):
+        media_type = "text/vtt"
+        cache_control = "max-age=86400"
+    else:
+        media_type = "video/MP2T"
+        cache_control = "max-age=86400"
+
     return FileResponse(
         segment_path,
-        media_type="video/MP2T",
+        media_type=media_type,
         headers={
-            "Cache-Control": "max-age=86400",  # Segments are immutable
+            "Cache-Control": cache_control,
             "Access-Control-Allow-Origin": "*",
         },
     )

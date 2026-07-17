@@ -118,6 +118,13 @@ class Settings(BaseSettings):
     # seconds - cooldown after hitting max start retries before allowing auto-retry
     BROADCAST_START_RETRY_COOLDOWN: float = 15.0
     BROADCAST_START_FAILURE_GRACE: float = 3.0  # seconds
+    # Seconds to shift an embedded subtitle's second, un-throttled input via
+    # -itsoffset to keep it in sync with the primary input's dialogue. The two
+    # inputs independently zero their own -ss landing point, so a real
+    # connection/timing gap between them shows up as a constant subtitle
+    # lead/lag. Not necessarily universal across deployments — tune per
+    # environment if subtitles are consistently early/late by a fixed amount.
+    BROADCAST_SUBTITLE_SYNC_OFFSET_SECONDS: float = 1.0
 
     # API Authentication
     API_TOKEN: Optional[str] = None

@@ -1,5 +1,7 @@
 """Tests for preferred_audio_language and subtitles_enabled in broadcast FFmpeg commands."""
 
+from unittest.mock import patch
+
 from src.broadcast_manager import BroadcastConfig, NetworkBroadcastProcess
 
 
@@ -286,6 +288,19 @@ def test_itsoffset_compensates_embedded_subtitle_second_input():
     assert "-avoid_negative_ts" in cmd
     assert cmd[cmd.index("-avoid_negative_ts") + 1] == "make_zero"
     assert cmd.index("-avoid_negative_ts") > input_indices[1]
+
+
+def test_itsoffset_respects_settings_override():
+    """The 1.0s default isn't necessarily universal (see
+    BROADCAST_SUBTITLE_SYNC_OFFSET_SECONDS in config.py) — a different
+    deployment's network/media-server timing could need a different value,
+    so it must be tunable via settings rather than hardcoded."""
+    with patch(
+        "src.broadcast_manager.settings.BROADCAST_SUBTITLE_SYNC_OFFSET_SECONDS",
+        2.25,
+    ):
+        cmd = _build_cmd(subtitles_enabled=True)
+    assert cmd[cmd.index("-itsoffset") + 1] == "2.25"
 
 
 def test_no_itsoffset_for_external_subtitle():

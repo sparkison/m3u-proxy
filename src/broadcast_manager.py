@@ -145,60 +145,71 @@ class NetworkBroadcastProcess:
             if hwaccel and hwaccel.lower() not in ("none", ""):
                 cmd.extend(["-hwaccel", hwaccel])
 
-        # Input-level seeking (BEFORE -i for accuracy)
-        if self.config.seek_seconds > 0:
-            cmd.extend(["-ss", str(self.config.seek_seconds)])
+        def add_source_input(url: str, seek_seconds: float, *, realtime: bool) -> None:
+            """Append an -i for `url`, matching this proxy's header/seek/reconnect
+            conventions.
 
-        # Real-time pacing - critical for live streaming
-        cmd.append("-re")
-
-        # Reconnection options for network streams
-        cmd.extend(
-            [
-                "-reconnect",
-                "1",
-                "-reconnect_streamed",
-                "1",
-                "-reconnect_delay_max",
-                "10",
-            ]
-        )
-
-        # Input URL
-        # If headers are provided explicitly in the BroadcastConfig, prefer them.
-        if (
-            getattr(self.config, "headers", None)
-            and isinstance(self.config.headers, dict)
-            and isinstance(self.config.stream_url, str)
-            and (
-                "://" in self.config.stream_url
-                and not self.config.stream_url.startswith("file://")
+            `realtime` controls whether `-re` precedes this input. Pass False for
+            a second, subtitle-only read of the same source: FFmpeg's `-re`
+            real-time governor paces the shared demux loop against wall-clock
+            time using EVERY mapped stream's packets, but a container's embedded
+            subtitle packets are often extremely sparse/bursty — confirmed
+            against a real broadcast, the governor's reported "lag" for the
+            subtitle stream climbed without bound (0.6s -> 50s+ over under a
+            minute), and since the demux loop is shared, that dragged video/audio
+            segment output down to a crawl too, even though only the subtitle
+            stream was the one falling behind. Reading the embedded subtitle
+            track from its own un-paced second input sidesteps the governor
+            entirely — verified against the same real broadcast, segment cadence
+            returned to normal immediately. This mirrors the external-subtitle
+            input below, which was never `-re`-throttled in the first place and
+            never hit this bug.
+            """
+            if seek_seconds > 0:
+                cmd.extend(["-ss", str(seek_seconds)])
+            if realtime:
+                cmd.append("-re")
+            cmd.extend(
+                [
+                    "-reconnect",
+                    "1",
+                    "-reconnect_streamed",
+                    "1",
+                    "-reconnect_delay_max",
+                    "10",
+                ]
             )
-        ):
-            try:
-                headers = []
-                for hk, hv in self.config.headers.items():
-                    # sanitize header names/values
-                    k = str(hk).replace("\r", "").replace("\n", "").strip()
-                    v = str(hv).replace("\r", "").replace("\n", "").strip()
-                    if not k:
-                        continue
-                    headers.append(f"{k}: {v}")
 
-                if headers:
-                    header_str = "\r\n".join(headers) + "\r\n"
-                    cmd.extend(["-headers", header_str, "-i", self.config.stream_url])
-                else:
-                    cmd.extend(["-i", self.config.stream_url])
-            except Exception as e:
-                logger.warning(f"Failed to construct headers for FFmpeg input: {e}")
-                cmd.extend(["-i", self.config.stream_url])
+            # If headers are provided explicitly in the BroadcastConfig, prefer them.
+            if (
+                getattr(self.config, "headers", None)
+                and isinstance(self.config.headers, dict)
+                and isinstance(url, str)
+                and ("://" in url and not url.startswith("file://"))
+            ):
+                try:
+                    headers = []
+                    for hk, hv in self.config.headers.items():
+                        # sanitize header names/values
+                        k = str(hk).replace("\r", "").replace("\n", "").strip()
+                        v = str(hv).replace("\r", "").replace("\n", "").strip()
+                        if not k:
+                            continue
+                        headers.append(f"{k}: {v}")
 
-        # If no input has been added by the header logic above, append it as a plain -i.
-        # This is a defensive measure to avoid malformed commands when headers are not
-        # provided and the URL is a simple network resource (e.g., Emby/Jellyfin stream.ts).
-        if "-i" not in cmd:
-            cmd.extend(["-i", self.config.stream_url])
+                    if headers:
+                        header_str = "\r\n".join(headers) + "\r\n"
+                        cmd.extend(["-headers", header_str, "-i", url])
+                        return
+                except Exception as e:
+                    logger.warning(f"Failed to construct headers for FFmpeg input: {e}")
+
+            cmd.extend(["-i", url])
+
+        # Primary input: video + audio (+ embedded subtitle, when nothing forces
+        # a second input for it). Real-time paced, since this governs the actual
+        # broadcast's live pacing.
+        add_source_input(self.config.stream_url, self.config.seek_seconds, realtime=True)
 
         # External subtitle as a second FFmpeg input (Emby sidecar file).
         # The seek offset is applied per-input: when subtitle_seek_seconds > 0 the
@@ -209,11 +220,20 @@ class NetworkBroadcastProcess:
             getattr(self.config, "subtitle_url", None)
             and self.config.subtitle_url.strip()
         )
+        # Type-relative input index the subtitle -map should address. Embedded
+        # subtitles need their own second input (see add_source_input's realtime
+        # note) whenever there's no external subtitle already covering it.
+        subtitle_input_index = 0
         if has_external_subtitle:
             sub_seek = getattr(self.config, "subtitle_seek_seconds", 0.0)
             if sub_seek and sub_seek > 0:
                 cmd.extend(["-ss", str(sub_seek)])
             cmd.extend(["-i", self.config.subtitle_url])
+        elif self.config.subtitles_enabled:
+            add_source_input(
+                self.config.stream_url, self.config.seek_seconds, realtime=False
+            )
+            subtitle_input_index = 1
 
         # Duration limiting for programme boundary
         if self.config.duration_seconds > 0:
@@ -246,26 +266,31 @@ class NetworkBroadcastProcess:
             cmd.extend(["-map", "0:a:0?"])
 
         # Subtitle mapping: external sidecar (input 1:s) takes precedence over
-        # embedded (0:s?) so we don't duplicate subtitle tracks when both exist.
-        # Embedded subtitles are language-aware (mirroring the audio mapping above)
-        # when subtitle_language is set, so a per-item override can pick a specific
-        # embedded track out of several rather than always getting the first one.
+        # embedded so we don't duplicate subtitle tracks when both exist. Embedded
+        # subtitles are read from their own un-throttled second input (see
+        # add_source_input's realtime note above) at subtitle_input_index, NOT
+        # from the primary input — mapping them from input 0 would re-subject
+        # them to the -re governor's shared demux loop and reintroduce the stall.
+        # Embedded subtitles are also language-aware (mirroring the audio mapping
+        # above) when subtitle_language is set, so a per-item override can pick a
+        # specific embedded track out of several rather than always the first one.
         if has_external_subtitle:
             cmd.extend(["-map", "1:s:0?"])
         elif self.config.subtitles_enabled:
             sub_lang = getattr(self.config, "subtitle_language", None)
+            sub_prefix = f"{subtitle_input_index}:s"
             if sub_lang and sub_lang.strip():
                 sub_lang = sub_lang.strip()
                 if sub_lang.isdigit():
                     # Per-item override — exact type-relative subtitle stream position.
                     # See the audio map above for why this uses a plain (gracefully
                     # optional) index specifier instead of the metadata form.
-                    cmd.extend(["-map", f"0:s:{sub_lang}?"])
+                    cmd.extend(["-map", f"{sub_prefix}:{sub_lang}?"])
                 else:
                     # No trailing '?' — see the audio map above for why.
-                    cmd.extend(["-map", f"0:s:m:language:{sub_lang}"])
+                    cmd.extend(["-map", f"{sub_prefix}:m:language:{sub_lang}"])
             else:
-                cmd.extend(["-map", "0:s?"])
+                cmd.extend(["-map", f"{sub_prefix}?"])
 
         # Codec selection
         if self.config.transcode:
@@ -294,10 +319,19 @@ class NetworkBroadcastProcess:
             cmd.extend(["-ac", "2"])  # Force stereo output
         else:
             cmd.extend(["-c:v", "copy", "-c:a", "copy"])
-            # Subtitle codec: copy when passthrough (preserves SRT/ASS/VTT as-is);
-            # when transcoding, the HLS muxer auto-selects webvtt for the .vtt segments.
-            if has_external_subtitle or self.config.subtitles_enabled:
-                cmd.extend(["-c:s", "copy"])
+            # Subtitle codec is deliberately left unspecified here, even in this
+            # video/audio-passthrough branch: HLS's .vtt segments must actually be
+            # WebVTT. `-c:s copy` was tried here previously, under the assumption
+            # that it "preserves" the source subtitle format the same way -c:v/-c:a
+            # copy do — but a source in SRT/ASS copied as-is produces bytes that
+            # merely look like WebVTT (SRT's comma decimal separator instead of a
+            # period, no "WEBVTT" header, etc.), which some players parse leniently
+            # enough to render the very first cue and then silently drop every
+            # cue after it — the exact "one line of dialogue, then nothing" bug
+            # reported live. Leaving -c:s unset lets FFmpeg's HLS muxer apply its
+            # own default (real webvtt transcoding) regardless of the video/audio
+            # copy mode, identical to what already happens in the transcode branch
+            # above.
 
         # Tag the external subtitle's language so the HLS variant carries metadata
         # (DEFAULT=NO/AUTOSELECT=YES is flipped by NetworkHlsController on the Laravel
@@ -404,7 +438,14 @@ class NetworkBroadcastProcess:
                         "with the default audio track."
                     )
                     self.config.preferred_audio_language = None
-                elif bad_map.startswith("0:s:") and self.config.subtitle_language:
+                elif (
+                    # Matches "N:s:..." for any input index N, not just "0:s:" —
+                    # embedded subtitles are mapped from their own second,
+                    # un-throttled input (see add_source_input's realtime note),
+                    # so a genuine failure quotes "1:s:m:language:XX", not "0:s:...".
+                    re.match(r"^\d+:s:", bad_map)
+                    and self.config.subtitle_language
+                ):
                     logger.warning(
                         f"Broadcast {self.network_id}: subtitle language "
                         f"'{self.config.subtitle_language}' matched no subtitle stream "

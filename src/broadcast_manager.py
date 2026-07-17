@@ -120,7 +120,8 @@ class NetworkBroadcastProcess:
     def __init__(self, config: BroadcastConfig, hls_base_dir: str):
         self.config = config
         self.network_id = config.network_id
-        self.hls_dir = os.path.join(hls_base_dir, f"broadcast_{config.network_id}")
+        self.hls_dir = os.path.join(
+            hls_base_dir, f"broadcast_{config.network_id}")
         self.process: Optional[asyncio.subprocess.Process] = None
         self.status = "starting"
         self.current_segment_number = config.segment_start_number
@@ -133,6 +134,24 @@ class NetworkBroadcastProcess:
         self._bytes_written: int = 0  # Cumulative bytes across all segments ever seen
         # Segment filenames already counted
         self._seen_segments: Set[str] = set()
+
+    # Confirmed live (Plex, via Safari): the embedded-subtitle second input's
+    # cues consistently show up ~1s EARLY relative to the dialogue they belong
+    # to (each input independently zeroes its own -ss landing point to
+    # timestamp 0, and the subtitle-only input's landing point leads the
+    # primary's by this small, constant amount). A positive -itsoffset on that
+    # input delays its local zero point by the same amount, cancelling the
+    # lead directly. Tuned empirically: 1.5 overcorrected (subs then ran late),
+    # 1.0 lines up correctly.
+    #
+    # An earlier attempt used -copyts to preserve each input's true source
+    # timestamps instead (making the gap explicit rather than compensating for
+    # it blindly) but had to be reverted: -copyts also disables FFmpeg's normal
+    # timestamp-discontinuity sanitization, which this live Plex source
+    # apparently relies on — confirmed live, it broke playback outright and
+    # left the proxy stuck retry-looping. Plain -itsoffset needs none of that;
+    # it only shifts one input's local timeline, sanitization included.
+    _SUBTITLE_SYNC_OFFSET_SECONDS = 1.0
 
     def _build_ffmpeg_command(self) -> List[str]:
         """Build the FFmpeg command for HLS broadcast output."""
@@ -202,14 +221,16 @@ class NetworkBroadcastProcess:
                         cmd.extend(["-headers", header_str, "-i", url])
                         return
                 except Exception as e:
-                    logger.warning(f"Failed to construct headers for FFmpeg input: {e}")
+                    logger.warning(
+                        f"Failed to construct headers for FFmpeg input: {e}")
 
             cmd.extend(["-i", url])
 
         # Primary input: video + audio (+ embedded subtitle, when nothing forces
         # a second input for it). Real-time paced, since this governs the actual
         # broadcast's live pacing.
-        add_source_input(self.config.stream_url, self.config.seek_seconds, realtime=True)
+        add_source_input(self.config.stream_url,
+                         self.config.seek_seconds, realtime=True)
 
         # External subtitle as a second FFmpeg input (Emby sidecar file).
         # The seek offset is applied per-input: when subtitle_seek_seconds > 0 the
@@ -230,6 +251,10 @@ class NetworkBroadcastProcess:
                 cmd.extend(["-ss", str(sub_seek)])
             cmd.extend(["-i", self.config.subtitle_url])
         elif self.config.subtitles_enabled:
+            # See _SUBTITLE_SYNC_OFFSET_SECONDS above: cancels the ~1.5s lag
+            # confirmed live between this input's cues and the dialogue they
+            # belong to.
+            cmd.extend(["-itsoffset", str(self._SUBTITLE_SYNC_OFFSET_SECONDS)])
             add_source_input(
                 self.config.stream_url, self.config.seek_seconds, realtime=False
             )
@@ -311,7 +336,8 @@ class NetworkBroadcastProcess:
 
             # Audio codec and bitrate
             audio_codec = self.config.audio_codec or "aac"
-            cmd.extend(["-c:a", audio_codec, "-b:a", f"{self.config.audio_bitrate}k"])
+            cmd.extend(["-c:a", audio_codec, "-b:a",
+                       f"{self.config.audio_bitrate}k"])
 
             # Force standard broadcast audio settings to prevent sample rate mismatches
             # that cause "deep/slow" audio playback issues
@@ -337,7 +363,8 @@ class NetworkBroadcastProcess:
         # (DEFAULT=NO/AUTOSELECT=YES is flipped by NetworkHlsController on the Laravel
         # side so the subtitle is available-but-not-forced).
         if has_external_subtitle and getattr(self.config, "subtitle_language", None):
-            cmd.extend(["-metadata:s:s:0", f"language={self.config.subtitle_language}"])
+            cmd.extend(
+                ["-metadata:s:s:0", f"language={self.config.subtitle_language}"])
 
         # HLS output configuration
         cmd.extend(["-f", "hls"])
@@ -364,6 +391,12 @@ class NetworkBroadcastProcess:
         segment_pattern = os.path.join(self.hls_dir, "live%06d.ts")
         cmd.extend(["-hls_segment_filename", segment_pattern])
 
+        # The negative -itsoffset above can produce a negative starting
+        # timestamp on the subtitle input; this keeps the HLS muxer from
+        # choking on it at the very start of the broadcast.
+        if subtitle_input_index == 1:
+            cmd.extend(["-avoid_negative_ts", "make_zero"])
+
         # Output playlist
         playlist_path = os.path.join(self.hls_dir, "live.m3u8")
         cmd.append(playlist_path)
@@ -372,7 +405,8 @@ class NetworkBroadcastProcess:
 
     # Matches FFmpeg's option-parsing failure for a `-map` value that matches zero
     # streams, e.g. Failed to set value '0:a:m:language:eng' for option 'map': Invalid argument
-    _MAP_FAILURE_PATTERN = re.compile(r"Failed to set value '([^']*)' for option 'map'")
+    _MAP_FAILURE_PATTERN = re.compile(
+        r"Failed to set value '([^']*)' for option 'map'")
 
     # FFmpeg's HLS output defaults to WebVTT for any mapped subtitle stream, which
     # only supports text-to-text conversion — a bitmap format (PGS/VobSub, common on
@@ -459,7 +493,8 @@ class NetworkBroadcastProcess:
                     return self.process
 
             cmd = self._build_ffmpeg_command()
-            logger.info(f"Restarting broadcast {self.network_id}: {' '.join(cmd)}")
+            logger.info(
+                f"Restarting broadcast {self.network_id}: {' '.join(cmd)}")
 
             self.process = await asyncio.create_subprocess_exec(
                 *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE
@@ -475,7 +510,8 @@ class NetworkBroadcastProcess:
             try:
                 os.chmod(self.hls_dir, 0o755)
             except Exception as e:
-                logger.warning(f"Failed to set permissions on {self.hls_dir}: {e}")
+                logger.warning(
+                    f"Failed to set permissions on {self.hls_dir}: {e}")
 
             # On a fresh start (not a transition), remove any leftover segments/playlists
             # so FFmpeg's rolling-window deletion doesn't hit files it didn't write.
@@ -505,7 +541,8 @@ class NetworkBroadcastProcess:
                     )
 
             cmd = self._build_ffmpeg_command()
-            logger.info(f"Starting broadcast {self.network_id}: {' '.join(cmd)}")
+            logger.info(
+                f"Starting broadcast {self.network_id}: {' '.join(cmd)}")
 
             self.process = await asyncio.create_subprocess_exec(
                 *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE
@@ -648,7 +685,8 @@ class NetworkBroadcastProcess:
 
                         self.error_message = line_str
                         self.status = "failed"
-                        logger.error(f"Broadcast {self.network_id} error: {line_str}")
+                        logger.error(
+                            f"Broadcast {self.network_id} error: {line_str}")
                         await self._send_callback(
                             "broadcast_failed",
                             {"error": line_str, "error_type": "input_error"},
@@ -668,12 +706,14 @@ class NetworkBroadcastProcess:
                         or "warning" in line_lower
                         or "failed" in line_lower
                     ):
-                        logger.warning(f"Broadcast {self.network_id}: {line_str}")
+                        logger.warning(
+                            f"Broadcast {self.network_id}: {line_str}")
 
         except asyncio.CancelledError:
             pass
         except Exception as e:
-            logger.error(f"Error reading FFmpeg stderr for {self.network_id}: {e}")
+            logger.error(
+                f"Error reading FFmpeg stderr for {self.network_id}: {e}")
 
     async def _monitor_process(self):
         """Monitor FFmpeg process and send callback when it exits."""
@@ -767,7 +807,8 @@ class NetworkBroadcastProcess:
                         f"Callback sent for broadcast {self.network_id}: {event}"
                     )
         except Exception as e:
-            logger.error(f"Error sending callback for broadcast {self.network_id}: {e}")
+            logger.error(
+                f"Error sending callback for broadcast {self.network_id}: {e}")
 
     async def _poll_bytes(self, interval: float = 1.0) -> None:
         """
@@ -980,7 +1021,8 @@ class BroadcastManager:
         self.broadcast_gc_enabled = bool(
             getattr(settings, "BROADCAST_GC_ENABLED", True)
         )
-        self.broadcast_gc_interval = int(getattr(settings, "HLS_GC_INTERVAL", 600))
+        self.broadcast_gc_interval = int(
+            getattr(settings, "HLS_GC_INTERVAL", 600))
         self.broadcast_gc_age_threshold = int(
             getattr(settings, "HLS_GC_AGE_THRESHOLD", 3600)
         )
@@ -988,7 +1030,8 @@ class BroadcastManager:
 
         # Ensure base directory exists
         os.makedirs(self.hls_base_dir, exist_ok=True)
-        logger.info(f"BroadcastManager initialized with base dir: {self.hls_base_dir}")
+        logger.info(
+            f"BroadcastManager initialized with base dir: {self.hls_base_dir}")
 
     async def start_broadcast(self, config: BroadcastConfig) -> BroadcastStatus:
         """
@@ -1003,7 +1046,8 @@ class BroadcastManager:
             # Check if broadcast already running
             if network_id in self.broadcasts:
                 existing = self.broadcasts[network_id]
-                logger.info(f"Transitioning broadcast {network_id} to new programme")
+                logger.info(
+                    f"Transitioning broadcast {network_id} to new programme")
 
                 # Stop existing process gracefully
                 final_segment = await existing.stop(graceful=True)
@@ -1055,7 +1099,8 @@ class BroadcastManager:
                     del self._start_attempts[network_id]
                     attempts = None
                 else:
-                    seconds_left = int(self.START_RETRY_COOLDOWN - (now - last))
+                    seconds_left = int(
+                        self.START_RETRY_COOLDOWN - (now - last))
                     logger.error(
                         f"Exceeded max start retries ({self.MAX_START_RETRIES}) for broadcast {network_id}; refusing to start for another {seconds_left}s."
                     )
@@ -1177,7 +1222,8 @@ class BroadcastManager:
                     with open(playlist_path, "r") as f:
                         return f.read()
                 except Exception as e:
-                    logger.error(f"Error reading playlist for {network_id}: {e}")
+                    logger.error(
+                        f"Error reading playlist for {network_id}: {e}")
             return None
 
         process = self.broadcasts[network_id]
@@ -1224,19 +1270,22 @@ class BroadcastManager:
                 del self.broadcasts[network_id]
 
             # Remove directory
-            broadcast_dir = os.path.join(self.hls_base_dir, f"broadcast_{network_id}")
+            broadcast_dir = os.path.join(
+                self.hls_base_dir, f"broadcast_{network_id}")
             if os.path.exists(broadcast_dir):
                 try:
                     import shutil
 
                     shutil.rmtree(broadcast_dir)
-                    logger.info(f"Cleaned up broadcast directory: {broadcast_dir}")
+                    logger.info(
+                        f"Cleaned up broadcast directory: {broadcast_dir}")
                     # Clear start attempts on successful cleanup
                     if network_id in self._start_attempts:
                         del self._start_attempts[network_id]
                     return True
                 except Exception as e:
-                    logger.error(f"Error cleaning up broadcast {network_id}: {e}")
+                    logger.error(
+                        f"Error cleaning up broadcast {network_id}: {e}")
                     return False
 
             return True
@@ -1321,7 +1370,8 @@ class BroadcastManager:
                     f"Broadcast GC: removed stale directory {full_path} (age={age:.0f}s)"
                 )
             except Exception as e:
-                logger.error(f"Broadcast GC: failed to remove {full_path}: {e}")
+                logger.error(
+                    f"Broadcast GC: failed to remove {full_path}: {e}")
 
         if dirs_removed or skipped_too_young:
             logger.info(

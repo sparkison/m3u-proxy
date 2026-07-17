@@ -263,3 +263,42 @@ def test_empty_subtitle_url_ignored():
     input_count = cmd.count("-i")
     assert input_count == 1
     assert "1:s:0?" not in cmd
+
+
+def test_itsoffset_compensates_embedded_subtitle_second_input():
+    """Confirmed live (Plex, via Safari): the embedded-subtitle second input's
+    cues consistently show up ~1s early relative to the dialogue they belong
+    to, since it's a separate, independently-zeroed input from the primary
+    (see add_source_input's realtime note). A positive -itsoffset delays this
+    input's local zero point by the same amount, cancelling the lead — tuned
+    empirically (1.5 overcorrected to late, 1.0 lines up correctly). An
+    earlier attempt at this used -copyts + -avoid_negative_ts instead, but
+    -copyts also disables FFmpeg's timestamp-discontinuity sanitization, which
+    broke live playback entirely against a real Plex source."""
+    cmd = _build_cmd(subtitles_enabled=True)
+    assert "-copyts" not in cmd
+    assert "-itsoffset" in cmd
+    assert cmd[cmd.index("-itsoffset") + 1] == "1.0"
+    input_indices = [i for i, v in enumerate(cmd) if v == "-i"]
+    itsoffset_idx = cmd.index("-itsoffset")
+    # -itsoffset must precede the second (subtitle) input, not the primary one.
+    assert input_indices[0] < itsoffset_idx < input_indices[1]
+    assert "-avoid_negative_ts" in cmd
+    assert cmd[cmd.index("-avoid_negative_ts") + 1] == "make_zero"
+    assert cmd.index("-avoid_negative_ts") > input_indices[1]
+
+
+def test_no_itsoffset_for_external_subtitle():
+    """External subtitle sidecars are a full-file fetch (byte-precise local
+    seek), not a live re-connect, so they aren't subject to the same landing
+    gap and get no compensating -itsoffset."""
+    cmd = _build_cmd(subtitle_url="http://example.com/subs.srt")
+    assert "-itsoffset" not in cmd
+    assert "-avoid_negative_ts" not in cmd
+
+
+def test_no_itsoffset_when_subtitles_disabled():
+    cmd = _build_cmd()
+    assert "-itsoffset" not in cmd
+    assert "-avoid_negative_ts" not in cmd
+    assert "-copyts" not in cmd

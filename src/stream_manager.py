@@ -1712,12 +1712,21 @@ class StreamManager:
                         broke_for_failover = False
                         while True:
                             try:
-                                # Read next chunk with a per-chunk timeout to detect silent stalls
-                                chunk_timeout = (
-                                    settings.LIVE_CHUNK_TIMEOUT_SECONDS
-                                    if hasattr(settings, "LIVE_CHUNK_TIMEOUT_SECONDS")
-                                    else 5.0
-                                )
+                                # Read next chunk with a per-chunk timeout to detect silent stalls.
+                                # VOD gets a shorter timeout so a stalled upstream (e.g. re-seeking
+                                # after a Range request) reconnects before the client gives up.
+                                if stream_info.is_vod:
+                                    chunk_timeout = getattr(
+                                        settings, "VOD_CHUNK_TIMEOUT_SECONDS", 5.0
+                                    )
+                                else:
+                                    chunk_timeout = (
+                                        settings.LIVE_CHUNK_TIMEOUT_SECONDS
+                                        if hasattr(
+                                            settings, "LIVE_CHUNK_TIMEOUT_SECONDS"
+                                        )
+                                        else 5.0
+                                    )
                                 if chunk_timeout and chunk_timeout > 0:
                                     try:
                                         chunk = await asyncio.wait_for(

@@ -167,6 +167,13 @@ class Settings(BaseSettings):
     # and trigger existing failover/reconnect logic instead of hanging.
     LIVE_CHUNK_TIMEOUT_SECONDS: float = 15.0
 
+    # Per-chunk read timeout (seconds) for VOD/direct-play streams specifically.
+    # Kept shorter than LIVE_CHUNK_TIMEOUT_SECONDS because VOD upstream stalls
+    # (e.g. a media server re-seeking after a Range request) should trigger the
+    # byte-resume reconnect quickly — most players give up on a silent
+    # connection well before the live-tuned 15s grace period elapses.
+    VOD_CHUNK_TIMEOUT_SECONDS: float = 5.0
+
     # Maximum failover attempts before giving up on a stream.
     # Set to 0 to try all configured failover URLs (no limit).
     # Default: 0 (try every failover URL before giving up)

@@ -1354,11 +1354,17 @@ def _start_disconnect_monitor(
     """Start a background task that detects ASGI client disconnect and sets cancel_event.
 
     When a client disconnects, the ASGI receive channel delivers an
-    ``http.disconnect`` message.  We set the connection's cancel_event AND
-    directly signal broadcast subscribers.  We cannot rely on the streaming
-    generator to reach post-loop cleanup because Starlette stops iterating
-    the generator once the client is gone — the generator stays suspended at
-    ``yield`` and only its ``finally`` blocks run during GC.
+    ``http.disconnect`` message.  We set the connection's cancel_event,
+    directly signal broadcast subscribers, AND directly call cleanup_client().
+    We cannot rely on the streaming generator to reach post-loop cleanup
+    because Starlette stops iterating the generator once the client is gone —
+    the generator stays suspended at ``yield`` and only its ``finally``
+    blocks run during GC. Without the direct cleanup_client() call here, the
+    client record lingers (still counted as connected) until the periodic
+    sweep evicts it — up to CLIENT_TIMEOUT + the sweep interval later (tens
+    of seconds), which is especially visible on VOD where the read loop can
+    go a while between chunks and rarely gets a chance to notice cancel_event
+    itself.
 
     Set DISABLE_ASGI_DISCONNECT_MONITOR=true to skip this and rely solely on
     the periodic cleanup / chunk-timeout paths (useful for testing that path
@@ -1403,6 +1409,18 @@ def _start_disconnect_monitor(
                             f"stream {stream_id} (primary was {client_id})"
                         )
                         sm._signal_subscribers_end(stream_id)
+
+                    # Remove the client immediately instead of waiting for the
+                    # generator to unwind (it may never resume) or the periodic
+                    # sweep (up to CLIENT_TIMEOUT + ~30s later). Safe to call
+                    # even if the generator's own cleanup also runs afterward —
+                    # cleanup_client() is a no-op once the client is already gone.
+                    try:
+                        await sm.cleanup_client(client_id, conn_id)
+                    except Exception:
+                        logger.exception(
+                            f"Error cleaning up client {client_id} after ASGI disconnect"
+                        )
 
                     return
         except Exception:
@@ -1511,6 +1529,17 @@ async def get_direct_stream(
                 )
             )
         else:
+            # Reusing an existing client record (e.g. a subsequent VOD Range
+            # request from a player doing sequential chunked GETs). Natural
+            # completion of a prior VOD range marks is_connected=False so
+            # capacity checks don't count it as active — but register_client()
+            # is skipped here, so nothing else would ever flip it back. Without
+            # this, client_count/is_active read 0 for the whole session after
+            # the first chunk, even though the player is still actively
+            # streaming and total_bytes_served keeps climbing.
+            reused_client = stream_manager.clients[client_id]
+            reused_client.is_connected = True
+            reused_client.last_access = datetime.now(timezone.utc)
             logger.debug(f"Reusing existing client {client_id} for stream {stream_id}")
 
         # Determine content type

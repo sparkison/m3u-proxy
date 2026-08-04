@@ -8,13 +8,13 @@ import logging
 import hashlib
 import subprocess
 import uuid
-from urllib.parse import unquote, urlparse
+from urllib.parse import unquote, urlparse, urljoin
 from typing import Optional, List, Dict, Literal
 from pydantic import BaseModel, field_validator
 from datetime import datetime, timezone
 import os
 
-from stream_manager import StreamManager
+from stream_manager import StreamManager, DashProcessor
 from events import EventManager
 from models import StreamEvent, EventType, WebhookConfig
 from config import settings, VERSION
@@ -65,6 +65,8 @@ def get_content_type(url: str) -> str:
         return "video/mp2t"
     elif path.endswith(".m3u8"):
         return "application/vnd.apple.mpegurl"
+    elif path.endswith(".mpd"):
+        return "application/dash+xml"
     elif path.endswith(".mp4"):
         return "video/mp4"
     elif path.endswith(".mkv"):
@@ -77,12 +79,19 @@ def get_content_type(url: str) -> str:
         return "application/octet-stream"
 
 
+def is_dash_stream(url: str) -> bool:
+    """Check if URL is a DASH (MPD) manifest"""
+    path = str(url).split("?", 1)[0].lower()
+    return path.endswith(".mpd")
+
+
 def is_direct_stream(url: str) -> bool:
-    """Check if URL is a direct stream (not HLS playlist)"""
+    """Check if URL is a direct stream (not HLS playlist, not DASH manifest)"""
     # Split off query string before checking extension
     path = str(url).split("?")[0].lower()
-    # M3U8 URLs are always HLS, even if /live/ appears in the path
-    if path.endswith(".m3u8"):
+    # M3U8 and MPD URLs are always routed to their own handlers, even if
+    # /live/ appears in the path
+    if path.endswith(".m3u8") or path.endswith(".mpd"):
         return False
     return (
         path.endswith((".ts", ".mp4", ".mkv", ".webm", ".avi"))
@@ -771,6 +780,17 @@ async def create_stream(request: StreamCreateRequest):
             silence_monitoring_grace_period=request.silence_monitoring_grace_period,
         )
 
+        # Determine the appropriate endpoint based on stream type
+        if is_dash_stream(request.url):
+            stream_endpoint = f"/dash/{stream_id}/manifest.mpd"
+            stream_type = "dash"
+        elif is_direct_stream(request.url):
+            stream_endpoint = f"/stream/{stream_id}"
+            stream_type = "direct"
+        else:
+            stream_endpoint = f"/hls/{stream_id}/playlist.m3u8"
+            stream_type = "hls"
+
         # Emit stream started event
         event = StreamEvent(
             event_type=EventType.STREAM_STARTED,
@@ -779,19 +799,11 @@ async def create_stream(request: StreamCreateRequest):
                 "primary_url": request.url,
                 "failover_urls": request.failover_urls or [],
                 "user_agent": request.user_agent,
-                "stream_type": "direct" if is_direct_stream(request.url) else "hls",
+                "stream_type": stream_type,
                 "metadata": request.metadata or {},
             },
         )
         await event_manager.emit_event(event)
-
-        # Determine the appropriate endpoint based on stream type
-        if is_direct_stream(request.url):
-            stream_endpoint = f"/stream/{stream_id}"
-            stream_type = "direct"
-        else:
-            stream_endpoint = f"/hls/{stream_id}/playlist.m3u8"
-            stream_type = "hls"
 
         response = {
             "stream_id": stream_id,
@@ -823,6 +835,18 @@ async def create_stream(request: StreamCreateRequest):
 async def create_transcode_stream(request: TranscodeCreateRequest):
     """Create a new transcoded stream with optional failover URLs and custom profile"""
     try:
+        # DASH sources are proxied for client-side playback only. We cannot
+        # know whether a manifest is DRM-protected without fetching it first,
+        # and FFmpeg cannot decrypt DRM-protected DASH content anyway, so
+        # transcoding of any DASH (.mpd) source is rejected outright rather
+        # than risk a confusing FFmpeg failure or, worse, a decryption-bypass
+        # attempt via ffmpeg decryption flags.
+        if is_dash_stream(request.url):
+            raise HTTPException(
+                status_code=400,
+                detail="Transcoding DASH (.mpd) sources is not supported; DASH streams are proxied for client-side playback only.",
+            )
+
         # --- Resolver path (streamlink / yt-dlp) ---
         if request.resolver:
             resolver_name = request.resolver  # "streamlink" or "ytdlp"
@@ -1346,6 +1370,136 @@ async def get_hls_segment_mp4(
 ):
     """Proxy fMP4 HLS init segment (EXT-X-MAP) or .mp4 segment file."""
     return await get_hls_segment(stream_id, request, client_id, url)
+
+
+@app.get("/dash/{stream_id}/manifest.mpd")
+async def get_dash_manifest(
+    request: Request,
+    stream_id: str = Depends(resolve_stream_id),
+    client_id: Optional[str] = Query(
+        None, description="Client ID (auto-generated if not provided)"
+    ),
+):
+    """Get DASH (MPD) manifest for a stream, with BaseURL rewritten through the proxy."""
+    try:
+        if not client_id:
+            client_info_data = get_client_info(request)
+            username_part = client_info_data.get("username") or ""
+            client_hash = hashlib.md5(
+                f"{client_info_data['ip_address']}-{client_info_data['user_agent']}-{stream_id}-{username_part}".encode()
+            ).hexdigest()[:16]
+            client_id = f"client_{client_hash}"
+
+        if (
+            client_id not in stream_manager.clients
+            or stream_manager.clients[client_id].stream_id != stream_id
+        ):
+            client_info_data = get_client_info(request)
+            await stream_manager.register_client(
+                client_id,
+                stream_id,
+                user_agent=client_info_data["user_agent"],
+                ip_address=client_info_data["ip_address"],
+                username=client_info_data.get("username"),
+            )
+
+        # Relative base URL so this works behind any reverse proxy, same
+        # approach as the HLS playlist route above.
+        root_path = getattr(settings, "ROOT_PATH", "")
+        base_proxy_url = f"{root_path}/dash/{stream_id}"
+
+        content = await stream_manager.get_dash_manifest_content(
+            stream_id, client_id, base_proxy_url
+        )
+
+        if content is None:
+            raise HTTPException(status_code=503, detail="Manifest not available")
+
+        logger.info(
+            f"Serving DASH manifest to client {client_id} for stream {stream_id}"
+        )
+
+        response = Response(content=content, media_type="application/dash+xml")
+        response.headers["X-Client-ID"] = client_id
+        response.headers["X-Stream-ID"] = stream_id
+        response.headers["Access-Control-Allow-Origin"] = "*"
+        response.headers["Access-Control-Allow-Methods"] = "GET, HEAD, OPTIONS"
+        response.headers["Access-Control-Allow-Headers"] = "*"
+        response.headers["Access-Control-Expose-Headers"] = "*"
+        return response
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error serving DASH manifest: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/dash/{stream_id}/segment/{encoded_base}/{path:path}")
+async def get_dash_segment_by_base(
+    stream_id: str,
+    encoded_base: str,
+    path: str,
+    request: Request,
+    client_id: str = Query(..., description="Client ID"),
+):
+    """Proxy a DASH segment resolved relative to a rewritten BaseURL directory.
+
+    DASH clients resolve SegmentTemplate/SegmentList paths against the
+    manifest's BaseURL per RFC 3986; since we rewrite BaseURL to point here,
+    the trailing `path` is exactly the relative reference the client resolved,
+    and we just need to re-join it with the original upstream directory.
+    """
+    try:
+        upstream_base = DashProcessor.decode_base(encoded_base)
+        segment_url = urljoin(upstream_base, path)
+
+        range_header = request.headers.get("range")
+
+        client_info_data = get_client_info(request)
+        await stream_manager.register_client(
+            client_id,
+            stream_id,
+            user_agent=client_info_data["user_agent"],
+            ip_address=client_info_data["ip_address"],
+            username=client_info_data.get("username"),
+        )
+
+        return await stream_manager.proxy_dash_segment(
+            stream_id, client_id, segment_url, range_header
+        )
+    except Exception as e:
+        logger.error(f"Error serving DASH segment: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/dash/{stream_id}/file")
+async def get_dash_file(
+    stream_id: str,
+    request: Request,
+    client_id: str = Query(..., description="Client ID"),
+    url: str = Query(..., description="The fully-qualified segment/init URL to proxy"),
+):
+    """Proxy a DASH segment/init-section that was already fully-qualified in the manifest."""
+    try:
+        segment_url = unquote(url)
+        range_header = request.headers.get("range")
+
+        client_info_data = get_client_info(request)
+        await stream_manager.register_client(
+            client_id,
+            stream_id,
+            user_agent=client_info_data["user_agent"],
+            ip_address=client_info_data["ip_address"],
+            username=client_info_data.get("username"),
+        )
+
+        return await stream_manager.proxy_dash_segment(
+            stream_id, client_id, segment_url, range_header
+        )
+    except Exception as e:
+        logger.error(f"Error serving DASH segment: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 def _start_disconnect_monitor(

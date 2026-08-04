@@ -6,13 +6,15 @@ while maintaining the shared buffer approach for HLS segments.
 
 import m3u8
 import asyncio
+import base64
 import httpx
 import logging
 import os
 import re
 import uuid
+import xml.etree.ElementTree as ET
 from typing import Dict, Optional, List, Set, Any
-from urllib.parse import urlparse, quote
+from urllib.parse import urlparse, urljoin, quote
 from datetime import datetime, timezone, timedelta
 from dataclasses import dataclass, field
 from fastapi import HTTPException
@@ -78,8 +80,12 @@ class StreamInfo:
     failover_event: asyncio.Event = field(default_factory=asyncio.Event)
     # Stream type detection
     is_hls: bool = False
+    is_dash: bool = False
     is_vod: bool = False
     is_live_continuous: bool = False
+    # DASH DRM detection - set once the manifest has been fetched and parsed;
+    # used to refuse FFmpeg transcoding of DRM-protected DASH content
+    is_encrypted: bool = False
     # HLS variant tracking - for variant playlists that are part of a master playlist
     parent_stream_id: Optional[str] = None
     is_variant_stream: bool = False
@@ -239,6 +245,110 @@ class M3U8Processor:
 
         kind = self._segment_kind(original_url)
         return f"{base_proxy_url}/segment.{kind}?url={encoded_url}&client_id={self.client_id}"
+
+
+class DashProcessor:
+    """Rewrites a DASH (MPD) manifest so segment requests route back through the proxy.
+
+    Unlike HLS, SegmentTemplate/SegmentList entries in a DASH manifest are
+    frequently URL *templates* (containing $Number$/$Time$/$RepresentationID$
+    placeholders) rather than fully-resolved URLs, so they can't be rewritten
+    into an opaque `?url=` query param the way HLS segments are. Instead this
+    rewrites only the manifest's BaseURL (inserting one if none exists) to
+    point at a proxy "directory" route. Per RFC 3986 relative-reference
+    resolution, DASH clients resolve every relative SegmentTemplate/SegmentList
+    path against that BaseURL, so they end up requesting the proxy directly
+    without any per-segment rewriting being necessary.
+    """
+
+    def __init__(
+        self,
+        base_url: str,
+        client_id: str,
+        user_agent: Optional[str] = None,
+        original_url: Optional[str] = None,
+    ):
+        self.base_url = base_url
+        self.client_id = client_id
+        self.user_agent = user_agent or settings.DEFAULT_USER_AGENT
+        self.original_url = original_url or base_url
+        self.is_encrypted = False
+
+    @staticmethod
+    def encode_base(absolute_base_url: str) -> str:
+        """Encode an absolute upstream directory URL into a single URL-safe path segment."""
+        return base64.urlsafe_b64encode(absolute_base_url.encode()).decode().rstrip("=")
+
+    @staticmethod
+    def decode_base(token: str) -> str:
+        """Reverse of encode_base."""
+        padded = token + "=" * (-len(token) % 4)
+        return base64.urlsafe_b64decode(padded.encode()).decode()
+
+    def _rewrite_base(self, absolute_base_url: str, base_proxy_url: str) -> str:
+        encoded = self.encode_base(absolute_base_url)
+        return f"{base_proxy_url}/segment/{encoded}/"
+
+    def _rewrite_absolute_url(self, absolute_url: str, base_proxy_url: str) -> str:
+        encoded_url = quote(absolute_url, safe="")
+        return f"{base_proxy_url}/file?url={encoded_url}&client_id={self.client_id}"
+
+    def process_manifest(
+        self, content: str, base_proxy_url: str, original_base_url: Optional[str] = None
+    ) -> str:
+        """Parse MPD XML and rewrite BaseURL / absolute segment references."""
+        try:
+            manifest_base = original_base_url or self.original_url
+            root = ET.fromstring(content)
+
+            ns_uri = None
+            if root.tag.startswith("{"):
+                ns_uri = root.tag[1:].split("}", 1)[0]
+                ET.register_namespace("", ns_uri)
+
+            def qn(tag: str) -> str:
+                return f"{{{ns_uri}}}{tag}" if ns_uri else tag
+
+            # DRM detection - do not log scheme/KID/PSSH contents, just the fact.
+            if root.find(f".//{qn('ContentProtection')}") is not None:
+                self.is_encrypted = True
+
+            found_base_url = False
+            for base_elem in root.iter(qn("BaseURL")):
+                text = (base_elem.text or "").strip()
+                if not text:
+                    continue
+                absolute = urljoin(manifest_base, text)
+                if text.lower().startswith(("http://", "https://")):
+                    base_elem.text = self._rewrite_base(absolute, base_proxy_url)
+                else:
+                    base_elem.text = self._rewrite_base(absolute, base_proxy_url)
+                found_base_url = True
+
+            if not found_base_url:
+                # No BaseURL anywhere in the manifest - relative SegmentTemplate/
+                # SegmentList entries resolve against the manifest's own request
+                # URI per the DASH spec, so inject one pointing back at the proxy.
+                new_base = ET.Element(qn("BaseURL"))
+                new_base.text = self._rewrite_base(manifest_base, base_proxy_url)
+                root.insert(0, new_base)
+
+            # Absolute (fully-qualified) segment references bypass BaseURL
+            # resolution entirely, so rewrite those individually.
+            for tag in ("SegmentURL", "Initialization"):
+                for elem in root.iter(qn(tag)):
+                    for attr in ("media", "sourceURL", "index"):
+                        value = elem.get(attr)
+                        if value and value.lower().startswith(("http://", "https://")):
+                            elem.set(
+                                attr, self._rewrite_absolute_url(value, base_proxy_url)
+                            )
+
+            xml_bytes = ET.tostring(root, encoding="unicode")
+            return f'<?xml version="1.0" encoding="UTF-8"?>\n{xml_bytes}'
+        except ET.ParseError as e:
+            logger.error(f"Error processing DASH manifest: {e}")
+            return content
 
 
 class StreamManager:
@@ -4176,6 +4286,227 @@ class StreamManager:
                         f"Failed to fetch playlist after {max_attempts} attempts. Last error: {last_error}"
                     )
                     return None
+
+    async def get_dash_manifest_content(
+        self, stream_id: str, client_id: str, base_proxy_url: str
+    ) -> Optional[str]:
+        """Fetch and rewrite a DASH (MPD) manifest, with failover support.
+
+        DASH manifests are proxied for client-side playback only (no FFmpeg
+        transcoding of the DASH output itself), so this mirrors only the
+        direct-fetch-with-failover branch of get_playlist_content, not the
+        pooled-transcoder branch.
+        """
+        if stream_id not in self.streams:
+            return None
+
+        stream_info = self.streams[stream_id]
+
+        has_failovers = bool(
+            stream_info.failover_resolver_url or stream_info.failover_urls
+        )
+        max_attempts = (
+            len(stream_info.failover_urls) + 1
+            if stream_info.failover_urls
+            else (10 if stream_info.failover_resolver_url else 1)
+        )
+        attempt = 0
+        last_error = None
+
+        while attempt < max_attempts:
+            try:
+                current_url = stream_info.current_url or stream_info.original_url
+                logger.info(
+                    f"Fetching DASH manifest from: {current_url} (attempt {attempt + 1}/{max_attempts})"
+                )
+                headers = {"User-Agent": stream_info.user_agent}
+                headers.update(stream_info.headers)
+                response = await self.http_client.get(current_url, headers=headers)
+                response.raise_for_status()
+
+                content = response.text
+                final_url = str(response.url)
+                stream_info.final_playlist_url = final_url
+
+                if (
+                    stream_info.use_sticky_session
+                    and current_url
+                    and final_url != current_url
+                ):
+                    stream_info.current_url = final_url
+
+                parsed_url = urlparse(final_url)
+                base_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
+                if parsed_url.path:
+                    path_parts = parsed_url.path.rsplit("/", 1)
+                    if len(path_parts) > 1:
+                        base_url += path_parts[0] + "/"
+                    else:
+                        base_url += "/"
+                else:
+                    base_url += "/"
+
+                processor = DashProcessor(
+                    base_proxy_url,
+                    client_id,
+                    stream_info.user_agent,
+                    final_url,
+                )
+                processed_content = processor.process_manifest(
+                    content, base_proxy_url, base_url
+                )
+                stream_info.is_encrypted = processor.is_encrypted
+
+                stream_info.last_access = datetime.now(timezone.utc)
+                if client_id in self.clients:
+                    now = datetime.now(timezone.utc)
+                    self.clients[client_id].last_access = now
+                    self.clients[client_id].last_data_time = now
+
+                return processed_content
+
+            except Exception as e:
+                last_error = e
+                logger.error(
+                    f"Error fetching DASH manifest for stream {stream_id}: {e}"
+                )
+                stream_info.error_count += 1
+
+                if isinstance(e, httpx.HTTPStatusError):
+                    stream_info.last_error_status_code = e.response.status_code
+
+                if has_failovers and attempt < max_attempts - 1:
+                    logger.info(
+                        f"Attempting failover for DASH manifest fetch (attempt {attempt + 1}/{max_attempts})"
+                    )
+                    failover_success = await self._try_update_failover_url(
+                        stream_id, f"dash_manifest_fetch_error_{type(e).__name__}"
+                    )
+                    if failover_success:
+                        attempt += 1
+                        continue
+
+                attempt += 1
+                if attempt >= max_attempts:
+                    logger.error(
+                        f"Failed to fetch DASH manifest after {max_attempts} attempts. Last error: {last_error}"
+                    )
+                    return None
+
+    @staticmethod
+    def _dash_file_content_type(segment_url: str) -> str:
+        """Infer the response Content-Type for a DASH segment/manifest-adjacent file."""
+        path = segment_url.split("?", 1)[0].lower()
+        if path.endswith((".m4s", ".cmfv", ".cmfa", ".cmft")):
+            return "video/iso.segment"
+        if path.endswith(".mp4") or path.endswith(".m4v") or path.endswith(".m4a"):
+            return "video/mp4"
+        if path.endswith(".aac"):
+            return "audio/aac"
+        if path.endswith(".vtt"):
+            return "text/vtt"
+        if path.endswith(".mpd"):
+            return "application/dash+xml"
+        return "application/octet-stream"
+
+    async def proxy_dash_segment(
+        self,
+        stream_id: str,
+        client_id: str,
+        segment_url: str,
+        range_header: Optional[str] = None,
+    ) -> StreamingResponse:
+        """Proxy an individual DASH segment/init-section - direct pass-through with header propagation."""
+        logger.info(f"Proxying DASH segment for stream {stream_id}, client {client_id}")
+
+        async def segment_generator():
+            bytes_served = 0
+            retry_count = 0
+            max_retries = 3
+
+            while retry_count <= max_retries:
+                try:
+                    headers = {}
+                    if range_header:
+                        headers["Range"] = range_header
+
+                    stream_info = None
+                    if stream_id in self.streams:
+                        stream_info = self.streams[stream_id]
+                        headers["User-Agent"] = stream_info.user_agent
+                        headers.update(stream_info.headers)
+
+                    async with self.http_client.stream(
+                        "GET", segment_url, headers=headers, follow_redirects=True
+                    ) as response:
+                        response.raise_for_status()
+                        async for chunk in response.aiter_bytes(chunk_size=32768):
+                            yield chunk
+                            bytes_served += len(chunk)
+
+                    if client_id in self.clients:
+                        now = datetime.now(timezone.utc)
+                        self.clients[client_id].bytes_served += bytes_served
+                        self.clients[client_id].segments_served += 1
+                        self.clients[client_id].last_access = now
+                        self.clients[client_id].last_data_time = now
+
+                    if stream_id in self.streams:
+                        self.streams[stream_id].total_bytes_served += bytes_served
+                        self.streams[stream_id].total_segments_served += 1
+                        self.streams[stream_id].last_access = datetime.now(timezone.utc)
+
+                    self._stats.total_bytes_served += bytes_served
+                    self._stats.total_segments_served += 1
+
+                    return
+
+                except (
+                    httpx.TimeoutException,
+                    httpx.NetworkError,
+                    httpx.HTTPError,
+                ) as e:
+                    logger.warning(
+                        f"Error fetching DASH segment (attempt {retry_count + 1}/{max_retries + 1}): {e}"
+                    )
+                    if isinstance(e, httpx.HTTPStatusError) and stream_info:
+                        stream_info.last_error_status_code = e.response.status_code
+
+                    if (
+                        stream_info
+                        and stream_info.failover_urls
+                        and retry_count < max_retries
+                    ):
+                        logger.info(
+                            f"Triggering failover due to DASH segment fetch error for stream {stream_id}"
+                        )
+                        await self._try_update_failover_url(
+                            stream_id, "dash_segment_fetch_error"
+                        )
+                        retry_count += 1
+                        continue
+                    else:
+                        logger.error(
+                            f"Failed to fetch DASH segment after {retry_count + 1} attempts: {e}"
+                        )
+                        raise
+
+                except Exception as e:
+                    logger.error(f"Unexpected error streaming DASH segment: {e}")
+                    raise
+
+        media_type = self._dash_file_content_type(segment_url)
+        return StreamingResponse(
+            segment_generator(),
+            media_type=media_type,
+            headers={
+                "Cache-Control": "no-cache",
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+                "Access-Control-Allow-Headers": "*",
+                "Access-Control-Expose-Headers": "*",
+            },
+        )
 
     @staticmethod
     def _segment_content_type(segment_url: str) -> str:

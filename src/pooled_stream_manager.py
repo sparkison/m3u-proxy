@@ -998,8 +998,12 @@ class PooledStreamManager:
                 # Import here to avoid issues if redis not installed
                 import redis.asyncio as redis_async
 
+                # protocol=2: the proxy uses no RESP3-only features, and RESP3
+                # makes newer redis-py probe the server with
+                # CLIENT MAINT_NOTIFICATIONS, which logs a harmless
+                # "unknown subcommand" against Redis < 8.
                 self.redis_client = redis_async.from_url(
-                    self.redis_url, decode_responses=True
+                    self.redis_url, decode_responses=True, protocol=2
                 )
                 await self.redis_client.ping()
                 logger.info(f"Redis connected for worker {self.worker_id}")

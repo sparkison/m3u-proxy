@@ -134,8 +134,12 @@ def main():
 
             async def _check_redis():
                 try:
+                    # protocol=2 keeps connections on RESP2: the proxy uses no
+                    # RESP3-only features, and RESP3 makes newer redis-py probe
+                    # the server with CLIENT MAINT_NOTIFICATIONS, which logs a
+                    # harmless "unknown subcommand" against Redis < 8.
                     client = redis_async.from_url(
-                        redis_url, decode_responses=True)
+                        redis_url, decode_responses=True, protocol=2)
                     await client.ping()
                     await client.aclose()
                     return True

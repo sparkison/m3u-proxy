@@ -39,6 +39,8 @@ class EventType(str, Enum):
     CLIENT_CONNECTED = "client_connected"
     CLIENT_DISCONNECTED = "client_disconnected"
     FAILOVER_TRIGGERED = "failover_triggered"
+    CONNECTION_IDLE_WARNING = "connection_idle_warning"
+    CONNECTION_IDLE_ERROR = "connection_idle_error"
 
 
 class StreamConfig(BaseModel):

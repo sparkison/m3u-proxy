@@ -473,8 +473,13 @@ class StreamManager:
             try:
                 from models import StreamEvent, EventType
 
+                resolved_type = getattr(EventType, event_type, None)
+                if resolved_type is None:
+                    logger.error(f"Unknown event type: {event_type}")
+                    return
+
                 event = StreamEvent(
-                    event_type=getattr(EventType, event_type),
+                    event_type=resolved_type,
                     stream_id=stream_id,
                     data=data,
                 )

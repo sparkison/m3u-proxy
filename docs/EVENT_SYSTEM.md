@@ -12,6 +12,10 @@ The system fires the following events:
 - `CLIENT_CONNECTED` - When a client connects to a stream
 - `CLIENT_DISCONNECTED` - When a client disconnects 
 - `FAILOVER_TRIGGERED` - When failover to backup URL occurs
+- `CONNECTION_IDLE_WARNING` - When a connected client has been idle longer than `CONNECTION_IDLE_ALERT_THRESHOLD` (default 600s)
+- `CONNECTION_IDLE_ERROR` - When a connected client has been idle longer than `CONNECTION_IDLE_ERROR_THRESHOLD` (default 1800s), indicating a likely connection resource leak
+
+The `CONNECTION_IDLE_*` events come from the idle-connection monitor (`ENABLE_CONNECTION_IDLE_MONITORING`, default `true`) and fire at most once per client until the connection recovers or closes.
 
 ## 🔧 API Endpoints
 
@@ -117,6 +121,23 @@ When events occur, webhooks receive POST requests with this structure:
   }
 }
 ```
+
+### Connection Idle Warning / Error
+```json
+{
+  "event_type": "connection_idle_warning",
+  "stream_id": "abc123",
+  "data": {
+    "client_id": "client_456",
+    "idle_seconds": 812.4,
+    "threshold_seconds": 600,
+    "ip_address": "192.168.1.100",
+    "bytes_served": 25850000
+  }
+}
+```
+
+`connection_idle_error` has the same `data` shape, with `threshold_seconds` set to `CONNECTION_IDLE_ERROR_THRESHOLD`.
 
 ## 🛠️ Example Usage
 

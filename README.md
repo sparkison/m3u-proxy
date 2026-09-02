@@ -496,6 +496,8 @@ curl -X POST "http://localhost:8085/webhooks" \
 - `client_connected` - Client joined stream  
 - `client_disconnected` - Client left stream
 - `failover_triggered` - Switched to backup URL
+- `connection_idle_warning` - Connected client idle past `CONNECTION_IDLE_ALERT_THRESHOLD` (default 600s)
+- `connection_idle_error` - Connected client idle past `CONNECTION_IDLE_ERROR_THRESHOLD` (default 1800s); likely connection leak
 
 ### Webhook Payload Example
 ```json

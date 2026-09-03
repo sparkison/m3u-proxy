@@ -604,25 +604,6 @@ def get_client_info(request: Request):
     }
 
 
-def derive_client_id(request: Request, stream_id: str) -> str:
-    """Recompute the deterministic client ID for a request.
-
-    Used by routes that cannot receive an explicit `client_id` query param.
-    DASH SegmentTemplate/relative-SegmentList entries are resolved by the
-    player against the manifest's rewritten <BaseURL> per RFC 3986, and that
-    resolution drops any query string on the BaseURL, so segment requests
-    arrive with no `client_id`. Recomputing the same hash the manifest route
-    used lets those requests reattach to the client record created when the
-    manifest was served, keeping per-client bandwidth/monitor stats intact.
-    """
-    client_info_data = get_client_info(request)
-    username_part = client_info_data.get("username") or ""
-    client_hash = hashlib.md5(
-        f"{client_info_data['ip_address']}-{client_info_data['user_agent']}-{stream_id}-{username_part}".encode()
-    ).hexdigest()[:16]
-    return f"client_{client_hash}"
-
-
 async def verify_token(
     x_api_token: Optional[str] = Header(None, alias="X-API-Token"),
     api_token: Optional[str] = Query(
@@ -1399,8 +1380,22 @@ async def get_dash_manifest(
         None, description="Client ID (auto-generated if not provided)"
     ),
 ):
-    """Get DASH (MPD) manifest for a stream, with BaseURL rewritten through the proxy."""
+    """Get DASH (MPD) manifest for a stream, with BaseURL rewritten through the proxy.
+
+    Client identification mirrors the HLS playlist route exactly (same hash,
+    same collision fork, same guarded register + CLIENT_CONNECTED event). The
+    resolved client_id is then baked into every rewritten segment/file URL by
+    DashProcessor so segments attribute to it - the DASH analogue of the
+    `&client_id=` M3U8Processor stamps on each HLS segment line.
+    """
     try:
+        # Generate or reuse client ID based on request characteristics.
+        # The deterministic hash lets the same device reconnect to the same
+        # client record.  However, two devices behind the same NAT with the
+        # same User-Agent produce an identical hash.  If the existing client
+        # record still has an active connection (different device), we must
+        # create a unique client ID — otherwise cleanup_client for one device
+        # deletes the shared record and kills the other device's stream.
         if not client_id:
             client_info_data = get_client_info(request)
             username_part = client_info_data.get("username") or ""
@@ -1409,6 +1404,27 @@ async def get_dash_manifest(
             ).hexdigest()[:16]
             client_id = f"client_{client_hash}"
 
+            # Collision check: if this client_id already has an active
+            # connection on the same stream, this is a different device.
+            if (
+                client_id in stream_manager.clients
+                and stream_manager.clients[client_id].stream_id == stream_id
+                and stream_manager.clients[client_id].active_connection_id
+                and stream_manager.clients[client_id].active_connection_id
+                in stream_manager.connection_cancel_events
+                and not stream_manager.connection_cancel_events[
+                    stream_manager.clients[client_id].active_connection_id
+                ].is_set()
+            ):
+                # Active connection exists — make this client unique
+                unique_suffix = uuid.uuid4().hex[:8]
+                client_id = f"client_{client_hash}_{unique_suffix}"
+                logger.info(
+                    f"Client ID collision detected for stream {stream_id}, "
+                    f"assigning unique ID: {client_id}"
+                )
+
+        # Only register client if not already registered for this stream
         if (
             client_id not in stream_manager.clients
             or stream_manager.clients[client_id].stream_id != stream_id
@@ -1421,6 +1437,23 @@ async def get_dash_manifest(
                 ip_address=client_info_data["ip_address"],
                 username=client_info_data.get("username"),
             )
+
+            # Emit client connected event
+            stream_info = stream_manager.streams.get(stream_id)
+            event = StreamEvent(
+                event_type=EventType.CLIENT_CONNECTED,
+                stream_id=stream_id,
+                data={
+                    "client_id": client_id,
+                    "user_agent": client_info_data["user_agent"],
+                    "ip_address": client_info_data["ip_address"],
+                    "username": client_info_data.get("username"),
+                    "metadata": stream_info.metadata if stream_info else {},
+                },
+            )
+            await event_manager.emit_event(event)
+        else:
+            logger.debug(f"Reusing existing client {client_id} for stream {stream_id}")
 
         # Relative base URL so this works behind any reverse proxy, same
         # approach as the HLS playlist route above.
@@ -1461,31 +1494,20 @@ async def get_dash_segment_by_base(
     encoded_base: str,
     path: str,
     request: Request,
-    client_id: Optional[str] = Query(
-        None, description="Client ID (overrides the one in the path if given)"
-    ),
 ):
-    """Proxy a DASH segment resolved relative to a rewritten BaseURL directory.
+    """Proxy a DASH segment. Mirrors the HLS segment route (get_hls_segment):
+    take the client_id from the request, register it against the parent stream,
+    hand off to proxy_dash_segment.
 
-    DASH clients resolve SegmentTemplate/SegmentList paths against the
-    manifest's BaseURL per RFC 3986; since we rewrite BaseURL to point here,
-    the trailing `path` is exactly the relative reference the client resolved,
-    and we just need to re-join it with the original upstream directory.
-
-    RFC 3986 resolution drops any query string on the BaseURL, so the manifest
-    route bakes the client_id into the BaseURL *path* (`client_seg`) instead.
-    That keeps every segment on the same client record the manifest registered,
-    so an explicit player-close teardown can actually drop it. An explicit
-    `?client_id=` query still wins if present; a request with neither (e.g. a
-    hand-built URL) falls back to the deterministic per-request hash.
+    The only structural difference from HLS is where client_id lives: an HLS
+    segment line carries it as `&client_id=`, but a DASH SegmentTemplate is
+    resolved against the rewritten <BaseURL> and RFC 3986 drops that query, so
+    DashProcessor puts it in the path (`.../segment/{client_seg}/{base}/`).
+    `path` is the exact relative reference the player resolved.
     """
     try:
-        if not client_id:
-            client_id = unquote(client_seg) or derive_client_id(request, stream_id)
-
-        upstream_base = DashProcessor.decode_base(encoded_base)
-        segment_url = urljoin(upstream_base, path)
-
+        client_id = unquote(client_seg)
+        segment_url = urljoin(DashProcessor.decode_base(encoded_base), path)
         range_header = request.headers.get("range")
 
         client_info_data = get_client_info(request)
@@ -1509,16 +1531,13 @@ async def get_dash_segment_by_base(
 async def get_dash_file(
     stream_id: str,
     request: Request,
-    url: str = Query(..., description="The fully-qualified segment/init URL to proxy"),
-    client_id: Optional[str] = Query(
-        None, description="Client ID (recomputed from the request if not provided)"
-    ),
+    client_id: str = Query(..., description="Client ID"),
+    url: str = Query(..., description="The segment URL to proxy"),
 ):
-    """Proxy a DASH segment/init-section that was already fully-qualified in the manifest."""
+    """Proxy a fully-qualified DASH segment/init URL (SegmentList). This route is
+    the direct DASH counterpart of the HLS segment route - identical signature
+    (`client_id` + `url` required query params), identical body."""
     try:
-        if not client_id:
-            client_id = derive_client_id(request, stream_id)
-
         segment_url = unquote(url)
         range_header = request.headers.get("range")
 

@@ -97,7 +97,10 @@ class TestDashProcessorBaseUrlRewriting:
         assert "http://proxy.com/dash/stream123/segment/" in result
         assert "<BaseURL>" in result
 
-        encoded = result.split("/segment/", 1)[1].split("/", 1)[0]
+        # Rewritten BaseURL shape: .../segment/{client_id}/{encoded_base}/
+        after = result.split("/segment/", 1)[1]
+        client_seg, encoded, _ = after.split("/", 2)
+        assert client_seg == "stream123"
         assert (
             DashProcessor.decode_base(encoded)
             == "https://upstream.example.com/live/dash/"
@@ -117,8 +120,11 @@ class TestDashProcessorBaseUrlRewriting:
             "https://upstream.example.com/live/",
         )
 
-        assert "<BaseURL>http://proxy.com/dash/stream123/segment/" in result
-        encoded = result.split("/segment/", 1)[1].split("/", 1)[0]
+        assert (
+            "<BaseURL>http://proxy.com/dash/stream123/segment/stream123/" in result
+        )
+        after = result.split("/segment/", 1)[1]
+        _client_seg, encoded, _ = after.split("/", 2)
         assert (
             DashProcessor.decode_base(encoded) == "https://upstream.example.com/live/"
         )
@@ -132,8 +138,9 @@ class TestDashProcessorBaseUrlRewriting:
             "https://upstream.example.com/live/",
         )
 
+        # Each rewritten BaseURL is .../segment/{client_id}/{encoded_base}/
         bases = [
-            DashProcessor.decode_base(chunk.split("/", 1)[0])
+            DashProcessor.decode_base(chunk.split("/")[1])
             for chunk in result.split("http://proxy.com/dash/stream123/segment/")[1:]
         ]
         assert "https://upstream.example.com/live/period1/" in bases
@@ -235,3 +242,98 @@ class TestDashContentType:
             StreamManager._dash_file_content_type("unknown.bin")
             == "application/octet-stream"
         )
+
+
+class TestDashSegmentRouteClientId:
+    """A DASH player resolves SegmentTemplate/relative-SegmentList references
+    against the rewritten <BaseURL> per RFC 3986, which drops any query string
+    on that BaseURL. The manifest route therefore bakes the client_id into the
+    BaseURL *path* so every segment stays on the same client record it
+    registered - letting an explicit player-close teardown drop it instead of
+    leaving a derived client record to time out. A hand-built URL with no
+    client_id anywhere must still serve (previously the route required a
+    `client_id` query param and returned HTTP 422 for every segment)."""
+
+    def _client_and_mock(self):
+        from unittest.mock import Mock, AsyncMock, patch
+        from fastapi.testclient import TestClient
+        from starlette.responses import StreamingResponse
+        import api
+
+        async def _body():
+            yield b"\x00\x00\x00\x18ftypmp42"
+
+        mock = patch("api.stream_manager").start()
+        mock.streams = {"stream123": Mock()}
+        mock.register_client = AsyncMock()
+        mock.proxy_dash_segment = AsyncMock(
+            return_value=StreamingResponse(_body(), media_type="video/mp4")
+        )
+        return TestClient(api.app), mock, patch
+
+    def test_segment_route_uses_client_id_from_the_base_path(self):
+        client, mock, patcher = self._client_and_mock()
+        try:
+            encoded = DashProcessor.encode_base(
+                "https://upstream.example.com/live/dash/"
+            )
+            resp = client.get(
+                f"/dash/stream123/segment/tab-abc-123/{encoded}/chunk-v0-00001.m4s"
+            )
+
+            assert resp.status_code == 200
+            assert mock.proxy_dash_segment.call_args.args[1] == "tab-abc-123"
+            assert (
+                mock.proxy_dash_segment.call_args.args[2]
+                == "https://upstream.example.com/live/dash/chunk-v0-00001.m4s"
+            )
+        finally:
+            patcher.stopall()
+
+    def test_segment_route_end_to_end_client_id_matches_manifest(self):
+        """The id DashProcessor puts in the BaseURL path is exactly what the
+        segment route hands to proxy_dash_segment - so manifest and segments
+        share one client record."""
+        client, mock, patcher = self._client_and_mock()
+        try:
+            processor = DashProcessor("/dash/stream123", "client_deadbeef")
+            manifest = processor.process_manifest(
+                MPD_WITH_RELATIVE_BASEURL,
+                "/dash/stream123",
+                "https://upstream.example.com/live/",
+            )
+            base = manifest.split("<BaseURL>", 1)[1].split("</BaseURL>", 1)[0]
+
+            resp = client.get(base + "chunk-v0-00001.m4s")
+
+            assert resp.status_code == 200
+            assert mock.proxy_dash_segment.call_args.args[1] == "client_deadbeef"
+        finally:
+            patcher.stopall()
+
+    def test_explicit_query_client_id_overrides_the_path(self):
+        client, mock, patcher = self._client_and_mock()
+        try:
+            encoded = DashProcessor.encode_base("https://upstream.example.com/live/")
+            resp = client.get(
+                f"/dash/stream123/segment/from-path/{encoded}/seg1.m4s",
+                params={"client_id": "from-query"},
+            )
+
+            assert resp.status_code == 200
+            assert mock.proxy_dash_segment.call_args.args[1] == "from-query"
+        finally:
+            patcher.stopall()
+
+    def test_file_route_serves_without_client_id(self):
+        client, mock, patcher = self._client_and_mock()
+        try:
+            resp = client.get(
+                "/dash/stream123/file",
+                params={"url": "https://upstream.example.com/video/seg1.m4s"},
+            )
+
+            assert resp.status_code == 200
+            assert mock.proxy_dash_segment.call_args.args[1].startswith("client_")
+        finally:
+            patcher.stopall()

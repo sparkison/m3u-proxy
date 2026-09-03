@@ -286,8 +286,16 @@ class DashProcessor:
         return base64.urlsafe_b64decode(padded.encode()).decode()
 
     def _rewrite_base(self, absolute_base_url: str, base_proxy_url: str) -> str:
+        # The client_id is carried as a path segment, not a query param: DASH
+        # players resolve relative SegmentTemplate/SegmentList refs against this
+        # BaseURL per RFC 3986, and that resolution discards any query string on
+        # the BaseURL. Threading it through the path keeps every segment request
+        # attributed to the same client record the manifest route registered, so
+        # an explicit player-close teardown (DELETE /streams/by-metadata) can
+        # actually find and drop it instead of leaving a second, derived client
+        # record holding the stream open until the idle sweep.
         encoded = self.encode_base(absolute_base_url)
-        return f"{base_proxy_url}/segment/{encoded}/"
+        return f"{base_proxy_url}/segment/{quote(self.client_id, safe='')}/{encoded}/"
 
     def _rewrite_absolute_url(self, absolute_url: str, base_proxy_url: str) -> str:
         encoded_url = quote(absolute_url, safe="")

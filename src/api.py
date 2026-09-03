@@ -604,6 +604,25 @@ def get_client_info(request: Request):
     }
 
 
+def derive_client_id(request: Request, stream_id: str) -> str:
+    """Recompute the deterministic client ID for a request.
+
+    Used by routes that cannot receive an explicit `client_id` query param.
+    DASH SegmentTemplate/relative-SegmentList entries are resolved by the
+    player against the manifest's rewritten <BaseURL> per RFC 3986, and that
+    resolution drops any query string on the BaseURL, so segment requests
+    arrive with no `client_id`. Recomputing the same hash the manifest route
+    used lets those requests reattach to the client record created when the
+    manifest was served, keeping per-client bandwidth/monitor stats intact.
+    """
+    client_info_data = get_client_info(request)
+    username_part = client_info_data.get("username") or ""
+    client_hash = hashlib.md5(
+        f"{client_info_data['ip_address']}-{client_info_data['user_agent']}-{stream_id}-{username_part}".encode()
+    ).hexdigest()[:16]
+    return f"client_{client_hash}"
+
+
 async def verify_token(
     x_api_token: Optional[str] = Header(None, alias="X-API-Token"),
     api_token: Optional[str] = Query(
@@ -1435,13 +1454,16 @@ async def get_dash_manifest(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/dash/{stream_id}/segment/{encoded_base}/{path:path}")
+@app.get("/dash/{stream_id}/segment/{client_seg}/{encoded_base}/{path:path}")
 async def get_dash_segment_by_base(
     stream_id: str,
+    client_seg: str,
     encoded_base: str,
     path: str,
     request: Request,
-    client_id: str = Query(..., description="Client ID"),
+    client_id: Optional[str] = Query(
+        None, description="Client ID (overrides the one in the path if given)"
+    ),
 ):
     """Proxy a DASH segment resolved relative to a rewritten BaseURL directory.
 
@@ -1449,8 +1471,18 @@ async def get_dash_segment_by_base(
     manifest's BaseURL per RFC 3986; since we rewrite BaseURL to point here,
     the trailing `path` is exactly the relative reference the client resolved,
     and we just need to re-join it with the original upstream directory.
+
+    RFC 3986 resolution drops any query string on the BaseURL, so the manifest
+    route bakes the client_id into the BaseURL *path* (`client_seg`) instead.
+    That keeps every segment on the same client record the manifest registered,
+    so an explicit player-close teardown can actually drop it. An explicit
+    `?client_id=` query still wins if present; a request with neither (e.g. a
+    hand-built URL) falls back to the deterministic per-request hash.
     """
     try:
+        if not client_id:
+            client_id = unquote(client_seg) or derive_client_id(request, stream_id)
+
         upstream_base = DashProcessor.decode_base(encoded_base)
         segment_url = urljoin(upstream_base, path)
 
@@ -1477,11 +1509,16 @@ async def get_dash_segment_by_base(
 async def get_dash_file(
     stream_id: str,
     request: Request,
-    client_id: str = Query(..., description="Client ID"),
     url: str = Query(..., description="The fully-qualified segment/init URL to proxy"),
+    client_id: Optional[str] = Query(
+        None, description="Client ID (recomputed from the request if not provided)"
+    ),
 ):
     """Proxy a DASH segment/init-section that was already fully-qualified in the manifest."""
     try:
+        if not client_id:
+            client_id = derive_client_id(request, stream_id)
+
         segment_url = unquote(url)
         range_header = request.headers.get("range")
 
